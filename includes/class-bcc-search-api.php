@@ -4,13 +4,19 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+use BCC\Core\DB\DB;
+
 class BCC_Search_API
 {
     const NAMESPACE    = 'bcc/v1';
     const ROUTE        = '/search';
     const LIMIT        = 12;
-    const CAT_CACHE_KEY = 'bcc_search_categories';
-    const CAT_CACHE_TTL = 43200; // 12 hours
+    const CAT_CACHE_KEY    = 'bcc_search_categories';
+    const CAT_CACHE_TTL    = 43200; // 12 hours
+    const SEARCH_CACHE_TTL  = 15;   // seconds
+    const SEARCH_VERSION_KEY = 'bcc_search_cache_version';
+    const RATE_LIMIT         = 10;  // max requests
+    const RATE_WINDOW        = 5;   // seconds
 
     public function register_routes(): void
     {
@@ -19,6 +25,14 @@ class BCC_Search_API
         add_action('delete_post', function (int $post_id): void {
             if (get_post_type($post_id) === 'peepso-page-cat') {
                 self::bust_category_cache();
+            }
+        });
+
+        // Bust search cache whenever a PeepSo page is saved or deleted
+        add_action('save_post_peepso-page', [__CLASS__, 'bust_search_cache']);
+        add_action('delete_post', function (int $post_id): void {
+            if (get_post_type($post_id) === 'peepso-page') {
+                self::bust_search_cache();
             }
         });
 
@@ -41,8 +55,23 @@ class BCC_Search_API
         ]);
     }
 
-    public function handle_search(WP_REST_Request $request): WP_REST_Response
+    public function handle_search(WP_REST_Request $request)
     {
+        // Rate limiting by client IP.
+        $ip        = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        $rate_key  = 'bcc_search_rate_' . md5($ip);
+        $hits      = (int) get_transient($rate_key);
+
+        if ($hits >= self::RATE_LIMIT) {
+            return new WP_Error(
+                'rate_limit_exceeded',
+                'Too many requests. Please wait a few seconds.',
+                ['status' => 429]
+            );
+        }
+
+        set_transient($rate_key, $hits + 1, self::RATE_WINDOW);
+
         global $wpdb;
 
         $q    = trim($request->get_param('q'));
@@ -53,11 +82,17 @@ class BCC_Search_API
             return rest_ensure_response(['results' => [], 'categories' => $this->get_categories()]);
         }
 
+        // Return cached results if available.
+        $cache_version = get_option( self::SEARCH_VERSION_KEY, 1 );
+        $cache_key     = 'bcc_search_' . md5( $q . '|' . $type . '|' . $cache_version );
+        $cached    = get_transient( $cache_key );
+        if ( is_array( $cached ) ) {
+            return rest_ensure_response( $cached );
+        }
+
         $posts_table      = $wpdb->posts;
         $page_cat_table   = $wpdb->prefix . 'peepso_page_categories';
-        $scores_table     = function_exists('bcc_trust_scores_table')
-                                ? bcc_trust_scores_table()
-                                : $wpdb->prefix . 'bcc_trust_page_scores';
+        $scores_table     = DB::table('trust_page_scores');
 
         $like = '%' . $wpdb->esc_like($q) . '%';
 
@@ -116,12 +151,50 @@ class BCC_Search_API
         }
 
         $results = [];
+
+        // Batch-fetch all avatar hashes in one query to avoid N+1.
+        $ids          = array_map( 'intval', array_column( (array) $rows, 'ID' ) );
+        $hashes_by_id = [];
+        if ( ! empty( $ids ) ) {
+            $id_placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+            $meta_rows       = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+                     WHERE meta_key = 'peepso_page_avatar_hash'
+                     AND post_id IN ({$id_placeholders})",
+                    ...$ids
+                )
+            );
+            foreach ( $meta_rows as $m ) {
+                $hashes_by_id[ (int) $m->post_id ] = $m->meta_value;
+            }
+        }
+
+        // Pre-compute URL base and asset paths once instead of per-row.
+        $pages_url_base = null;
+        $peepso_uri     = '';
+        $default_avatar = '';
+        if ( class_exists( 'PeepSo' ) ) {
+            $base           = PeepSo::get_page( 'pages' );
+            $pages_url_base = $base ? trailingslashit( $base ) : null;
+            $peepso_uri     = PeepSo::get_peepso_uri();
+            $default_avatar = PeepSo::get_asset( 'images/avatar/page.png' );
+        }
+
         foreach ($rows as $row) {
-            $avatar = $this->get_page_avatar($row->ID);
-            $url    = $this->get_page_url($row->post_name);
+            $pid = (int) $row->ID;
+
+            $hash   = $hashes_by_id[ $pid ] ?? '';
+            $avatar = $hash
+                ? $peepso_uri . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
+                : $default_avatar;
+
+            $url = $pages_url_base
+                ? $pages_url_base . $row->post_name . '/'
+                : home_url( '/pages/' . $row->post_name . '/' );
 
             $results[] = [
-                'id'            => (int) $row->ID,
+                'id'            => $pid,
                 'title'         => $row->post_title,
                 'url'           => $url,
                 'avatar'        => $avatar,
@@ -132,10 +205,14 @@ class BCC_Search_API
             ];
         }
 
-        return rest_ensure_response([
+        $response = [
             'results'    => $results,
             'categories' => $this->get_categories(),
-        ]);
+        ];
+
+        set_transient( $cache_key, $response, self::SEARCH_CACHE_TTL );
+
+        return rest_ensure_response( $response );
     }
 
     // ----------------------------------------------------------------
@@ -215,5 +292,10 @@ class BCC_Search_API
     public static function bust_category_cache(): void
     {
         delete_transient(self::CAT_CACHE_KEY);
+    }
+
+    public static function bust_search_cache(): void
+    {
+        update_option(self::SEARCH_VERSION_KEY, time());
     }
 }

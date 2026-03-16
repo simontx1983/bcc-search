@@ -24,7 +24,19 @@ add_action('rest_api_init', function () {
     $api->register_routes();
 });
 
-add_action('wp_enqueue_scripts', function () {
+/**
+ * Shortcode: [bcc_search]
+ *
+ * Attributes:
+ *   placeholder  — input placeholder text
+ *   show_type    — 1 (default) to show the type dropdown, 0 to hide it
+ */
+add_shortcode('bcc_search', function ($atts) {
+    $atts = shortcode_atts([
+        'placeholder' => 'Search projects…',
+        'show_type'   => '1',
+    ], $atts, 'bcc_search');
+
     wp_enqueue_style(
         'bcc-search',
         BCC_SEARCH_URL . 'assets/css/bcc-search.css',
@@ -42,20 +54,6 @@ add_action('wp_enqueue_scripts', function () {
         'restUrl' => esc_url_raw(rest_url('bcc/v1/search')),
         'nonce'   => wp_create_nonce('wp_rest'),
     ]);
-});
-
-/**
- * Shortcode: [bcc_search]
- *
- * Attributes:
- *   placeholder  — input placeholder text
- *   show_type    — 1 (default) to show the type dropdown, 0 to hide it
- */
-add_shortcode('bcc_search', function ($atts) {
-    $atts = shortcode_atts([
-        'placeholder' => 'Search projects…',
-        'show_type'   => '1',
-    ], $atts, 'bcc_search');
 
     ob_start();
     include BCC_SEARCH_PATH . 'templates/search-bar.php';
