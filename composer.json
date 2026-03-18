@@ -1,0 +1,17 @@
+{
+    "name": "blue-collar-crypto/bcc-search",
+    "description": "Live search for BCC PeepSo project pages",
+    "type": "wordpress-plugin",
+    "license": "proprietary",
+    "require": {
+        "php": ">=7.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "BCC\\Search\\": "app/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}
