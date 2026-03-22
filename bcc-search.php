@@ -18,11 +18,30 @@ define('BCC_SEARCH_VERSION', '1.1.0');
 define('BCC_SEARCH_PATH', plugin_dir_path(__FILE__));
 define('BCC_SEARCH_URL', plugin_dir_url(__FILE__));
 
+// ── Dependency check — bcc-core must be active ──────────────────────────────
+if ( ! defined( 'BCC_CORE_VERSION' ) ) {
+    add_action( 'admin_notices', function () {
+        echo '<div class="notice notice-error"><p>'
+           . '<strong>BCC Search:</strong> '
+           . 'The <strong>BCC Core</strong> plugin must be activated first. '
+           . 'Please activate BCC Core, then re-activate BCC Search.'
+           . '</p></div>';
+    } );
+    return;
+}
+
 // ── PSR-4 autoloader ────────────────────────────────────────────────────────
 $bcc_search_autoloader = BCC_SEARCH_PATH . 'vendor/autoload.php';
-if (file_exists($bcc_search_autoloader)) {
-    require_once $bcc_search_autoloader;
+if ( ! file_exists( $bcc_search_autoloader ) ) {
+    add_action( 'admin_notices', function () {
+        echo '<div class="notice notice-error"><p>'
+           . '<strong>BCC Search:</strong> '
+           . 'Run <code>composer install</code> in the plugin directory to generate the autoloader.'
+           . '</p></div>';
+    } );
+    return;
 }
+require_once $bcc_search_autoloader;
 
 // ── Backward-compatibility bridge ───────────────────────────────────────────
 require_once BCC_SEARCH_PATH . 'includes/class-bcc-search-api.php';
