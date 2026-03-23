@@ -189,9 +189,11 @@ class SearchController
 
         // Batch-fetch trust scores for ALL candidates (single query via interface).
         $scores_by_id = [];
-        $scoreService = ServiceLocator::resolveScoreReadService();
-        if ($scoreService) {
-            $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
+        if (class_exists('\\BCC\\Core\\ServiceLocator')) {
+            $scoreService = ServiceLocator::resolveScoreReadService();
+            if ($scoreService) {
+                $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
+            }
         }
 
         // Blended ranking: trust score (60%) + match relevance (40%).
@@ -376,9 +378,11 @@ class SearchController
 
         // Rank by trust score only.
         $scores_by_id = [];
-        $scoreService = ServiceLocator::resolveScoreReadService();
-        if ($scoreService) {
-            $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
+        if (class_exists('\\BCC\\Core\\ServiceLocator')) {
+            $scoreService = ServiceLocator::resolveScoreReadService();
+            if ($scoreService) {
+                $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
+            }
         }
 
         usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
