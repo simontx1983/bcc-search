@@ -22,9 +22,73 @@ class SearchController
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
 
-    public function register_routes(): void
+    /**
+     * Resolve the PeepSo page-to-category relation table.
+     *
+     * PeepSo does not expose a service API, so we must reference its
+     * table directly. This helper centralises that knowledge and caches
+     * a table-existence check so the search degrades gracefully when
+     * PeepSo is absent.
+     *
+     * @return array{table: string, page_col: string, cat_col: string}|null
+     */
+    private static function peepso_category_table(): ?array
     {
-        // Bust category cache whenever a page-category is saved or deleted
+        static $result = null;
+        static $checked = false;
+
+        if ($checked) {
+            return $result;
+        }
+        $checked = true;
+
+        global $wpdb;
+        $table = $wpdb->prefix . 'peepso_page_categories';
+
+        if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) !== $table) {
+            return null;
+        }
+
+        $result = [
+            'table'    => $table,
+            'page_col' => 'pm_page_id',
+            'cat_col'  => 'pm_cat_id',
+        ];
+
+        return $result;
+    }
+
+    /**
+     * Resolve PeepSo frontend asset paths.
+     *
+     * @return array{url_base: string|null, uri: string, default_avatar: string}
+     */
+    private static function peepso_assets(): array
+    {
+        static $assets = null;
+
+        if ($assets !== null) {
+            return $assets;
+        }
+
+        $assets = ['url_base' => null, 'uri' => '', 'default_avatar' => ''];
+
+        if (class_exists('PeepSo')) {
+            $base                    = \PeepSo::get_page('pages');
+            $assets['url_base']      = $base ? trailingslashit($base) : null;
+            $assets['uri']           = \PeepSo::get_peepso_uri();
+            $assets['default_avatar'] = \PeepSo::get_asset('images/avatar/page.png');
+        }
+
+        return $assets;
+    }
+
+    /**
+     * Register cache-busting hooks.
+     * Called on 'init' so they fire on admin saves, not just REST requests.
+     */
+    public static function register_cache_hooks(): void
+    {
         add_action('save_post_peepso-page-cat', [__CLASS__, 'bust_category_cache']);
         add_action('delete_post', function (int $post_id): void {
             if (get_post_type($post_id) === 'peepso-page-cat') {
@@ -32,14 +96,16 @@ class SearchController
             }
         });
 
-        // Bust search cache whenever a PeepSo page is saved or deleted
         add_action('save_post_peepso-page', [__CLASS__, 'bust_search_cache']);
         add_action('delete_post', function (int $post_id): void {
             if (get_post_type($post_id) === 'peepso-page') {
                 self::bust_search_cache();
             }
         });
+    }
 
+    public function register_routes(): void
+    {
         register_rest_route(self::NAMESPACE, self::ROUTE, [
             'methods'             => \WP_REST_Server::READABLE,
             'callback'            => [$this, 'handle_search'],
@@ -108,8 +174,8 @@ class SearchController
             return rest_ensure_response( $cached );
         }
 
-        $posts_table    = $wpdb->posts;
-        $page_cat_table = $wpdb->prefix . 'peepso_page_categories';
+        $posts_table = $wpdb->posts;
+        $cat_info    = self::peepso_category_table();
 
         $cap         = $this->getCandidateCap($q);
         $prefix_like = $wpdb->esc_like($q) . '%';
@@ -117,17 +183,17 @@ class SearchController
 
         // ── Phase 1: Lightweight candidate query ───────────────────────
         // Prefix matches first (can use index), then infix. UNION deduplicates.
-        // Category JOIN added only when filtering.
+        // Category JOIN added only when filtering (and only if PeepSo table exists).
         $cat_join  = '';
         $cat_where = '';
         $distinct  = '';
-        if ($type !== '') {
+        if ($type !== '' && $cat_info) {
             $distinct = 'DISTINCT';
             $cat_join = "
-                INNER JOIN {$page_cat_table} pc  ON pc.pm_page_id = p.ID
-                INNER JOIN {$posts_table}    cat ON cat.ID = pc.pm_cat_id
-                                                 AND cat.post_type = 'peepso-page-cat'
-                                                 AND cat.post_status = 'publish'
+                INNER JOIN {$cat_info['table']} pc  ON pc.{$cat_info['page_col']} = p.ID
+                INNER JOIN {$posts_table}       cat ON cat.ID = pc.{$cat_info['cat_col']}
+                                                    AND cat.post_type = 'peepso-page-cat'
+                                                    AND cat.post_status = 'publish'
             ";
             $cat_where = $wpdb->prepare("AND cat.post_name = %s", $type);
         }
@@ -221,14 +287,19 @@ class SearchController
                 p.ID,
                 p.post_title,
                 p.post_name,
-                MIN(catl.post_title) AS category_name,
-                MIN(catl.post_name)  AS category_slug,
+                " . ($cat_info
+                    ? "MIN(catl.post_title) AS category_name,
+                       MIN(catl.post_name)  AS category_slug,"
+                    : "NULL AS category_name,
+                       NULL AS category_slug,") . "
                 pm_av.meta_value     AS avatar_hash
              FROM {$posts_table} p
-             LEFT JOIN {$page_cat_table}  pcl   ON pcl.pm_page_id = p.ID
-             LEFT JOIN {$posts_table}     catl  ON catl.ID = pcl.pm_cat_id
-                                                AND catl.post_type = 'peepso-page-cat'
-                                                AND catl.post_status = 'publish'
+             " . ($cat_info
+                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
+                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
+                                                         AND catl.post_type = 'peepso-page-cat'
+                                                         AND catl.post_status = 'publish'"
+                : "") . "
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
              WHERE p.ID IN ({$id_placeholders})
@@ -252,15 +323,7 @@ class SearchController
         }
 
         // Pre-compute URL base and asset paths once instead of per-row.
-        $pages_url_base = null;
-        $peepso_uri     = '';
-        $default_avatar = '';
-        if (class_exists('PeepSo')) {
-            $base           = \PeepSo::get_page('pages');
-            $pages_url_base = $base ? trailingslashit($base) : null;
-            $peepso_uri     = \PeepSo::get_peepso_uri();
-            $default_avatar = \PeepSo::get_asset('images/avatar/page.png');
-        }
+        $ps = self::peepso_assets();
 
         $results = [];
         foreach ($rows as $row) {
@@ -270,11 +333,11 @@ class SearchController
 
             $hash   = $row->avatar_hash ?? '';
             $avatar = $hash
-                ? $peepso_uri . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
-                : $default_avatar;
+                ? $ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
+                : $ps['default_avatar'];
 
-            $url = $pages_url_base
-                ? $pages_url_base . $row->post_name . '/'
+            $url = $ps['url_base']
+                ? $ps['url_base'] . $row->post_name . '/'
                 : home_url('/pages/' . $row->post_name . '/');
 
             $results[] = [
@@ -358,8 +421,8 @@ class SearchController
             return rest_ensure_response($cached);
         }
 
-        $posts_table    = $wpdb->posts;
-        $page_cat_table = $wpdb->prefix . 'peepso_page_categories';
+        $posts_table = $wpdb->posts;
+        $cat_info    = self::peepso_category_table();
 
         // Fetch a pool of published page IDs (no LIKE filter).
         $candidate_ids = array_map('intval', $wpdb->get_col(
@@ -403,14 +466,19 @@ class SearchController
                 p.ID,
                 p.post_title,
                 p.post_name,
-                MIN(catl.post_title) AS category_name,
-                MIN(catl.post_name)  AS category_slug,
+                " . ($cat_info
+                    ? "MIN(catl.post_title) AS category_name,
+                       MIN(catl.post_name)  AS category_slug,"
+                    : "NULL AS category_name,
+                       NULL AS category_slug,") . "
                 pm_av.meta_value     AS avatar_hash
              FROM {$posts_table} p
-             LEFT JOIN {$page_cat_table}  pcl   ON pcl.pm_page_id = p.ID
-             LEFT JOIN {$posts_table}     catl  ON catl.ID = pcl.pm_cat_id
-                                                AND catl.post_type = 'peepso-page-cat'
-                                                AND catl.post_status = 'publish'
+             " . ($cat_info
+                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
+                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
+                                                         AND catl.post_type = 'peepso-page-cat'
+                                                         AND catl.post_status = 'publish'"
+                : "") . "
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
              WHERE p.ID IN ({$id_placeholders})
@@ -419,15 +487,7 @@ class SearchController
             ...$winner_ids
         ));
 
-        $pages_url_base = null;
-        $peepso_uri     = '';
-        $default_avatar = '';
-        if (class_exists('PeepSo')) {
-            $base           = \PeepSo::get_page('pages');
-            $pages_url_base = $base ? trailingslashit($base) : null;
-            $peepso_uri     = \PeepSo::get_peepso_uri();
-            $default_avatar = \PeepSo::get_asset('images/avatar/page.png');
-        }
+        $ps = self::peepso_assets();
 
         $results = [];
         foreach ($rows as $row) {
@@ -437,11 +497,11 @@ class SearchController
 
             $hash   = $row->avatar_hash ?? '';
             $avatar = $hash
-                ? $peepso_uri . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
-                : $default_avatar;
+                ? $ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
+                : $ps['default_avatar'];
 
-            $url = $pages_url_base
-                ? $pages_url_base . $row->post_name . '/'
+            $url = $ps['url_base']
+                ? $ps['url_base'] . $row->post_name . '/'
                 : home_url('/pages/' . $row->post_name . '/');
 
             $results[] = [

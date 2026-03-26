@@ -43,10 +43,10 @@ if ( ! file_exists( $bcc_search_autoloader ) ) {
 }
 require_once $bcc_search_autoloader;
 
-// ── Backward-compatibility bridge ───────────────────────────────────────────
-require_once BCC_SEARCH_PATH . 'includes/class-bcc-search-api.php';
+// ── Cache invalidation (must run on every request, not just REST) ────────────
+add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_cache_hooks']);
 
-// ── Boot ─────────────────────────────────────────────────────────────────────
+// ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     \BCC\Search\Plugin::instance()->controller()->register_routes();
 });
