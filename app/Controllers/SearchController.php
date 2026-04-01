@@ -132,9 +132,14 @@ class SearchController
 
     public function handle_search(\WP_REST_Request $request)
     {
-        // Rate limiting by client IP (proxy-aware).
-        $raw_ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
-        $ip     = trim(explode(',', $raw_ip)[0]);
+        // Rate limiting by client IP.
+        // Use trust-engine's Cloudflare-aware resolver when available;
+        // otherwise fall back to REMOTE_ADDR only (never trust X-Forwarded-For).
+        if (class_exists('\\BCC\\Trust\\Security\\IpResolver')) {
+            $ip = \BCC\Trust\Security\IpResolver::getClientIp();
+        } else {
+            $ip = sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+        }
         if (!filter_var($ip, FILTER_VALIDATE_IP)) {
             $ip = '0.0.0.0';
         }
@@ -256,10 +261,8 @@ class SearchController
         // Batch-fetch trust scores for ALL candidates (single query via interface).
         $scores_by_id = [];
         if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-            $scoreService = ServiceLocator::resolveScoreReadService();
-            if ($scoreService) {
-                $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
-            }
+            // NullScoreReadService::getScoresForPageIds() returns [] — same as default.
+            $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
         }
 
         // Blended ranking: trust score (60%) + match relevance (40%).
@@ -442,10 +445,7 @@ class SearchController
         // Rank by trust score only.
         $scores_by_id = [];
         if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-            $scoreService = ServiceLocator::resolveScoreReadService();
-            if ($scoreService) {
-                $scores_by_id = $scoreService->getScoresForPageIds($candidate_ids);
-            }
+            $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
         }
 
         usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {

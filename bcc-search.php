@@ -48,7 +48,7 @@ add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_c
 
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
-    \BCC\Search\Plugin::instance()->controller()->register_routes();
+    (new \BCC\Search\Controllers\SearchController())->register_routes();
 });
 
 /**
