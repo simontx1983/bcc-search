@@ -17,8 +17,8 @@ class SearchController
     const CAT_CACHE_TTL    = 43200; // 12 hours
     const SEARCH_CACHE_TTL    = 60;    // seconds
     const TRENDING_CACHE_TTL  = 300;   // 5 minutes
-    const TRENDING_CACHE_KEY  = 'bcc_search_trending';
     const SEARCH_VERSION_KEY = 'bcc_search_cache_version';
+    const CACHE_GROUP        = 'bcc_search';
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
 
@@ -154,6 +154,10 @@ class SearchController
             );
         }
 
+        // Non-atomic: concurrent requests between get_transient and set_transient
+        // can bypass the limit. Acceptable for a read-only search endpoint.
+        // For atomic increment, a persistent object cache (Redis) + wp_cache_incr
+        // would be needed, but that is not guaranteed on all WordPress installs.
         set_transient($rate_key, $hits + 1, self::RATE_WINDOW);
 
         global $wpdb;
@@ -171,10 +175,10 @@ class SearchController
             return rest_ensure_response(['results' => [], 'categories' => $this->get_categories()]);
         }
 
-        // Return cached results if available.
+        // Return cached results if available (wp_cache — no DB write for short TTL).
         $cache_version = get_option( self::SEARCH_VERSION_KEY, 1 );
-        $cache_key     = 'bcc_search_' . md5( mb_strtolower($q) . '|' . $type . '|' . $cache_version );
-        $cached    = get_transient( $cache_key );
+        $cache_key     = 'search_' . md5( mb_strtolower($q) . '|' . $type . '|' . $cache_version );
+        $cached    = wp_cache_get( $cache_key, self::CACHE_GROUP );
         if ( is_array( $cached ) ) {
             return rest_ensure_response( $cached );
         }
@@ -252,7 +256,7 @@ class SearchController
 
         if (empty($candidate_ids)) {
             $response = ['results' => [], 'categories' => $this->get_categories()];
-            set_transient($cache_key, $response, self::SEARCH_CACHE_TTL);
+            wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
             return rest_ensure_response($response);
         }
 
@@ -282,8 +286,8 @@ class SearchController
 
         // Hydrate only the winners — post data + category + avatar in one query.
         $id_placeholders = implode(',', array_fill(0, count($winner_ids), '%d'));
-        // Safe: $winner_ids contains only (int)-cast values from line 161
-        $id_list         = implode(',', $winner_ids);
+        // Safe: values are int-cast; FIELD() cannot be parameterized via $wpdb->prepare().
+        $id_list         = implode(',', array_map('intval', $winner_ids));
 
         $hydrate_sql = $wpdb->prepare(
             "SELECT
@@ -360,7 +364,7 @@ class SearchController
             'categories' => $this->get_categories(),
         ];
 
-        set_transient( $cache_key, $response, self::SEARCH_CACHE_TTL );
+        wp_cache_set( $cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL );
 
         return rest_ensure_response( $response );
     }
@@ -418,8 +422,8 @@ class SearchController
     private function handle_trending(\wpdb $wpdb)
     {
         $cache_version = get_option(self::SEARCH_VERSION_KEY, 1);
-        $cache_key     = self::TRENDING_CACHE_KEY . '_' . $cache_version;
-        $cached        = get_transient($cache_key);
+        $cache_key     = 'trending_' . $cache_version;
+        $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
         if (is_array($cached)) {
             return rest_ensure_response($cached);
         }
@@ -458,8 +462,8 @@ class SearchController
 
         // Hydrate winners.
         $id_placeholders = implode(',', array_fill(0, count($winner_ids), '%d'));
-        // Safe: $winner_ids contains only (int)-cast values
-        $id_list = implode(',', $winner_ids);
+        // Safe: values are int-cast; FIELD() cannot be parameterized via $wpdb->prepare().
+        $id_list = implode(',', array_map('intval', $winner_ids));
 
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT
@@ -521,7 +525,7 @@ class SearchController
             'categories' => $this->get_categories(),
         ];
 
-        set_transient($cache_key, $response, self::TRENDING_CACHE_TTL);
+        wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::TRENDING_CACHE_TTL);
 
         return rest_ensure_response($response);
     }

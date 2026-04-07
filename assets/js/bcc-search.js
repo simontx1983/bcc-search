@@ -391,11 +391,6 @@
             activeIdx = idx;
         }
 
-        // ── "See more" → apply category filter and re-search ─────────────────
-        function filterByCategory(slug) {
-            selectChip(slug);
-        }
-
         // ── Render results (flat when filtered, grouped when "All") ──────────
         function renderResults(results, query) {
             listEl.innerHTML = '';
@@ -428,7 +423,7 @@
                 // Grouped by category
                 var groups = groupByCategory(results);
                 groups.forEach(function (g) {
-                    listEl.appendChild(buildGroup(g.slug, g.name, g.items, query, filterByCategory));
+                    listEl.appendChild(buildGroup(g.slug, g.name, g.items, query, selectChip));
                 });
             }
 
