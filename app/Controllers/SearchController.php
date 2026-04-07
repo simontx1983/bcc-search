@@ -340,7 +340,7 @@ class SearchController
 
             $hash   = $row->avatar_hash ?? '';
             $avatar = $hash
-                ? $ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
+                ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
                 : $ps['default_avatar'];
 
             $url = $ps['url_base']
@@ -501,7 +501,7 @@ class SearchController
 
             $hash   = $row->avatar_hash ?? '';
             $avatar = $hash
-                ? $ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg'
+                ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
                 : $ps['default_avatar'];
 
             $url = $ps['url_base']
