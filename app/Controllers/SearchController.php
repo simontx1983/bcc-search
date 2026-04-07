@@ -284,42 +284,11 @@ class SearchController
         // Take only the top LIMIT winners.
         $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
 
-        // Hydrate only the winners — post data + category + avatar in one query.
-        $id_placeholders = implode(',', array_fill(0, count($winner_ids), '%d'));
-        // Safe: values are int-cast; FIELD() cannot be parameterized via $wpdb->prepare().
-        $id_list         = implode(',', array_map('intval', $winner_ids));
-
-        $hydrate_sql = $wpdb->prepare(
-            "SELECT
-                p.ID,
-                p.post_title,
-                p.post_name,
-                " . ($cat_info
-                    ? "MIN(catl.post_title) AS category_name,
-                       MIN(catl.post_name)  AS category_slug,"
-                    : "NULL AS category_name,
-                       NULL AS category_slug,") . "
-                pm_av.meta_value     AS avatar_hash
-             FROM {$posts_table} p
-             " . ($cat_info
-                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
-                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
-                                                         AND catl.post_type = 'peepso-page-cat'
-                                                         AND catl.post_status = 'publish'"
-                : "") . "
-             LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
-                                                AND pm_av.meta_key = 'peepso_page_avatar_hash'
-             WHERE p.ID IN ({$id_placeholders})
-             GROUP BY p.ID
-             ORDER BY FIELD(p.ID, {$id_list})",
-            ...$winner_ids
-        );
-
-        $rows = $wpdb->get_results($hydrate_sql);
-
         // Resolve the filtered category name once (for display override).
         $filtered_cat_name = null;
+        $filtered_cat_slug = null;
         if ($type !== '') {
+            $filtered_cat_slug = $type;
             $categories = $this->get_categories();
             foreach ($categories as $cat) {
                 if ($cat['slug'] === $type) {
@@ -329,35 +298,7 @@ class SearchController
             }
         }
 
-        // Pre-compute URL base and asset paths once instead of per-row.
-        $ps = self::peepso_assets();
-
-        $results = [];
-        foreach ($rows as $row) {
-            $pid   = (int) $row->ID;
-            $score = $scores_by_id[$pid] ?? null;
-            $tier  = is_array($score) ? ($score['reputation_tier'] ?? null) : null;
-
-            $hash   = $row->avatar_hash ?? '';
-            $avatar = $hash
-                ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
-                : $ps['default_avatar'];
-
-            $url = $ps['url_base']
-                ? $ps['url_base'] . $row->post_name . '/'
-                : home_url('/pages/' . $row->post_name . '/');
-
-            $results[] = [
-                'id'            => $pid,
-                'title'         => $row->post_title,
-                'url'           => $url,
-                'avatar'        => $avatar,
-                'score'         => is_array($score) ? (int) $score['total_score'] : null,
-                'tier'          => $tier,
-                'category'      => $filtered_cat_name ?? $row->category_name ?? null,
-                'category_slug' => ($type !== '' ? $type : null) ?? $row->category_slug ?? null,
-            ];
-        }
+        $results = $this->hydrateAndFormat($winner_ids, $scores_by_id, $filtered_cat_name, $filtered_cat_slug);
 
         $response = [
             'results'    => $results,
@@ -401,6 +342,92 @@ class SearchController
     }
 
     /**
+     * Hydrate winner IDs into full result rows (shared by search + trending).
+     *
+     * Runs a single SQL query to fetch post data, category info, and avatar hash,
+     * then formats each row with trust scores and PeepSo asset URLs.
+     *
+     * @param int[]       $winnerIds       Ordered page IDs to hydrate.
+     * @param array       $scoresById      Trust-score arrays keyed by page ID.
+     * @param string|null $filteredCatName  Category name override (search filter).
+     * @param string|null $filteredCatSlug  Category slug override (search filter).
+     * @return array Formatted result rows.
+     */
+    private function hydrateAndFormat(
+        array $winnerIds,
+        array $scoresById,
+        ?string $filteredCatName = null,
+        ?string $filteredCatSlug = null
+    ): array {
+        global $wpdb;
+
+        $posts_table = $wpdb->posts;
+        $cat_info    = self::peepso_category_table();
+
+        $id_placeholders = implode(',', array_fill(0, count($winnerIds), '%d'));
+        // Safe: values are int-cast; FIELD() cannot be parameterized via $wpdb->prepare().
+        $id_list         = implode(',', array_map('intval', $winnerIds));
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT
+                p.ID,
+                p.post_title,
+                p.post_name,
+                " . ($cat_info
+                    ? "MIN(catl.post_title) AS category_name,
+                       MIN(catl.post_name)  AS category_slug,"
+                    : "NULL AS category_name,
+                       NULL AS category_slug,") . "
+                pm_av.meta_value     AS avatar_hash
+             FROM {$posts_table} p
+             " . ($cat_info
+                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
+                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
+                                                         AND catl.post_type = 'peepso-page-cat'
+                                                         AND catl.post_status = 'publish'"
+                : "") . "
+             LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
+                                                AND pm_av.meta_key = 'peepso_page_avatar_hash'
+             WHERE p.ID IN ({$id_placeholders})
+             GROUP BY p.ID
+             ORDER BY FIELD(p.ID, {$id_list})",
+            ...$winnerIds
+        ));
+
+        // Pre-compute URL base and asset paths once instead of per-row.
+        $ps = self::peepso_assets();
+
+        $results = [];
+        foreach ($rows as $row) {
+            $pid   = (int) $row->ID;
+            $score = $scoresById[$pid] ?? null;
+            $tier  = is_array($score) ? ($score['reputation_tier'] ?? null) : null;
+
+            $hash   = $row->avatar_hash ?? '';
+            $avatar = $hash
+                ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
+                : $ps['default_avatar'];
+
+            $url = $ps['url_base']
+                ? $ps['url_base'] . $row->post_name . '/'
+                : home_url('/pages/' . $row->post_name . '/');
+
+            $results[] = [
+                'id'            => $pid,
+                'title'         => $row->post_title,
+                'url'           => $url,
+                'avatar'        => $avatar,
+                'score'         => is_array($score) ? (int) $score['total_score'] : null,
+                'tier'          => $tier,
+                'category'      => $filteredCatName ?? $row->category_name ?? null,
+                'category_slug' => $filteredCatSlug ?? $row->category_slug ?? null,
+            ];
+        }
+
+        return $results;
+    }
+
+    /**
      * Dynamic candidate cap — shorter queries cast a wider net.
      */
     private function getCandidateCap(string $query): int
@@ -429,7 +456,6 @@ class SearchController
         }
 
         $posts_table = $wpdb->posts;
-        $cat_info    = self::peepso_category_table();
 
         // Fetch a pool of published page IDs (no LIKE filter).
         $candidate_ids = array_map('intval', $wpdb->get_col(
@@ -460,65 +486,7 @@ class SearchController
 
         $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
 
-        // Hydrate winners.
-        $id_placeholders = implode(',', array_fill(0, count($winner_ids), '%d'));
-        // Safe: values are int-cast; FIELD() cannot be parameterized via $wpdb->prepare().
-        $id_list = implode(',', array_map('intval', $winner_ids));
-
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT
-                p.ID,
-                p.post_title,
-                p.post_name,
-                " . ($cat_info
-                    ? "MIN(catl.post_title) AS category_name,
-                       MIN(catl.post_name)  AS category_slug,"
-                    : "NULL AS category_name,
-                       NULL AS category_slug,") . "
-                pm_av.meta_value     AS avatar_hash
-             FROM {$posts_table} p
-             " . ($cat_info
-                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
-                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
-                                                         AND catl.post_type = 'peepso-page-cat'
-                                                         AND catl.post_status = 'publish'"
-                : "") . "
-             LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
-                                                AND pm_av.meta_key = 'peepso_page_avatar_hash'
-             WHERE p.ID IN ({$id_placeholders})
-             GROUP BY p.ID
-             ORDER BY FIELD(p.ID, {$id_list})",
-            ...$winner_ids
-        ));
-
-        $ps = self::peepso_assets();
-
-        $results = [];
-        foreach ($rows as $row) {
-            $pid   = (int) $row->ID;
-            $score = $scores_by_id[$pid] ?? null;
-            $tier  = is_array($score) ? ($score['reputation_tier'] ?? null) : null;
-
-            $hash   = $row->avatar_hash ?? '';
-            $avatar = $hash
-                ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
-                : $ps['default_avatar'];
-
-            $url = $ps['url_base']
-                ? $ps['url_base'] . $row->post_name . '/'
-                : home_url('/pages/' . $row->post_name . '/');
-
-            $results[] = [
-                'id'            => $pid,
-                'title'         => $row->post_title,
-                'url'           => $url,
-                'avatar'        => $avatar,
-                'score'         => is_array($score) ? (int) $score['total_score'] : null,
-                'tier'          => $tier,
-                'category'      => $row->category_name ?? null,
-                'category_slug' => $row->category_slug ?? null,
-            ];
-        }
+        $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
 
         $response = [
             'results'    => $results,
