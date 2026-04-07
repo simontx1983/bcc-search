@@ -51,6 +51,34 @@ add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
 });
 
+// ── Gutenberg block registration ────────────────────────────────────────────
+add_filter('block_categories_all', function (array $categories): array {
+    // Avoid duplicate registration if another BCC Search block adds the category.
+    foreach ($categories as $cat) {
+        if (($cat['slug'] ?? '') === 'bcc-search') {
+            return $categories;
+        }
+    }
+    $categories[] = [
+        'slug'  => 'bcc-search',
+        'title' => __('BCC Search', 'bcc-search'),
+        'icon'  => null,
+    ];
+    return $categories;
+}, 10, 1);
+
+add_action('init', function () {
+    wp_register_script(
+        'bcc-search-blocks-editor',
+        BCC_SEARCH_URL . 'blocks/search-bar/editor.js',
+        ['wp-blocks', 'wp-element', 'wp-block-editor', 'wp-components', 'wp-server-side-render'],
+        BCC_SEARCH_VERSION,
+        true
+    );
+
+    register_block_type(BCC_SEARCH_PATH . 'blocks/search-bar');
+});
+
 /**
  * Shortcode: [bcc_search]
  *

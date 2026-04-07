@@ -1,0 +1,28 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "bcc-search/search-bar",
+    "version": "1.1.0",
+    "title": "BCC Search Bar",
+    "category": "bcc-search",
+    "icon": "search",
+    "description": "Live search bar for PeepSo project pages with optional type filter chips.",
+    "keywords": ["search", "find", "discover", "project"],
+    "textdomain": "bcc-search",
+    "attributes": {
+        "placeholder": {
+            "type": "string",
+            "default": "Search projects\u2026"
+        },
+        "showType": {
+            "type": "boolean",
+            "default": true
+        }
+    },
+    "supports": {
+        "html": false,
+        "align": ["wide", "full"]
+    },
+    "render": "file:./render.php",
+    "editorScript": "bcc-search-blocks-editor"
+}
