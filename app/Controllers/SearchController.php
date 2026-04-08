@@ -457,34 +457,62 @@ class SearchController
 
         $posts_table = $wpdb->posts;
 
-        // Fetch a pool of published page IDs (no LIKE filter).
-        $candidate_ids = array_map('intval', $wpdb->get_col(
-            "SELECT p.ID
-             FROM {$posts_table} p
-             WHERE p.post_type = 'peepso-page'
-               AND p.post_status = 'publish'
-             ORDER BY p.ID DESC
-             LIMIT 500"
-        ));
+        // Fast path: JOIN with scores table and sort in SQL (single query).
+        $winner_ids   = [];
+        $scores_by_id = [];
 
-        if ($wpdb->last_error || empty($candidate_ids)) {
+        if (class_exists('\\BCC\\Trust\\Database\\TableRegistry')) {
+            $scores_table = \BCC\Trust\Database\TableRegistry::scores();
+            $limit        = self::LIMIT;
+
+            $rows = $wpdb->get_results(
+                "SELECT p.ID, s.total_score, s.reputation_tier
+                 FROM {$posts_table} p
+                 INNER JOIN {$scores_table} s ON s.page_id = p.ID
+                 WHERE p.post_type = 'peepso-page'
+                   AND p.post_status = 'publish'
+                 ORDER BY s.total_score DESC, p.ID ASC
+                 LIMIT {$limit}"
+            );
+
+            foreach ($rows as $row) {
+                $pid = (int) $row->ID;
+                $winner_ids[] = $pid;
+                $scores_by_id[$pid] = [
+                    'total_score'     => (float) $row->total_score,
+                    'reputation_tier' => $row->reputation_tier,
+                ];
+            }
+        }
+
+        // Fallback: fetch 500 IDs and sort in PHP if trust-engine is unavailable.
+        if (empty($winner_ids)) {
+            $candidate_ids = array_map('intval', $wpdb->get_col(
+                "SELECT p.ID
+                 FROM {$posts_table} p
+                 WHERE p.post_type = 'peepso-page'
+                   AND p.post_status = 'publish'
+                 ORDER BY p.ID DESC
+                 LIMIT 500"
+            ));
+
+            if (!empty($candidate_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
+                $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+
+                usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
+                    $sa = $scores_by_id[$a]['total_score'] ?? 0.0;
+                    $sb = $scores_by_id[$b]['total_score'] ?? 0.0;
+                    return ($sb <=> $sa) ?: ($a <=> $b);
+                });
+
+                $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
+            }
+        }
+
+        if (empty($winner_ids)) {
             $response = ['results' => [], 'categories' => $this->get_categories()];
             return rest_ensure_response($response);
         }
-
-        // Rank by trust score only.
-        $scores_by_id = [];
-        if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-            $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
-        }
-
-        usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
-            $sa = $scores_by_id[$a]['total_score'] ?? 0.0;
-            $sb = $scores_by_id[$b]['total_score'] ?? 0.0;
-            return ($sb <=> $sa) ?: ($a <=> $b);
-        });
-
-        $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
 
         $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
 
