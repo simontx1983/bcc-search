@@ -462,18 +462,17 @@ class SearchController
         $scores_by_id = [];
 
         if (class_exists('\\BCC\\Trust\\Database\\TableRegistry')) {
-            $scores_table = \BCC\Trust\Database\TableRegistry::scores();
-            $limit        = self::LIMIT;
+            $rm_table = \BCC\Trust\Database\TableRegistry::pageReadModel();
+            $limit    = self::LIMIT;
 
-            $rows = $wpdb->get_results(
-                "SELECT p.ID, s.total_score, s.reputation_tier
-                 FROM {$posts_table} p
-                 INNER JOIN {$scores_table} s ON s.page_id = p.ID
-                 WHERE p.post_type = 'peepso-page'
-                   AND p.post_status = 'publish'
-                 ORDER BY s.total_score DESC, p.ID ASC
-                 LIMIT {$limit}"
-            );
+            // Single-table read from the denormalized read model — no JOIN needed.
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT page_id AS ID, trust_score AS total_score, reputation_tier
+                 FROM {$rm_table}
+                 ORDER BY trust_score DESC, page_id ASC
+                 LIMIT %d",
+                $limit
+            ));
 
             foreach ($rows as $row) {
                 $pid = (int) $row->ID;
