@@ -295,7 +295,7 @@
             preloadFetching = true;
             var url = new URL(bccSearch.restUrl);
             url.searchParams.set('trending', '1');
-            fetch(url.toString(), { headers: { 'X-WP-Nonce': bccSearch.nonce } })
+            fetch(url.toString())
                 .then(function (res) { return res.ok ? res.json() : null; })
                 .then(function (json) {
                     if (json && Array.isArray(json.results)) {
@@ -452,8 +452,7 @@
 
             try {
                 const res = await fetch(url.toString(), {
-                    signal:  controller.signal,
-                    headers: { 'X-WP-Nonce': bccSearch.nonce },
+                    signal: controller.signal,
                 });
 
                 widget.classList.remove('bcc-search--loading');

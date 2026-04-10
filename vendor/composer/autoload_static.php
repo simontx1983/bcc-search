@@ -22,6 +22,7 @@ class ComposerStaticInit01a6b85c621fb3373fd6f39353ebbe86
 
     public static $classMap = array (
         'BCC\\Search\\Controllers\\SearchController' => __DIR__ . '/../..' . '/app/Controllers/SearchController.php',
+        'BCC\\Search\\Repositories\\SearchRepository' => __DIR__ . '/../..' . '/app/Repositories/SearchRepository.php',
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
     );
 

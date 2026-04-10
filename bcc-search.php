@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Blue Collar Crypto – Search
  * Description: Live search bar for PeepSo project pages, filterable by Validators, Builders, and NFT Creators.
- * Version: 1.1.0
+ * Version: 1.0.0
  * Author: Blue Collar Labs LLC
  * Text Domain: bcc-search
  * Requires at least: 5.8
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('BCC_SEARCH_VERSION', '1.1.0');
+define('BCC_SEARCH_VERSION', '1.0.0');
 define('BCC_SEARCH_PATH', plugin_dir_path(__FILE__));
 define('BCC_SEARCH_URL', plugin_dir_url(__FILE__));
 
@@ -107,7 +107,6 @@ add_shortcode('bcc_search', function ($atts) {
     );
     wp_localize_script('bcc-search', 'bccSearch', [
         'restUrl' => esc_url_raw(rest_url('bcc/v1/search')),
-        'nonce'   => wp_create_nonce('wp_rest'),
     ]);
 
     ob_start();

@@ -12,6 +12,3 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 
 // Clean up options.
 delete_option('bcc_search_cache_version');
-
-// Clean up transients.
-delete_transient('bcc_search_categories');

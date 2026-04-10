@@ -30,7 +30,6 @@ wp_enqueue_script(
 );
 wp_localize_script('bcc-search', 'bccSearch', [
     'restUrl' => esc_url_raw(rest_url('bcc/v1/search')),
-    'nonce'   => wp_create_nonce('wp_rest'),
 ]);
 
 $wrapper_attributes = get_block_wrapper_attributes();

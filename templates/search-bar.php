@@ -18,7 +18,7 @@ $results_id  = 'bcc-search-results-' . uniqid();
 
     <?php if ($show_type) : ?>
     <div class="bcc-search__chips" role="radiogroup" aria-label="<?php esc_attr_e('Filter by type', 'bcc-search'); ?>">
-        <button class="bcc-search__chip bcc-search__chip--active" type="button" data-type="">All Types</button>
+        <button class="bcc-search__chip bcc-search__chip--active" type="button" data-type=""><?php esc_html_e('All Types', 'bcc-search'); ?></button>
     </div>
     <?php endif; ?>
 
