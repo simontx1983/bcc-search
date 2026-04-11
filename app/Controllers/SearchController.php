@@ -66,6 +66,14 @@ class SearchController
                 self::bust_search_cache();
             }
         });
+
+        // Bust search cache when trust scores change (votes, endorsements,
+        // dispute resolution). Without this, search results serve stale
+        // trust scores and rankings for up to 300 seconds.
+        add_action('bcc_trust_vote_changed', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc_trust_endorsement_added', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc_trust_endorsement_removed', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc_trust_score_recalculated', [__CLASS__, 'bust_search_cache'], 10, 0);
     }
 
     public function register_routes(): void
@@ -125,14 +133,15 @@ class SearchController
         $q    = trim($request->get_param('q'));
         $type = trim($request->get_param('type'));
 
-        // Require at least 2 chars to search
-        if (mb_strlen($q) < 2) {
+        // Require 2–100 chars to search
+        $qLen = mb_strlen($q);
+        if ($qLen < 2 || $qLen > 100) {
             return rest_ensure_response(['results' => [], 'categories' => SearchRepository::getCategories()]);
         }
 
         // Return cached results if available.
         $cache_version = get_option(self::SEARCH_VERSION_KEY, 1);
-        $cache_key     = 'search_' . md5(mb_strtolower($q) . '|' . $type . '|' . $cache_version);
+        $cache_key     = 'search_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $cache_version);
         $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
         if (is_array($cached)) {
             return rest_ensure_response($cached);
@@ -158,9 +167,16 @@ class SearchController
         }
 
         // ── Phase 2: Score, rank, then hydrate winners ──────────────────
+        // Wrapped in try/catch so search still returns results (scoreless)
+        // when the trust engine is unavailable or throws.
         $scores_by_id = [];
         if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-            $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+            try {
+                $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+            } catch (\Throwable $e) {
+                // Degrade gracefully — return results without trust scores.
+                $scores_by_id = [];
+            }
         }
 
         $rank_scores = [];
@@ -279,12 +295,12 @@ class SearchController
     {
         $len = mb_strlen($query);
         if ($len >= 5) {
-            return 500;
+            return 100;
         }
         if ($len >= 3) {
-            return 1000;
+            return 80;
         }
-        return 300;
+        return 50;
     }
 
     /**
@@ -348,6 +364,6 @@ class SearchController
 
     public static function bust_search_cache(): void
     {
-        update_option(self::SEARCH_VERSION_KEY, time());
+        update_option(self::SEARCH_VERSION_KEY, time(), false);
     }
 }
