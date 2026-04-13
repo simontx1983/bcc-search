@@ -102,6 +102,9 @@ class SearchController
         ]);
     }
 
+    /**
+     * @return \WP_REST_Response|\WP_Error
+     */
     public function handle_search(\WP_REST_Request $request)
     {
         // Rate limiting by client IP.
@@ -248,6 +251,10 @@ class SearchController
 
     /**
      * Format hydrated DB rows into API response items.
+     *
+     * @param int[] $winnerIds
+     * @param array<int, array{total_score: float, reputation_tier: string|null}> $scoresById
+     * @return array<int, array{id: int, title: string, url: string, avatar: string, score: int|null, tier: string|null, category: string|null, category_slug: string|null}>
      */
     private function hydrateAndFormat(
         array $winnerIds,
@@ -305,6 +312,8 @@ class SearchController
 
     /**
      * Trending: top-scored published pages.
+     *
+     * @return \WP_REST_Response
      */
     private function handle_trending()
     {

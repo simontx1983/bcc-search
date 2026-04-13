@@ -55,11 +55,74 @@ final class SearchRepository
         return $cache[$prefix];
     }
 
+    // ── FULLTEXT index management ──────────────────────────────────────
+
+    private static bool $ftIndexChecked = false;
+
+    /**
+     * Ensure a FULLTEXT index exists on wp_posts.post_title.
+     *
+     * Called from the activation hook (primary) and as a runtime safety
+     * net from searchCandidates(). The persistent option guard ensures
+     * the ALTER TABLE only runs once — during activation, not mid-request.
+     */
+    public static function ensureFulltextIndex(): void
+    {
+        if (self::$ftIndexChecked) {
+            return;
+        }
+        self::$ftIndexChecked = true;
+
+        // Use a persistent flag so only one process ever attempts ALTER TABLE.
+        // The index is created on plugin activation; this is a runtime safety net.
+        if (get_option('bcc_ft_index_installed')) {
+            return;
+        }
+
+        global $wpdb;
+
+        $exists = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM information_schema.STATISTICS
+             WHERE table_schema = DATABASE()
+               AND table_name = %s
+               AND index_name = %s",
+            $wpdb->posts,
+            'bcc_ft_post_title'
+        ));
+
+        if ($exists) {
+            update_option('bcc_ft_index_installed', 1, true);
+            return;
+        }
+
+        // Attempt creation with a lock to prevent thundering herd.
+        $locked = (int) $wpdb->get_var("SELECT GET_LOCK('bcc_ft_index', 0)");
+        if ($locked !== 1) {
+            return; // Another process is creating it — fall through to LIKE.
+        }
+
+        $wpdb->query(
+            "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_title (post_title)"
+        );
+        update_option('bcc_ft_index_installed', 1, true);
+
+        $wpdb->query("SELECT RELEASE_LOCK('bcc_ft_index')");
+    }
+
     // ── Candidate search query ──────────────────────────────────────────
 
     /**
      * Find candidate page IDs matching a search query.
-     * Returns array of objects with ->ID and ->post_title.
+     *
+     * Strategy:
+     *   - Queries >= 3 chars: FULLTEXT MATCH...AGAINST in BOOLEAN MODE
+     *     (uses index, no table scan). Falls back to prefix LIKE if
+     *     FULLTEXT index doesn't exist yet or returns no results.
+     *   - Queries < 3 chars: prefix LIKE only (2-char queries are too
+     *     short for FULLTEXT minimum word length).
+     *
+     * The old LIKE '%query%' (leading wildcard) is removed entirely —
+     * it forced full table scans and was the primary scaling bottleneck.
      *
      * @param string $query Search term (min 2 chars).
      * @param string $type  Category slug filter (empty = all).
@@ -73,12 +136,6 @@ final class SearchRepository
         $posts_table = $wpdb->posts;
         $cat_info    = self::peepsoCategoryTable();
 
-        $prefix_like = $wpdb->esc_like($query) . '%';
-        $infix_like  = '%' . $wpdb->esc_like($query) . '%';
-
-        // If a category filter was requested but the category table doesn't
-        // exist, return empty rather than silently dropping the filter and
-        // returning mislabelled results.
         if ($type !== '' && !$cat_info) {
             return [];
         }
@@ -99,29 +156,50 @@ final class SearchRepository
 
         $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish'";
 
+        // ── FULLTEXT path (queries >= 3 chars) ──────────────────────────
+        if (mb_strlen($query) >= 3) {
+            self::ensureFulltextIndex();
+
+            // Strip FULLTEXT boolean operators to prevent query-semantics injection.
+            $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
+            $ft_term  = trim($ft_clean) . '*';
+
+            $sql = $wpdb->prepare(
+                "SELECT {$distinct} p.ID, p.post_title
+                 FROM {$posts_table} p
+                 {$cat_join}
+                 WHERE {$base_where}
+                   AND MATCH(p.post_title) AGAINST(%s IN BOOLEAN MODE)
+                   {$cat_where}
+                 ORDER BY MATCH(p.post_title) AGAINST(%s IN BOOLEAN MODE) DESC,
+                          p.post_title ASC
+                 LIMIT %d",
+                $ft_term,
+                $ft_term,
+                $cap
+            );
+
+            $rows = $wpdb->get_results($sql);
+
+            if (!$wpdb->last_error && !empty($rows)) {
+                return $rows;
+            }
+            // Fall through to LIKE if FULLTEXT unavailable or empty.
+        }
+
+        // ── Prefix LIKE fallback (no leading wildcard) ──────────────────
+        $prefix_like = $wpdb->esc_like($query) . '%';
+
         $sql = $wpdb->prepare(
-            "(SELECT {$distinct} p.ID, p.post_title
-              FROM {$posts_table} p
-              {$cat_join}
-              WHERE {$base_where}
-                AND p.post_title LIKE %s
-                {$cat_where}
-              ORDER BY p.post_title ASC
-              LIMIT %d)
-             UNION
-             (SELECT {$distinct} p.ID, p.post_title
-              FROM {$posts_table} p
-              {$cat_join}
-              WHERE {$base_where}
-                AND p.post_title LIKE %s
-                {$cat_where}
-              ORDER BY p.post_title ASC
-              LIMIT %d)
+            "SELECT {$distinct} p.ID, p.post_title
+             FROM {$posts_table} p
+             {$cat_join}
+             WHERE {$base_where}
+               AND p.post_title LIKE %s
+               {$cat_where}
+             ORDER BY p.post_title ASC
              LIMIT %d",
             $prefix_like,
-            $cap,
-            $infix_like,
-            $cap,
             $cap
         );
 
@@ -153,6 +231,7 @@ final class SearchRepository
         $posts_table = $wpdb->posts;
         $cat_info    = self::peepsoCategoryTable();
 
+        $ids = array_slice($ids, 0, 50); // Hard safety cap on hydration batch size.
         $id_placeholders    = implode(',', array_fill(0, count($ids), '%d'));
         $field_placeholders = implode(',', array_fill(0, count($ids), '%d'));
 
@@ -182,38 +261,24 @@ final class SearchRepository
              GROUP BY p.ID
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
-            ...array_merge($ids, $ids, [count($ids)])
+            ...array_merge($ids, $ids, [min(count($ids), 50)])
         ));
     }
 
     // ── Trending queries ────────────────────────────────────────────────
 
     /**
-     * Get trending pages from the trust-engine read model.
+     * Get trending pages via the TrendingDataInterface contract.
+     *
+     * Uses ServiceLocator so bcc-search has no direct dependency on
+     * bcc-trust-engine's internal TableRegistry or read model tables.
      *
      * @param int $limit Max results.
      * @return object[] Rows with ->ID, ->total_score, ->reputation_tier.
      */
     public static function getTrendingFromReadModel(int $limit): array
     {
-        if (!class_exists('\\BCC\\Trust\\Database\\TableRegistry')) {
-            return [];
-        }
-
-        global $wpdb;
-        $rm_table    = \BCC\Trust\Database\TableRegistry::pageReadModel();
-        $posts_table = $wpdb->posts;
-
-        return $wpdb->get_results($wpdb->prepare(
-            "SELECT rm.page_id AS ID, rm.trust_score AS total_score, rm.reputation_tier
-             FROM {$rm_table} rm
-             INNER JOIN {$posts_table} p ON p.ID = rm.page_id
-                                         AND p.post_type   = 'peepso-page'
-                                         AND p.post_status = 'publish'
-             ORDER BY rm.trust_score DESC, rm.page_id ASC
-             LIMIT %d",
-            $limit
-        ));
+        return \BCC\Core\ServiceLocator::resolveTrendingData()->getTrendingPages($limit);
     }
 
     /**

@@ -30,6 +30,16 @@ if ( ! defined( 'BCC_CORE_VERSION' ) ) {
     return;
 }
 
+// ── Activation hook: create FULLTEXT index during activation, not mid-request
+register_activation_hook( __FILE__, function () {
+    // Defer to after autoloader is available.
+    $autoloader = plugin_dir_path( __FILE__ ) . 'vendor/autoload.php';
+    if ( file_exists( $autoloader ) ) {
+        require_once $autoloader;
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+    }
+} );
+
 // ── PSR-4 autoloader ────────────────────────────────────────────────────────
 $bcc_search_autoloader = BCC_SEARCH_PATH . 'vendor/autoload.php';
 if ( ! file_exists( $bcc_search_autoloader ) ) {
