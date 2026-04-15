@@ -6,7 +6,7 @@
     "title": "BCC Search Bar",
     "category": "bcc-search",
     "icon": "search",
-    "description": "Live search bar for PeepSo project pages with optional type filter chips.",
+    "description": "Live search bar for finding community projects by name. Place on any page — works standalone. Also available as [bcc_search] shortcode.",
     "keywords": ["search", "find", "discover", "project"],
     "textdomain": "bcc-search",
     "attributes": {
