@@ -24,5 +24,5 @@
         "align": ["wide", "full"]
     },
     "render": "file:./render.php",
-    "editorScript": "bcc-search-blocks-editor"
+    "editorScript": "file:./editor.js"
 }

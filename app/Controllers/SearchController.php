@@ -67,13 +67,10 @@ class SearchController
             }
         });
 
-        // Bust search cache when trust scores change (votes, endorsements,
-        // dispute resolution). Without this, search results serve stale
-        // trust scores and rankings for up to 300 seconds.
-        add_action('bcc_trust_vote_changed', [__CLASS__, 'bust_search_cache'], 10, 0);
+        // Trust score changes rely on the 60s cache TTL for freshness.
+        // Busting on every vote/score change causes stampedes under active voting.
         add_action('bcc_trust_endorsement_added', [__CLASS__, 'bust_search_cache'], 10, 0);
         add_action('bcc_trust_endorsement_removed', [__CLASS__, 'bust_search_cache'], 10, 0);
-        add_action('bcc_trust_score_recalculated', [__CLASS__, 'bust_search_cache'], 10, 0);
     }
 
     public function register_routes(): void
@@ -136,6 +133,15 @@ class SearchController
         $q    = trim($request->get_param('q'));
         $type = trim($request->get_param('type'));
 
+        // Validate $type against known category slugs to prevent wasted
+        // DB queries on nonexistent categories and limit the SQL surface.
+        if ($type !== '') {
+            $validSlugs = array_column(SearchRepository::getCategories(), 'slug');
+            if (!in_array($type, $validSlugs, true)) {
+                return rest_ensure_response(['results' => [], 'categories' => SearchRepository::getCategories()]);
+            }
+        }
+
         // Require 2–100 chars to search
         $qLen = mb_strlen($q);
         if ($qLen < 2 || $qLen > 100) {
@@ -150,75 +156,89 @@ class SearchController
             return rest_ensure_response($cached);
         }
 
-        $cap = $this->getCandidateCap($q);
-
-        // ── Phase 1: Lightweight candidate query (via repository) ───────
-        $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
-
-        if (empty($candidate_rows)) {
-            $response = ['results' => [], 'categories' => SearchRepository::getCategories()];
-            wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
-            return rest_ensure_response($response);
+        // ── Stampede protection: prevent concurrent workers from all hitting DB ──
+        $lock_key = 'bcc_search_lock_' . md5($cache_key);
+        $locked = get_transient($lock_key);
+        if ($locked) {
+            // Another worker is building this cache entry; return empty to avoid stampede.
+            wp_cache_set($cache_key, [], self::CACHE_GROUP, 5); // short negative cache
+            return new \WP_REST_Response(['results' => [], 'total' => 0, 'cached' => false]);
         }
+        set_transient($lock_key, 1, 10); // 10-second lock
 
-        $candidate_ids = [];
-        $titles_by_id  = [];
-        foreach ($candidate_rows as $row) {
-            $id = (int) $row->ID;
-            $candidate_ids[]   = $id;
-            $titles_by_id[$id] = $row->post_title;
-        }
+        try {
+            $cap = $this->getCandidateCap($q);
 
-        // ── Phase 2: Score, rank, then hydrate winners ──────────────────
-        // Wrapped in try/catch so search still returns results (scoreless)
-        // when the trust engine is unavailable or throws.
-        $scores_by_id = [];
-        if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-            try {
-                $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
-            } catch (\Throwable $e) {
-                // Degrade gracefully — return results without trust scores.
-                $scores_by_id = [];
+            // ── Phase 1: Lightweight candidate query (via repository) ───────
+            $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
+
+            if (empty($candidate_rows)) {
+                $response = ['results' => [], 'categories' => SearchRepository::getCategories()];
+                wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
+                return rest_ensure_response($response);
             }
-        }
 
-        $rank_scores = [];
-        foreach ($candidate_ids as $id) {
-            $trust = $scores_by_id[$id]['total_score'] ?? 0.0;
-            $title = $titles_by_id[$id] ?? '';
-            $rank_scores[$id] = $this->computeRankScore($title, $q, $trust);
-        }
+            $candidate_ids = [];
+            $titles_by_id  = [];
+            foreach ($candidate_rows as $row) {
+                $id = (int) $row->ID;
+                $candidate_ids[]   = $id;
+                $titles_by_id[$id] = $row->post_title;
+            }
 
-        usort($candidate_ids, static function (int $a, int $b) use ($rank_scores): int {
-            return ($rank_scores[$b] <=> $rank_scores[$a]) ?: ($a <=> $b);
-        });
-
-        $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
-
-        // Resolve filtered category name.
-        $filtered_cat_name = null;
-        $filtered_cat_slug = null;
-        if ($type !== '') {
-            $filtered_cat_slug = $type;
-            $categories = SearchRepository::getCategories();
-            foreach ($categories as $cat) {
-                if ($cat['slug'] === $type) {
-                    $filtered_cat_name = $cat['name'];
-                    break;
+            // ── Phase 2: Score, rank, then hydrate winners ──────────────────
+            // Wrapped in try/catch so search still returns results (scoreless)
+            // when the trust engine is unavailable or throws.
+            $scores_by_id = [];
+            if (class_exists('\\BCC\\Core\\ServiceLocator')) {
+                try {
+                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+                } catch (\Throwable $e) {
+                    // Degrade gracefully — return results without trust scores.
+                    $scores_by_id = [];
                 }
             }
+
+            $rank_scores = [];
+            foreach ($candidate_ids as $id) {
+                $trust = $scores_by_id[$id]['total_score'] ?? 0.0;
+                $title = $titles_by_id[$id] ?? '';
+                $rank_scores[$id] = $this->computeRankScore($title, $q, $trust);
+            }
+
+            usort($candidate_ids, static function (int $a, int $b) use ($rank_scores): int {
+                return ($rank_scores[$b] <=> $rank_scores[$a]) ?: ($a <=> $b);
+            });
+
+            $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
+
+            // Resolve filtered category name.
+            $filtered_cat_name = null;
+            $filtered_cat_slug = null;
+            if ($type !== '') {
+                $filtered_cat_slug = $type;
+                $categories = SearchRepository::getCategories();
+                foreach ($categories as $cat) {
+                    if ($cat['slug'] === $type) {
+                        $filtered_cat_name = $cat['name'];
+                        break;
+                    }
+                }
+            }
+
+            $results = $this->hydrateAndFormat($winner_ids, $scores_by_id, $filtered_cat_name, $filtered_cat_slug);
+
+            $response = [
+                'results'    => $results,
+                'categories' => SearchRepository::getCategories(),
+            ];
+
+            wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
+
+            return rest_ensure_response($response);
+        } finally {
+            delete_transient($lock_key);
         }
-
-        $results = $this->hydrateAndFormat($winner_ids, $scores_by_id, $filtered_cat_name, $filtered_cat_slug);
-
-        $response = [
-            'results'    => $results,
-            'categories' => SearchRepository::getCategories(),
-        ];
-
-        wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
-
-        return rest_ensure_response($response);
     }
 
     /**
@@ -343,7 +363,12 @@ class SearchController
             $candidate_ids = SearchRepository::getFallbackPageIds(100);
 
             if (!empty($candidate_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
-                $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+                try {
+                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+                } catch (\Throwable $e) {
+                    // Degrade gracefully — return trending results without trust scores.
+                    $scores_by_id = [];
+                }
 
                 usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
                     $sa = $scores_by_id[$a]['total_score'] ?? 0.0;

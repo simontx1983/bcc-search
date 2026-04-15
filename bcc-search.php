@@ -78,14 +78,6 @@ add_filter('block_categories_all', function (array $categories): array {
 }, 10, 1);
 
 add_action('init', function () {
-    wp_register_script(
-        'bcc-search-blocks-editor',
-        BCC_SEARCH_URL . 'blocks/search-bar/editor.js',
-        ['wp-blocks', 'wp-element', 'wp-block-editor', 'wp-components', 'wp-server-side-render'],
-        BCC_SEARCH_VERSION,
-        true
-    );
-
     register_block_type(BCC_SEARCH_PATH . 'blocks/search-bar');
 });
 
@@ -116,7 +108,9 @@ add_shortcode('bcc_search', function ($atts) {
         true
     );
     wp_localize_script('bcc-search', 'bccSearch', [
-        'restUrl' => esc_url_raw(rest_url('bcc/v1/search')),
+        'restUrl'   => esc_url_raw(rest_url('bcc/v1/search')),
+        'tierCss'   => ['elite' => 'platinum', 'trusted' => 'gold', 'neutral' => 'silver', 'caution' => 'bronze', 'risky' => 'risky'],
+        'tierLabel' => ['elite' => 'Elite', 'trusted' => 'Trusted', 'neutral' => 'Neutral', 'caution' => 'Caution', 'risky' => 'Risky'],
     ]);
 
     ob_start();

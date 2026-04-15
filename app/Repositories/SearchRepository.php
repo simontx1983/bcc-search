@@ -91,7 +91,7 @@ final class SearchRepository
         ));
 
         if ($exists) {
-            update_option('bcc_ft_index_installed', 1, true);
+            update_option('bcc_ft_index_installed', 1, false);
             return;
         }
 
@@ -101,12 +101,17 @@ final class SearchRepository
             return; // Another process is creating it — fall through to LIKE.
         }
 
-        $wpdb->query(
-            "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_title (post_title)"
-        );
-        update_option('bcc_ft_index_installed', 1, true);
+        try {
+            $altered = $wpdb->query(
+                "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_title (post_title)"
+            );
 
-        $wpdb->query("SELECT RELEASE_LOCK('bcc_ft_index')");
+            if ($altered !== false) {
+                update_option('bcc_ft_index_installed', 1, false);
+            }
+        } finally {
+            $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");
+        }
     }
 
     // ── Candidate search query ──────────────────────────────────────────
@@ -158,7 +163,8 @@ final class SearchRepository
 
         // ── FULLTEXT path (queries >= 3 chars) ──────────────────────────
         if (mb_strlen($query) >= 3) {
-            self::ensureFulltextIndex();
+            // FULLTEXT index is created on activation; LIKE fallback handles absence.
+            // Do NOT call ensureFulltextIndex() here — it risks ALTER TABLE mid-request.
 
             // Strip FULLTEXT boolean operators to prevent query-semantics injection.
             $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
@@ -180,6 +186,10 @@ final class SearchRepository
             );
 
             $rows = $wpdb->get_results($sql);
+
+            if ($wpdb->last_error) {
+                error_log('[bcc-search] FULLTEXT query error, falling back to LIKE: ' . $wpdb->last_error);
+            }
 
             if (!$wpdb->last_error && !empty($rows)) {
                 return $rows;
@@ -278,6 +288,9 @@ final class SearchRepository
      */
     public static function getTrendingFromReadModel(int $limit): array
     {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')) {
+            return [];
+        }
         return \BCC\Core\ServiceLocator::resolveTrendingData()->getTrendingPages($limit);
     }
 

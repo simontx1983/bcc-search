@@ -29,7 +29,9 @@ wp_enqueue_script(
     true
 );
 wp_localize_script('bcc-search', 'bccSearch', [
-    'restUrl' => esc_url_raw(rest_url('bcc/v1/search')),
+    'restUrl'   => esc_url_raw(rest_url('bcc/v1/search')),
+    'tierCss'   => ['elite' => 'platinum', 'trusted' => 'gold', 'neutral' => 'silver', 'caution' => 'bronze', 'risky' => 'risky'],
+    'tierLabel' => ['elite' => 'Elite', 'trusted' => 'Trusted', 'neutral' => 'Neutral', 'caution' => 'Caution', 'risky' => 'Risky'],
 ]);
 
 $wrapper_attributes = get_block_wrapper_attributes();

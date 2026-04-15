@@ -56,9 +56,9 @@
         return /^https?:\/\//i.test(url) ? url : '#';
     }
 
-    // ─── Tier helpers ───────────────────────────────────────────────────────────
-    const TIER_CSS = { elite: 'platinum', trusted: 'gold', neutral: 'silver', caution: 'bronze', risky: 'risky' };
-    const TIER_LABEL = { elite: 'Elite', trusted: 'Trusted', neutral: 'Neutral', caution: 'Caution', risky: 'Risky' };
+    // ─── Tier helpers (server-provided via wp_localize_script) ────────────────
+    const TIER_CSS = (typeof bccSearch !== 'undefined' && bccSearch.tierCss) ? bccSearch.tierCss : {};
+    const TIER_LABEL = (typeof bccSearch !== 'undefined' && bccSearch.tierLabel) ? bccSearch.tierLabel : {};
 
     function tierClass(tier) {
         if (!tier) return '';
@@ -89,7 +89,7 @@
             : '';
 
         link.innerHTML = `
-            <img class="bcc-search__avatar" src="${escHtml(item.avatar || '')}" alt="" loading="lazy">
+            <img class="bcc-search__avatar" src="${safeUrl(item.avatar || '')}" alt="" loading="lazy">
             <span class="bcc-search__meta">
                 <span class="bcc-search__name">${highlight(item.title, query)}</span>
                 <span class="bcc-search__sub">${catHtml}</span>
