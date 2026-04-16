@@ -74,14 +74,14 @@
     function buildItem(item, query) {
         const li   = document.createElement('li');
         const link = document.createElement('a');
-        link.href      = safeUrl(item.url);
+        link.href      = safeUrl(item.page_url);
         link.className = RESULT_CLASS;
         link.setAttribute('role', 'option');
         link.setAttribute('tabindex', '-1');
 
         const label = tierLabel(item.tier);
-        const scoreHtml = item.score !== null && item.score !== undefined
-            ? `<span class="bcc-search__score ${tierClass(item.tier)}">${label ? escHtml(label) + ' \u00B7 ' : ''}${item.score}</span>`
+        const scoreHtml = item.trust_score !== null && item.trust_score !== undefined
+            ? `<span class="bcc-search__score ${tierClass(item.tier)}">${label ? escHtml(label) + ' \u00B7 ' : ''}${item.trust_score}</span>`
             : '';
 
         const catHtml = item.category
@@ -89,9 +89,9 @@
             : '';
 
         link.innerHTML = `
-            <img class="bcc-search__avatar" src="${safeUrl(item.avatar || '')}" alt="" loading="lazy">
+            <img class="bcc-search__avatar" src="${safeUrl(item.avatar_url || '')}" alt="" loading="lazy">
             <span class="bcc-search__meta">
-                <span class="bcc-search__name">${highlight(item.title, query)}</span>
+                <span class="bcc-search__name">${highlight(item.page_name, query)}</span>
                 <span class="bcc-search__sub">${catHtml}</span>
             </span>
             ${scoreHtml}
@@ -112,7 +112,7 @@
             }
             var g = groups.get(slug);
             g.items.push(item);
-            var s = (item.score !== null && item.score !== undefined) ? item.score : -1;
+            var s = (item.trust_score !== null && item.trust_score !== undefined) ? item.trust_score : -1;
             if (s > g.topScore) g.topScore = s;
         }
         // Sort groups: highest top-score first

@@ -67,10 +67,13 @@ class SearchController
             }
         });
 
-        // Trust score changes rely on the 60s cache TTL for freshness.
-        // Busting on every vote/score change causes stampedes under active voting.
+        // Trust score changes: bust on endorsement and score recalculation events.
+        // Individual votes rely on the 60s cache TTL for freshness — busting on
+        // every single vote causes stampedes under active voting. Score recalcs
+        // are batched by cron so they're safe to bust on directly.
         add_action('bcc_trust_endorsement_added', [__CLASS__, 'bust_search_cache'], 10, 0);
         add_action('bcc_trust_endorsement_removed', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc_trust_score_recalculated', [__CLASS__, 'bust_search_cache'], 10, 0);
     }
 
     public function register_routes(): void
@@ -187,12 +190,12 @@ class SearchController
             }
 
             // ── Phase 2: Score, rank, then hydrate winners ──────────────────
-            // Wrapped in try/catch so search still returns results (scoreless)
-            // when the trust engine is unavailable or throws.
+            // Use enriched scores (same composite ranking as /discover) so
+            // search and discovery produce consistent trust-based ordering.
             $scores_by_id = [];
             if (class_exists('\\BCC\\Core\\ServiceLocator')) {
                 try {
-                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($candidate_ids);
                 } catch (\Throwable $e) {
                     // Degrade gracefully — return results without trust scores.
                     $scores_by_id = [];
@@ -201,9 +204,9 @@ class SearchController
 
             $rank_scores = [];
             foreach ($candidate_ids as $id) {
-                $trust = $scores_by_id[$id]['total_score'] ?? 0.0;
-                $title = $titles_by_id[$id] ?? '';
-                $rank_scores[$id] = $this->computeRankScore($title, $q, $trust);
+                $ranking = $scores_by_id[$id]['ranking_score'] ?? 0.0;
+                $title   = $titles_by_id[$id] ?? '';
+                $rank_scores[$id] = $this->computeRankScore($title, $q, $ranking);
             }
 
             usort($candidate_ids, static function (int $a, int $b) use ($rank_scores): int {
@@ -243,8 +246,15 @@ class SearchController
 
     /**
      * Compute a blended rank score from match relevance (40%) and trust (60%).
+     *
+     * The $compositeScore is the ranking_score from the trust engine's read
+     * model — the same formula used by GET /bcc/v1/discover. This ensures
+     * search and discovery produce consistent trust-based ordering.
+     *
+     * The composite score is unbounded (typically 0–80 range). We normalize
+     * it to 0–1 using a soft cap at 80 before blending with text relevance.
      */
-    private function computeRankScore(string $title, string $query, float $trustScore): float
+    private function computeRankScore(string $title, string $query, float $compositeScore): float
     {
         $titleLower = mb_strtolower($title);
         $queryLower = mb_strtolower($query);
@@ -264,7 +274,9 @@ class SearchController
 
         $lengthBonus = 1.0 - (min(mb_strlen($titleLower), 100) / 200);
         $relevance   = ($matchScore * 0.6) + ($lengthBonus * 0.4);
-        $trust       = min($trustScore, 100) / 100;
+
+        // Normalize composite ranking score to 0–1 with soft cap at 80.
+        $trust = min($compositeScore / 80.0, 1.0);
 
         return ($trust * 0.6) + ($relevance * 0.4);
     }
@@ -272,9 +284,12 @@ class SearchController
     /**
      * Format hydrated DB rows into API response items.
      *
+     * Field names are aligned with GET /bcc/v1/discover so the frontend
+     * can consume both endpoints with the same component logic.
+     *
      * @param int[] $winnerIds
-     * @param array<int, array{total_score: float, reputation_tier: string|null}> $scoresById
-     * @return array<int, array{id: int, title: string, url: string, avatar: string, score: int|null, tier: string|null, category: string|null, category_slug: string|null}>
+     * @param array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}> $scoresById
+     * @return list<array{page_id: int, page_name: string, page_url: string, avatar_url: string, trust_score: int|null, tier: string|null, endorsements: int, verified: bool, followers: int, category: string|null, category_slug: string|null}>
      */
     private function hydrateAndFormat(
         array $winnerIds,
@@ -301,12 +316,15 @@ class SearchController
                 : home_url('/pages/' . $row->post_name . '/');
 
             $results[] = [
-                'id'            => $pid,
-                'title'         => $row->post_title,
-                'url'           => $url,
-                'avatar'        => $avatar,
-                'score'         => is_array($score) ? (int) $score['total_score'] : null,
+                'page_id'       => $pid,
+                'page_name'     => $row->post_title,
+                'page_url'      => $url,
+                'avatar_url'    => $avatar,
+                'trust_score'   => is_array($score) ? (int) $score['total_score'] : null,
                 'tier'          => $tier,
+                'endorsements'  => is_array($score) ? (int) $score['endorsement_count'] : 0,
+                'verified'      => is_array($score) ? (bool) $score['is_verified'] : false,
+                'followers'     => is_array($score) ? (int) $score['follower_count'] : 0,
                 'category'      => $filteredCatName ?? $row->category_name ?? null,
                 'category_slug' => $filteredCatSlug ?? $row->category_slug ?? null,
             ];
@@ -347,32 +365,50 @@ class SearchController
         $winner_ids   = [];
         $scores_by_id = [];
 
-        // Fast path: trust-engine read model.
+        // Fast path: trust-engine read model for trending pages.
         $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
-        foreach ($rows as $row) {
-            $pid = (int) $row->ID;
-            $winner_ids[] = $pid;
-            $scores_by_id[$pid] = [
-                'total_score'     => (float) $row->total_score,
-                'reputation_tier' => $row->reputation_tier,
-            ];
+        if (!empty($rows)) {
+            $trending_ids = array_map(fn($r) => (int) $r->ID, $rows);
+            // Use enriched scores so trending response includes the same
+            // fields as search results (endorsements, verified, followers).
+            if (class_exists('\\BCC\\Core\\ServiceLocator')) {
+                try {
+                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($trending_ids);
+                } catch (\Throwable $e) {
+                    $scores_by_id = [];
+                }
+            }
+            // Fall back to basic data from the read-model rows if enriched failed.
+            foreach ($rows as $row) {
+                $pid = (int) $row->ID;
+                $winner_ids[] = $pid;
+                if (!isset($scores_by_id[$pid])) {
+                    $scores_by_id[$pid] = [
+                        'total_score'       => (float) $row->total_score,
+                        'reputation_tier'   => $row->reputation_tier,
+                        'ranking_score'     => 0.0,
+                        'endorsement_count' => 0,
+                        'is_verified'       => false,
+                        'follower_count'    => 0,
+                    ];
+                }
+            }
         }
 
-        // Fallback: fetch recent IDs and sort by trust score in PHP.
+        // Fallback: fetch recent IDs and sort by composite ranking score.
         if (empty($winner_ids)) {
             $candidate_ids = SearchRepository::getFallbackPageIds(100);
 
             if (!empty($candidate_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
                 try {
-                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getScoresForPageIds($candidate_ids);
+                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($candidate_ids);
                 } catch (\Throwable $e) {
-                    // Degrade gracefully — return trending results without trust scores.
                     $scores_by_id = [];
                 }
 
                 usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
-                    $sa = $scores_by_id[$a]['total_score'] ?? 0.0;
-                    $sb = $scores_by_id[$b]['total_score'] ?? 0.0;
+                    $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
+                    $sb = $scores_by_id[$b]['ranking_score'] ?? 0.0;
                     return ($sb <=> $sa) ?: ($a <=> $b);
                 });
 
