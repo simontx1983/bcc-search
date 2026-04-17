@@ -60,11 +60,14 @@ final class SearchRepository
     private static bool $ftIndexChecked = false;
 
     /**
-     * Ensure a FULLTEXT index exists on wp_posts.post_title.
+     * Ensure a FULLTEXT index exists on wp_posts (title + content).
      *
      * Called from the activation hook (primary) and as a runtime safety
      * net from searchCandidates(). The persistent option guard ensures
      * the ALTER TABLE only runs once — during activation, not mid-request.
+     *
+     * v2: expanded from title-only to title+content so searches for
+     * terms in page descriptions (e.g., "Cosmos validator") also match.
      */
     public static function ensureFulltextIndex(): void
     {
@@ -73,42 +76,51 @@ final class SearchRepository
         }
         self::$ftIndexChecked = true;
 
-        // Use a persistent flag so only one process ever attempts ALTER TABLE.
-        // The index is created on plugin activation; this is a runtime safety net.
-        if (get_option('bcc_ft_index_installed')) {
+        // v2 flag — if only v1 (title-only) is installed, upgrade to title+content.
+        if (get_option('bcc_ft_index_v2_installed')) {
             return;
         }
 
         global $wpdb;
 
-        $exists = (int) $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(*) FROM information_schema.STATISTICS
-             WHERE table_schema = DATABASE()
-               AND table_name = %s
-               AND index_name = %s",
-            $wpdb->posts,
-            'bcc_ft_post_title'
-        ));
-
-        if ($exists) {
-            update_option('bcc_ft_index_installed', 1, false);
-            return;
-        }
-
         // Attempt creation with a lock to prevent thundering herd.
         $locked = (int) $wpdb->get_var("SELECT GET_LOCK('bcc_ft_index', 0)");
         if ($locked !== 1) {
-            return; // Another process is creating it — fall through to LIKE.
+            return;
         }
 
         try {
-            $altered = $wpdb->query(
-                "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_title (post_title)"
-            );
+            // Drop the old title-only index if it exists.
+            $oldExists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.STATISTICS
+                 WHERE table_schema = DATABASE()
+                   AND table_name = %s
+                   AND index_name = %s",
+                $wpdb->posts,
+                'bcc_ft_post_title'
+            ));
 
-            if ($altered !== false) {
-                update_option('bcc_ft_index_installed', 1, false);
+            if ($oldExists) {
+                $wpdb->query("ALTER TABLE {$wpdb->posts} DROP INDEX bcc_ft_post_title");
             }
+
+            // Create the v2 index covering title + content.
+            $v2Exists = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM information_schema.STATISTICS
+                 WHERE table_schema = DATABASE()
+                   AND table_name = %s
+                   AND index_name = %s",
+                $wpdb->posts,
+                'bcc_ft_post_search'
+            ));
+
+            if (!$v2Exists) {
+                $wpdb->query(
+                    "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_search (post_title, post_content)"
+                );
+            }
+
+            update_option('bcc_ft_index_v2_installed', 1, false);
         } finally {
             $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");
         }
@@ -170,14 +182,34 @@ final class SearchRepository
             $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
             $ft_term  = trim($ft_clean) . '*';
 
+            // Search title + content via FULLTEXT, also match category names
+            // via LEFT JOIN so "Cosmos validator" finds pages categorised as
+            // "Validators" even if the title doesn't contain that word.
+            $cat_match_join = '';
+            $cat_match_where = '';
+            if ($cat_info) {
+                $cat_match_join = "
+                    LEFT JOIN {$cat_info['table']} pcm ON pcm.{$cat_info['page_col']} = p.ID
+                    LEFT JOIN {$posts_table} catm ON catm.ID = pcm.{$cat_info['cat_col']}
+                        AND catm.post_type = 'peepso-page-cat'
+                        AND catm.post_status = 'publish'
+                ";
+                $cat_match_where = $wpdb->prepare(
+                    "OR catm.post_title LIKE %s",
+                    '%' . $wpdb->esc_like($query) . '%'
+                );
+            }
+
             $sql = $wpdb->prepare(
                 "SELECT {$distinct} p.ID, p.post_title
                  FROM {$posts_table} p
                  {$cat_join}
+                 {$cat_match_join}
                  WHERE {$base_where}
-                   AND MATCH(p.post_title) AGAINST(%s IN BOOLEAN MODE)
+                   AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
+                        {$cat_match_where})
                    {$cat_where}
-                 ORDER BY MATCH(p.post_title) AGAINST(%s IN BOOLEAN MODE) DESC,
+                 ORDER BY MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE) DESC,
                           p.post_title ASC
                  LIMIT %d",
                 $ft_term,
@@ -197,19 +229,21 @@ final class SearchRepository
             // Fall through to LIKE if FULLTEXT unavailable or empty.
         }
 
-        // ── Prefix LIKE fallback (no leading wildcard) ──────────────────
-        $prefix_like = $wpdb->esc_like($query) . '%';
+        // ── LIKE fallback (title prefix + content substring) ────────────
+        $prefix_like   = $wpdb->esc_like($query) . '%';
+        $content_like  = '%' . $wpdb->esc_like($query) . '%';
 
         $sql = $wpdb->prepare(
             "SELECT {$distinct} p.ID, p.post_title
              FROM {$posts_table} p
              {$cat_join}
              WHERE {$base_where}
-               AND p.post_title LIKE %s
+               AND (p.post_title LIKE %s OR p.post_content LIKE %s)
                {$cat_where}
              ORDER BY p.post_title ASC
              LIMIT %d",
             $prefix_like,
+            $content_like,
             $cap
         );
 
