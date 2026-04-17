@@ -178,8 +178,10 @@ final class SearchRepository
             // FULLTEXT index is created on activation; LIKE fallback handles absence.
             // Do NOT call ensureFulltextIndex() here — it risks ALTER TABLE mid-request.
 
-            // Strip FULLTEXT boolean operators to prevent query-semantics injection.
+            // Strip FULLTEXT boolean operators and keywords to prevent
+            // query-semantics injection / relevance manipulation.
             $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
+            $ft_clean = preg_replace('/\b(AND|OR|NOT)\b/i', ' ', $ft_clean);
             $ft_term  = trim($ft_clean) . '*';
 
             // Search title + content via FULLTEXT, also match category names

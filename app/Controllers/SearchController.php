@@ -136,38 +136,63 @@ class SearchController
         $q    = trim($request->get_param('q'));
         $type = trim($request->get_param('type'));
 
+        // Fetch categories once per request — used for validation and response.
+        $categories = SearchRepository::getCategories();
+
         // Validate $type against known category slugs to prevent wasted
         // DB queries on nonexistent categories and limit the SQL surface.
         if ($type !== '') {
-            $validSlugs = array_column(SearchRepository::getCategories(), 'slug');
+            $validSlugs = array_column($categories, 'slug');
             if (!in_array($type, $validSlugs, true)) {
-                return rest_ensure_response(['results' => [], 'categories' => SearchRepository::getCategories()]);
+                return rest_ensure_response(['results' => [], 'categories' => $categories]);
             }
         }
 
         // Require 2–100 chars to search
         $qLen = mb_strlen($q);
         if ($qLen < 2 || $qLen > 100) {
-            return rest_ensure_response(['results' => [], 'categories' => SearchRepository::getCategories()]);
+            return rest_ensure_response(['results' => [], 'categories' => $categories]);
         }
 
         // Return cached results if available.
+        // The cache stores a wrapper: ['data' => ..., 'expires_at' => timestamp].
+        // 'expires_at' is the SOFT expiry (when the data becomes stale).
+        // The actual wp_cache TTL is longer (stale buffer) so that a
+        // stale-while-revalidate pattern can serve old data while one
+        // worker rebuilds the entry.
         $cache_version = get_option(self::SEARCH_VERSION_KEY, 1);
         $cache_key     = 'search_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $cache_version);
         $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
-        if (is_array($cached)) {
-            return rest_ensure_response($cached);
-        }
 
-        // ── Stampede protection: prevent concurrent workers from all hitting DB ──
-        $lock_key = 'bcc_search_lock_' . md5($cache_key);
-        $locked = get_transient($lock_key);
-        if ($locked) {
-            // Another worker is building this cache entry; return empty to avoid stampede.
-            wp_cache_set($cache_key, [], self::CACHE_GROUP, 5); // short negative cache
-            return new \WP_REST_Response(['results' => [], 'total' => 0, 'cached' => false]);
+        if (is_array($cached) && isset($cached['data'])) {
+            $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
+
+            if ($isFresh) {
+                // Cache is fresh — serve immediately.
+                return rest_ensure_response($cached['data']);
+            }
+
+            // Cache is stale but still in the buffer window.
+            // Try to acquire the rebuild lock (atomic). If another worker
+            // is already rebuilding, serve stale data instead of blocking.
+            $lock_key = 'bcc_search_lock_' . md5($cache_key);
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+                // Another worker is rebuilding — serve stale data.
+                return rest_ensure_response($cached['data']);
+            }
+            // We won the lock — fall through to rebuild below.
+        } elseif (is_array($cached)) {
+            // Legacy cache format (pre-upgrade) — serve as-is.
+            return rest_ensure_response($cached);
+        } else {
+            // ── Stampede protection for cold cache (no stale entry to serve) ──
+            $lock_key = 'bcc_search_lock_' . md5($cache_key);
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+                // Another worker is building this entry from scratch.
+                // Return empty rather than piling onto the DB.
+                return new \WP_REST_Response(['results' => [], 'total' => 0, 'cached' => false]);
+            }
         }
-        set_transient($lock_key, 1, 10); // 10-second lock
 
         try {
             $cap = $this->getCandidateCap($q);
@@ -176,8 +201,8 @@ class SearchController
             $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
 
             if (empty($candidate_rows)) {
-                $response = ['results' => [], 'categories' => SearchRepository::getCategories()];
-                wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
+                $response = ['results' => [], 'categories' => $categories];
+                $this->cacheSearchResult($cache_key, $response);
                 return rest_ensure_response($response);
             }
 
@@ -192,15 +217,7 @@ class SearchController
             // ── Phase 2: Score, rank, then hydrate winners ──────────────────
             // Use enriched scores (same composite ranking as /discover) so
             // search and discovery produce consistent trust-based ordering.
-            $scores_by_id = [];
-            if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-                try {
-                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($candidate_ids);
-                } catch (\Throwable $e) {
-                    // Degrade gracefully — return results without trust scores.
-                    $scores_by_id = [];
-                }
-            }
+            $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
 
             $rank_scores = [];
             foreach ($candidate_ids as $id) {
@@ -220,7 +237,6 @@ class SearchController
             $filtered_cat_slug = null;
             if ($type !== '') {
                 $filtered_cat_slug = $type;
-                $categories = SearchRepository::getCategories();
                 foreach ($categories as $cat) {
                     if ($cat['slug'] === $type) {
                         $filtered_cat_name = $cat['name'];
@@ -233,15 +249,43 @@ class SearchController
 
             $response = [
                 'results'    => $results,
-                'categories' => SearchRepository::getCategories(),
+                'categories' => $categories,
             ];
 
-            wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::SEARCH_CACHE_TTL);
+            $this->cacheSearchResult($cache_key, $response);
 
             return rest_ensure_response($response);
         } finally {
-            delete_transient($lock_key);
+            wp_cache_delete($lock_key, self::CACHE_GROUP);
         }
+    }
+
+    /**
+     * Store a search result with stale-while-revalidate semantics.
+     *
+     * The wrapper stores a soft expiry ('expires_at') jittered by ±20% of
+     * SEARCH_CACHE_TTL. The actual wp_cache TTL is SEARCH_CACHE_TTL + 30s
+     * (stale buffer), allowing one worker to rebuild while others serve
+     * the stale entry.
+     *
+     * Jitter prevents all cache entries set at the same time from expiring
+     * simultaneously, which would cause a coordinated stampede.
+     *
+     * @param string              $cache_key
+     * @param array<string,mixed> $response
+     */
+    private function cacheSearchResult(string $cache_key, array $response): void
+    {
+        $jitter    = (int) (self::SEARCH_CACHE_TTL * 0.2);                 // ±20%
+        $softTtl   = self::SEARCH_CACHE_TTL + random_int(-$jitter, $jitter); // 48-72s
+        $hardTtl   = $softTtl + 30;                                         // stale buffer
+
+        $wrapper = [
+            'data'       => $response,
+            'expires_at' => time() + $softTtl,
+        ];
+
+        wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
     }
 
     /**
@@ -334,6 +378,28 @@ class SearchController
     }
 
     /**
+     * Resolve enriched trust scores for a set of page IDs.
+     *
+     * Wraps the ServiceLocator call with class_exists + try/catch so
+     * callers get an empty array instead of a fatal when the trust
+     * engine plugin is inactive or throws.
+     *
+     * @param int[] $pageIds
+     * @return array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}>
+     */
+    private static function enrichScoresIfAvailable(array $pageIds): array
+    {
+        if (!class_exists('\\BCC\\Core\\ServiceLocator')) {
+            return [];
+        }
+        try {
+            return ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($pageIds);
+        } catch (\Throwable $e) {
+            return [];
+        }
+    }
+
+    /**
      * Dynamic candidate cap — shorter queries cast a wider net.
      */
     private function getCandidateCap(string $query): int
@@ -364,6 +430,7 @@ class SearchController
 
         $winner_ids   = [];
         $scores_by_id = [];
+        $categories   = SearchRepository::getCategories();
 
         // Fast path: trust-engine read model for trending pages.
         $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
@@ -371,13 +438,7 @@ class SearchController
             $trending_ids = array_map(fn($r) => (int) $r->ID, $rows);
             // Use enriched scores so trending response includes the same
             // fields as search results (endorsements, verified, followers).
-            if (class_exists('\\BCC\\Core\\ServiceLocator')) {
-                try {
-                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($trending_ids);
-                } catch (\Throwable $e) {
-                    $scores_by_id = [];
-                }
-            }
+            $scores_by_id = self::enrichScoresIfAvailable($trending_ids);
             // Fall back to basic data from the read-model rows if enriched failed.
             foreach ($rows as $row) {
                 $pid = (int) $row->ID;
@@ -399,12 +460,8 @@ class SearchController
         if (empty($winner_ids)) {
             $candidate_ids = SearchRepository::getFallbackPageIds(100);
 
-            if (!empty($candidate_ids) && class_exists('\\BCC\\Core\\ServiceLocator')) {
-                try {
-                    $scores_by_id = ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($candidate_ids);
-                } catch (\Throwable $e) {
-                    $scores_by_id = [];
-                }
+            if (!empty($candidate_ids)) {
+                $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
 
                 usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
                     $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
@@ -417,14 +474,14 @@ class SearchController
         }
 
         if (empty($winner_ids)) {
-            return rest_ensure_response(['results' => [], 'categories' => SearchRepository::getCategories()]);
+            return rest_ensure_response(['results' => [], 'categories' => $categories]);
         }
 
         $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
 
         $response = [
             'results'    => $results,
-            'categories' => SearchRepository::getCategories(),
+            'categories' => $categories,
         ];
 
         wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::TRENDING_CACHE_TTL);
