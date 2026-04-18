@@ -182,7 +182,15 @@ final class SearchRepository
             // query-semantics injection / relevance manipulation.
             $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
             $ft_clean = preg_replace('/\b(AND|OR|NOT)\b/i', ' ', $ft_clean);
-            $ft_term  = trim($ft_clean) . '*';
+            $ft_clean = trim($ft_clean);
+
+            // If sanitization stripped everything, skip FULLTEXT and fall
+            // through to the LIKE fallback to avoid a standalone '*' term.
+            if ($ft_clean === '') {
+                goto like_fallback;
+            }
+
+            $ft_term = $ft_clean . '*';
 
             // Search title + content via FULLTEXT, also match category names
             // via LEFT JOIN so "Cosmos validator" finds pages categorised as
@@ -231,6 +239,8 @@ final class SearchRepository
             // Fall through to LIKE if FULLTEXT unavailable or empty.
         }
 
+        // @phpcs:ignore Generic.PHP.DiscourageGoto -- structured fallback from FULLTEXT sanitizer
+        like_fallback:
         // ── LIKE fallback (title prefix + content substring) ────────────
         $prefix_like   = $wpdb->esc_like($query) . '%';
         $content_like  = '%' . $wpdb->esc_like($query) . '%';
