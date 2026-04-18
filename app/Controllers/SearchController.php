@@ -160,9 +160,12 @@ class SearchController
         // The actual wp_cache TTL is longer (stale buffer) so that a
         // stale-while-revalidate pattern can serve old data while one
         // worker rebuilds the entry.
-        $cache_version = get_option(self::SEARCH_VERSION_KEY, 1);
+        $cache_version = self::getCacheVersion();
         $cache_key     = 'search_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $cache_version);
         $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
+
+        $lock_key      = null;
+        $lock_acquired = false;
 
         if (is_array($cached) && isset($cached['data'])) {
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
@@ -180,6 +183,7 @@ class SearchController
                 // Another worker is rebuilding — serve stale data.
                 return rest_ensure_response($cached['data']);
             }
+            $lock_acquired = true;
             // We won the lock — fall through to rebuild below.
         } elseif (is_array($cached)) {
             // Legacy cache format (pre-upgrade) — serve as-is.
@@ -192,6 +196,7 @@ class SearchController
                 // Return empty rather than piling onto the DB.
                 return new \WP_REST_Response(['results' => [], 'total' => 0, 'cached' => false]);
             }
+            $lock_acquired = true;
         }
 
         try {
@@ -421,76 +426,147 @@ class SearchController
      */
     private function handle_trending()
     {
-        $cache_version = get_option(self::SEARCH_VERSION_KEY, 1);
+        $cache_version = self::getCacheVersion();
         $cache_key     = 'trending_' . $cache_version;
         $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
-        if (is_array($cached)) {
+
+        $lock_key      = 'bcc_trending_lock_' . md5($cache_key);
+        $lock_acquired = false;
+
+        if (is_array($cached) && isset($cached['data'])) {
+            $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
+
+            if ($isFresh) {
+                return rest_ensure_response($cached['data']);
+            }
+
+            // Stale — try to acquire rebuild lock.
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+                // Another worker is rebuilding — serve stale data.
+                return rest_ensure_response($cached['data']);
+            }
+            $lock_acquired = true;
+        } elseif (is_array($cached)) {
+            // Legacy cache format (pre-upgrade) — serve as-is.
             return rest_ensure_response($cached);
+        } else {
+            // Cold miss — try to acquire lock.
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+                // Another worker is building — return empty.
+                return rest_ensure_response(['results' => [], 'categories' => []]);
+            }
+            $lock_acquired = true;
         }
 
-        $winner_ids   = [];
-        $scores_by_id = [];
-        $categories   = SearchRepository::getCategories();
+        try {
+            $winner_ids   = [];
+            $scores_by_id = [];
+            $categories   = SearchRepository::getCategories();
 
-        // Fast path: trust-engine read model for trending pages.
-        $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
-        if (!empty($rows)) {
-            $trending_ids = array_map(fn($r) => (int) $r->ID, $rows);
-            // Use enriched scores so trending response includes the same
-            // fields as search results (endorsements, verified, followers).
-            $scores_by_id = self::enrichScoresIfAvailable($trending_ids);
-            // Fall back to basic data from the read-model rows if enriched failed.
-            foreach ($rows as $row) {
-                $pid = (int) $row->ID;
-                $winner_ids[] = $pid;
-                if (!isset($scores_by_id[$pid])) {
-                    $scores_by_id[$pid] = [
-                        'total_score'       => (float) $row->total_score,
-                        'reputation_tier'   => $row->reputation_tier,
-                        'ranking_score'     => 0.0,
-                        'endorsement_count' => 0,
-                        'is_verified'       => false,
-                        'follower_count'    => 0,
-                    ];
+            // Fast path: trust-engine read model for trending pages.
+            $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
+            if (!empty($rows)) {
+                $trending_ids = array_map(fn($r) => (int) $r->ID, $rows);
+                // Use enriched scores so trending response includes the same
+                // fields as search results (endorsements, verified, followers).
+                $scores_by_id = self::enrichScoresIfAvailable($trending_ids);
+                // Fall back to basic data from the read-model rows if enriched failed.
+                foreach ($rows as $row) {
+                    $pid = (int) $row->ID;
+                    $winner_ids[] = $pid;
+                    if (!isset($scores_by_id[$pid])) {
+                        $scores_by_id[$pid] = [
+                            'total_score'       => (float) $row->total_score,
+                            'reputation_tier'   => $row->reputation_tier,
+                            'ranking_score'     => 0.0,
+                            'endorsement_count' => 0,
+                            'is_verified'       => false,
+                            'follower_count'    => 0,
+                        ];
+                    }
                 }
             }
-        }
 
-        // Fallback: fetch recent IDs and sort by composite ranking score.
-        if (empty($winner_ids)) {
-            $candidate_ids = SearchRepository::getFallbackPageIds(100);
+            // Fallback: fetch recent IDs and sort by composite ranking score.
+            if (empty($winner_ids)) {
+                $candidate_ids = SearchRepository::getFallbackPageIds(100);
 
-            if (!empty($candidate_ids)) {
-                $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
+                if (!empty($candidate_ids)) {
+                    $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
 
-                usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
-                    $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
-                    $sb = $scores_by_id[$b]['ranking_score'] ?? 0.0;
-                    return ($sb <=> $sa) ?: ($a <=> $b);
-                });
+                    usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
+                        $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
+                        $sb = $scores_by_id[$b]['ranking_score'] ?? 0.0;
+                        return ($sb <=> $sa) ?: ($a <=> $b);
+                    });
 
-                $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
+                    $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
+                }
             }
+
+            if (empty($winner_ids)) {
+                $response = ['results' => [], 'categories' => $categories];
+                $this->cacheTrendingResult($cache_key, $response);
+                return rest_ensure_response($response);
+            }
+
+            $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
+
+            $response = [
+                'results'    => $results,
+                'categories' => $categories,
+            ];
+
+            $this->cacheTrendingResult($cache_key, $response);
+
+            return rest_ensure_response($response);
+        } finally {
+            wp_cache_delete($lock_key, self::CACHE_GROUP);
         }
+    }
 
-        if (empty($winner_ids)) {
-            return rest_ensure_response(['results' => [], 'categories' => $categories]);
-        }
+    /**
+     * Store a trending result with stale-while-revalidate semantics.
+     *
+     * @param string              $cache_key
+     * @param array<string,mixed> $response
+     */
+    private function cacheTrendingResult(string $cache_key, array $response): void
+    {
+        $jitter  = (int) (self::TRENDING_CACHE_TTL * 0.2);
+        $softTtl = self::TRENDING_CACHE_TTL + random_int(-$jitter, $jitter);
+        $hardTtl = $softTtl + 30;
 
-        $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
-
-        $response = [
-            'results'    => $results,
-            'categories' => $categories,
+        $wrapper = [
+            'data'       => $response,
+            'expires_at' => time() + $softTtl,
         ];
 
-        wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::TRENDING_CACHE_TTL);
+        wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
+    }
 
-        return rest_ensure_response($response);
+    /**
+     * Get the cache version, backed by object cache to avoid a DB hit per request.
+     *
+     * @return int
+     */
+    private static function getCacheVersion(): int
+    {
+        $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
+        if ($cached !== false) {
+            return (int) $cached;
+        }
+
+        $version = (int) get_option(self::SEARCH_VERSION_KEY, 1);
+        wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP);
+
+        return $version;
     }
 
     public static function bust_search_cache(): void
     {
-        update_option(self::SEARCH_VERSION_KEY, time(), false);
+        $version = time();
+        update_option(self::SEARCH_VERSION_KEY, $version, false);
+        wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP);
     }
 }
