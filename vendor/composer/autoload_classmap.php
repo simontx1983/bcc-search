@@ -7,6 +7,9 @@ $baseDir = dirname($vendorDir);
 
 return array(
     'BCC\\Search\\Controllers\\SearchController' => $baseDir . '/app/Controllers/SearchController.php',
+    'BCC\\Search\\DTO\\PageCandidateDTO' => $baseDir . '/app/DTO/PageCandidateDTO.php',
+    'BCC\\Search\\DTO\\PageHydratedDTO' => $baseDir . '/app/DTO/PageHydratedDTO.php',
+    'BCC\\Search\\DTO\\TrendingPageRowDTO' => $baseDir . '/app/DTO/TrendingPageRowDTO.php',
     'BCC\\Search\\Repositories\\SearchRepository' => $baseDir . '/app/Repositories/SearchRepository.php',
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
 );

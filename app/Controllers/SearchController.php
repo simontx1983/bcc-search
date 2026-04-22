@@ -102,10 +102,7 @@ class SearchController
         ]);
     }
 
-    /**
-     * @return \WP_REST_Response|\WP_Error
-     */
-    public function handle_search(\WP_REST_Request $request)
+    public function handle_search(\WP_REST_Request $request): \WP_REST_Response
     {
         // Rate limiting by client IP.
         // Delegates to bcc-core's Throttle which tries trust-engine's atomic
@@ -121,11 +118,14 @@ class SearchController
 
         $rate_key = "bcc_search_rate_{$ip}";
         if (!Throttle::allow('search', self::RATE_LIMIT, self::RATE_WINDOW, $rate_key)) {
-            return new \WP_Error(
-                'rate_limit_exceeded',
-                'Too many requests. Please wait a few seconds.',
-                ['status' => 429]
-            );
+            // Mirror WP_Error payload shape so clients don't have to special-case
+            // rate-limit responses. Return WP_REST_Response (not WP_Error) so the
+            // controller has a single narrow return type.
+            return new \WP_REST_Response([
+                'code'    => 'rate_limit_exceeded',
+                'message' => 'Too many requests. Please wait a few seconds.',
+                'data'    => ['status' => 429],
+            ], 429);
         }
 
         // ── Trending: top-scored pages, no query needed ──────────────────
@@ -144,14 +144,14 @@ class SearchController
         if ($type !== '') {
             $validSlugs = array_column($categories, 'slug');
             if (!in_array($type, $validSlugs, true)) {
-                return rest_ensure_response(['results' => [], 'categories' => $categories]);
+                return new \WP_REST_Response(['results' => [], 'categories' => $categories]);
             }
         }
 
         // Require 2–100 chars to search
         $qLen = mb_strlen($q);
         if ($qLen < 2 || $qLen > 100) {
-            return rest_ensure_response(['results' => [], 'categories' => $categories]);
+            return new \WP_REST_Response(['results' => [], 'categories' => $categories]);
         }
 
         // Return cached results if available.
@@ -167,12 +167,12 @@ class SearchController
         $lock_key      = null;
         $lock_acquired = false;
 
-        if (is_array($cached) && isset($cached['data'])) {
+        if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
 
             if ($isFresh) {
                 // Cache is fresh — serve immediately.
-                return rest_ensure_response($cached['data']);
+                return new \WP_REST_Response($cached['data']);
             }
 
             // Cache is stale but still in the buffer window.
@@ -181,13 +181,13 @@ class SearchController
             $lock_key = 'bcc_search_lock_' . md5($cache_key);
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
                 // Another worker is rebuilding — serve stale data.
-                return rest_ensure_response($cached['data']);
+                return new \WP_REST_Response($cached['data']);
             }
             $lock_acquired = true;
             // We won the lock — fall through to rebuild below.
         } elseif (is_array($cached)) {
             // Legacy cache format (pre-upgrade) — serve as-is.
-            return rest_ensure_response($cached);
+            return new \WP_REST_Response($cached);
         } else {
             // ── Stampede protection for cold cache (no stale entry to serve) ──
             $lock_key = 'bcc_search_lock_' . md5($cache_key);
@@ -208,15 +208,14 @@ class SearchController
             if (empty($candidate_rows)) {
                 $response = ['results' => [], 'categories' => $categories];
                 $this->cacheSearchResult($cache_key, $response);
-                return rest_ensure_response($response);
+                return new \WP_REST_Response($response);
             }
 
             $candidate_ids = [];
             $titles_by_id  = [];
             foreach ($candidate_rows as $row) {
-                $id = (int) $row->ID;
-                $candidate_ids[]   = $id;
-                $titles_by_id[$id] = $row->post_title;
+                $candidate_ids[]          = $row->id;
+                $titles_by_id[$row->id]   = $row->title;
             }
 
             // ── Phase 2: Score, rank, then hydrate winners ──────────────────
@@ -259,7 +258,7 @@ class SearchController
 
             $this->cacheSearchResult($cache_key, $response);
 
-            return rest_ensure_response($response);
+            return new \WP_REST_Response($response);
         } finally {
             wp_cache_delete($lock_key, self::CACHE_GROUP);
         }
@@ -351,22 +350,22 @@ class SearchController
 
         $results = [];
         foreach ($rows as $row) {
-            $pid   = (int) $row->ID;
+            $pid   = $row->id;
             $score = $scoresById[$pid] ?? null;
             $tier  = is_array($score) ? ($score['reputation_tier'] ?? null) : null;
 
-            $hash   = $row->avatar_hash ?? '';
+            $hash   = $row->avatarHash ?? '';
             $avatar = $hash
                 ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
                 : $ps['default_avatar'];
 
             $url = $ps['url_base']
-                ? $ps['url_base'] . $row->post_name . '/'
-                : home_url('/pages/' . $row->post_name . '/');
+                ? $ps['url_base'] . $row->slug . '/'
+                : home_url('/pages/' . $row->slug . '/');
 
             $results[] = [
                 'page_id'       => $pid,
-                'page_name'     => $row->post_title,
+                'page_name'     => $row->title,
                 'page_url'      => $url,
                 'avatar_url'    => $avatar,
                 'trust_score'   => is_array($score) ? (int) $score['total_score'] : null,
@@ -374,8 +373,8 @@ class SearchController
                 'endorsements'  => is_array($score) ? (int) $score['endorsement_count'] : 0,
                 'verified'      => is_array($score) ? (bool) $score['is_verified'] : false,
                 'followers'     => is_array($score) ? (int) $score['follower_count'] : 0,
-                'category'      => $filteredCatName ?? $row->category_name ?? null,
-                'category_slug' => $filteredCatSlug ?? $row->category_slug ?? null,
+                'category'      => $filteredCatName ?? $row->categoryName ?? null,
+                'category_slug' => $filteredCatSlug ?? $row->categorySlug ?? null,
             ];
         }
 
@@ -433,27 +432,27 @@ class SearchController
         $lock_key      = 'bcc_trending_lock_' . md5($cache_key);
         $lock_acquired = false;
 
-        if (is_array($cached) && isset($cached['data'])) {
+        if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
 
             if ($isFresh) {
-                return rest_ensure_response($cached['data']);
+                return new \WP_REST_Response($cached['data']);
             }
 
             // Stale — try to acquire rebuild lock.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
                 // Another worker is rebuilding — serve stale data.
-                return rest_ensure_response($cached['data']);
+                return new \WP_REST_Response($cached['data']);
             }
             $lock_acquired = true;
         } elseif (is_array($cached)) {
             // Legacy cache format (pre-upgrade) — serve as-is.
-            return rest_ensure_response($cached);
+            return new \WP_REST_Response($cached);
         } else {
             // Cold miss — try to acquire lock.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
                 // Another worker is building — return empty.
-                return rest_ensure_response(['results' => [], 'categories' => []]);
+                return new \WP_REST_Response(['results' => [], 'categories' => []]);
             }
             $lock_acquired = true;
         }
@@ -466,18 +465,18 @@ class SearchController
             // Fast path: trust-engine read model for trending pages.
             $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
             if (!empty($rows)) {
-                $trending_ids = array_map(fn($r) => (int) $r->ID, $rows);
+                $trending_ids = array_map(static fn($r) => $r->id, $rows);
                 // Use enriched scores so trending response includes the same
                 // fields as search results (endorsements, verified, followers).
                 $scores_by_id = self::enrichScoresIfAvailable($trending_ids);
                 // Fall back to basic data from the read-model rows if enriched failed.
                 foreach ($rows as $row) {
-                    $pid = (int) $row->ID;
+                    $pid = $row->id;
                     $winner_ids[] = $pid;
                     if (!isset($scores_by_id[$pid])) {
                         $scores_by_id[$pid] = [
-                            'total_score'       => (float) $row->total_score,
-                            'reputation_tier'   => $row->reputation_tier,
+                            'total_score'       => $row->totalScore,
+                            'reputation_tier'   => $row->reputationTier,
                             'ranking_score'     => 0.0,
                             'endorsement_count' => 0,
                             'is_verified'       => false,
@@ -507,7 +506,7 @@ class SearchController
             if (empty($winner_ids)) {
                 $response = ['results' => [], 'categories' => $categories];
                 $this->cacheTrendingResult($cache_key, $response);
-                return rest_ensure_response($response);
+                return new \WP_REST_Response($response);
             }
 
             $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
@@ -519,7 +518,7 @@ class SearchController
 
             $this->cacheTrendingResult($cache_key, $response);
 
-            return rest_ensure_response($response);
+            return new \WP_REST_Response($response);
         } finally {
             wp_cache_delete($lock_key, self::CACHE_GROUP);
         }
@@ -545,28 +544,155 @@ class SearchController
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
     }
 
+    /** Cache TTL used uniformly for both bust and heal writes (see getCacheVersion). */
+    private const VERSION_CACHE_TTL = 60;
+
+    /** Soft-lock window that gates the heal path so concurrent cold requests do not all hit the DB. */
+    private const VERSION_HEAL_LOCK_TTL = 2;
+
     /**
      * Get the cache version, backed by object cache to avoid a DB hit per request.
      *
-     * @return int
+     * Defends against three distinct corruption vectors:
+     *   1. Cache entry poisoned (wrong type written by another plugin, a crashed
+     *      write, or cache-layer data corruption)
+     *   2. Option itself polluted (bad migration, a stray pre_option filter, or
+     *      admin miswrite) — the "authoritative" source can lie too
+     *   3. Cold-start dogpile — many concurrent requests racing to read the
+     *      option and write cache simultaneously
+     *
+     * Strategy:
+     *   - Accept only is_int OR decimal-digit strings. is_numeric would let
+     *     "1e3" through and coerce to 1000, producing plausible-looking but
+     *     wrong versions.
+     *   - Both the bust path and heal path write with the SAME TTL so no "forever"
+     *     cache entries can accumulate in multi-node setups and defeat damping.
+     *   - Heal path acquires a 2s soft-lock. Losers back off 5ms and re-read the
+     *     cache; only the winner does the option read + cache set. Bounded
+     *     fallback: if the winner didn't finish within 5ms, losers read options
+     *     directly (correct but more DB load — converges on next tick).
+     *   - On non-persistent object caches, short-circuit all damping: wp_cache_*
+     *     is per-request memory and cross-request poisoning is impossible.
      */
     private static function getCacheVersion(): int
     {
+        // Without a persistent object cache, damping is moot and the lock
+        // gate would always succeed trivially. Just validate the option.
+        if (!wp_using_ext_object_cache()) {
+            return self::readValidatedVersionOption();
+        }
+
         $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
-        if ($cached !== false) {
+        if (self::isValidVersionValue($cached)) {
             return (int) $cached;
         }
 
-        $version = (int) get_option(self::SEARCH_VERSION_KEY, 1);
-        wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP);
+        // Cache miss OR poisoned. Soft-lock: only one request per 2s window
+        // does the option read + cache set.
+        $lockKey = self::SEARCH_VERSION_KEY . '_heal_lock';
 
-        return $version;
+        if (wp_cache_add($lockKey, 1, self::CACHE_GROUP, self::VERSION_HEAL_LOCK_TTL)) {
+            // Winner of the heal race.
+            $version = self::readValidatedVersionOption();
+            wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+            self::logCacheVersionFallbackRateLimited($cached, $version);
+            return $version;
+        }
+
+        // Loser: brief backoff to give the winner time to populate the cache.
+        usleep(5000); // 5ms
+        $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
+        if (self::isValidVersionValue($cached)) {
+            return (int) $cached;
+        }
+
+        // Second short retry — covers slower environments (networked Redis,
+        // overloaded nodes, disk-backed caches) where the winner's write
+        // takes >5ms. Total backoff of 10ms under contention is negligible
+        // and meaningfully reduces worst-case DB hits.
+        usleep(5000); // 5ms
+        $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
+        if (self::isValidVersionValue($cached)) {
+            return (int) $cached;
+        }
+
+        // Winner not done within backoff window — last resort, do our own
+        // option read. Do NOT write the cache: the active heal will.
+        return self::readValidatedVersionOption();
+    }
+
+    /**
+     * Strict version validator: int, or a string containing only decimal digits.
+     *
+     * @param mixed $value
+     */
+    private static function isValidVersionValue($value): bool
+    {
+        return is_int($value) || (is_string($value) && ctype_digit($value));
+    }
+
+    /**
+     * Read the cache-version option and validate it strictly.
+     *
+     * Closes the "authoritative source is dirty" hole: if a filter, a bad
+     * migration, or an admin miswrite ever pollutes the option, return a
+     * known-safe floor (1) rather than silently coercing garbage.
+     *
+     * Also enforces a floor of 1 on validly-typed-but-zero values. No code
+     * path writes 0 legitimately (bust_search_cache uses time()), so 0 is
+     * always pollution. max() preserves the original value when it's a
+     * valid positive int and only lifts genuinely low/bad values to 1.
+     */
+    private static function readValidatedVersionOption(): int
+    {
+        $opt = get_option(self::SEARCH_VERSION_KEY, 1);
+
+        if (self::isValidVersionValue($opt)) {
+            return max(1, (int) $opt);
+        }
+
+        // Option polluted. Log once per 60s per node, return safe floor.
+        self::logOptionPoisonRateLimited($opt);
+        return 1;
+    }
+
+    /** Rate-limited: at most one line per 60s per node per key. */
+    private static function logCacheVersionFallbackRateLimited(mixed $cached, int $version): void
+    {
+        if (!wp_cache_add(self::SEARCH_VERSION_KEY . '_fallback_logged', 1, self::CACHE_GROUP, 60)) {
+            return;
+        }
+        error_log(sprintf(
+            '[bcc-search] cache_version_fallback key=%s group=%s type=%s fallback=%d node=%s ext_cache=%s',
+            self::SEARCH_VERSION_KEY,
+            self::CACHE_GROUP,
+            gettype($cached),
+            $version,
+            gethostname() ?: 'unknown',
+            wp_using_ext_object_cache() ? 'yes' : 'no'
+        ));
+    }
+
+    /** Rate-limited: at most one line per 60s per node per option. */
+    private static function logOptionPoisonRateLimited(mixed $opt): void
+    {
+        if (!wp_cache_add(self::SEARCH_VERSION_KEY . '_option_poison_logged', 1, self::CACHE_GROUP, 60)) {
+            return;
+        }
+        error_log(sprintf(
+            '[bcc-search] cache_version_option_poisoned key=%s type=%s fallback=1 node=%s',
+            self::SEARCH_VERSION_KEY,
+            gettype($opt),
+            gethostname() ?: 'unknown'
+        ));
     }
 
     public static function bust_search_cache(): void
     {
         $version = time();
         update_option(self::SEARCH_VERSION_KEY, $version, false);
-        wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP);
+        // Uniform TTL with the heal path — no "forever" keys in multi-node
+        // setups that would defeat getCacheVersion()'s damping window.
+        wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
     }
 }

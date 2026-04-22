@@ -2,6 +2,10 @@
 
 namespace BCC\Search\Repositories;
 
+use BCC\Search\DTO\PageCandidateDTO;
+use BCC\Search\DTO\PageHydratedDTO;
+use BCC\Search\DTO\TrendingPageRowDTO;
+
 if (!defined('ABSPATH')) {
     exit;
 }
@@ -144,7 +148,7 @@ final class SearchRepository
      * @param string $query Search term (min 2 chars).
      * @param string $type  Category slug filter (empty = all).
      * @param int    $cap   Max candidates to return.
-     * @return object[]
+     * @return list<PageCandidateDTO>
      */
     public static function searchCandidates(string $query, string $type, int $cap): array
     {
@@ -227,14 +231,14 @@ final class SearchRepository
                 $cap
             );
 
-            $rows = $wpdb->get_results($sql);
+            $rows = $wpdb->get_results($sql, ARRAY_A);
 
             if ($wpdb->last_error) {
                 error_log('[bcc-search] FULLTEXT query error, falling back to LIKE: ' . $wpdb->last_error);
             }
 
-            if (!$wpdb->last_error && !empty($rows)) {
-                return $rows;
+            if (!$wpdb->last_error && is_array($rows) && !empty($rows)) {
+                return self::candidatesToDtos($rows);
             }
             // Fall through to LIKE if FULLTEXT unavailable or empty.
         }
@@ -259,13 +263,42 @@ final class SearchRepository
             $cap
         );
 
-        $rows = $wpdb->get_results($sql);
+        $rows = $wpdb->get_results($sql, ARRAY_A);
 
-        if ($wpdb->last_error) {
+        if ($wpdb->last_error || !is_array($rows)) {
             return [];
         }
 
-        return $rows;
+        return self::candidatesToDtos($rows);
+    }
+
+    /**
+     * Map ARRAY_A rows from searchCandidates() SQL into PageCandidateDTOs.
+     *
+     * Both columns are NOT NULL in wp_posts — any missing/non-numeric value
+     * signals a SQL schema drift or mapping bug and must fail fast rather
+     * than silently inject a valid-looking zero ID into the candidate pool.
+     *
+     * @param array<int, array<string, string|null>> $rows
+     * @return list<PageCandidateDTO>
+     */
+    private static function candidatesToDtos(array $rows): array
+    {
+        $dtos = [];
+        foreach ($rows as $row) {
+            $id = $row['ID'] ?? null;
+            if (!is_numeric($id)) {
+                throw new \LogicException('SearchRepository::searchCandidates: missing/invalid ID');
+            }
+            if (!isset($row['post_title'])) {
+                throw new \LogicException('SearchRepository::searchCandidates: missing post_title');
+            }
+            $dtos[] = new PageCandidateDTO(
+                id:    (int) $id,
+                title: (string) $row['post_title'],
+            );
+        }
+        return $dtos;
     }
 
     // ── Hydration query ─────────────────────────────────────────────────
@@ -274,7 +307,7 @@ final class SearchRepository
      * Hydrate page IDs into full result rows (post data + category + avatar).
      *
      * @param int[] $ids Ordered page IDs to hydrate.
-     * @return object[]
+     * @return list<PageHydratedDTO>
      */
     public static function hydratePages(array $ids): array
     {
@@ -293,7 +326,7 @@ final class SearchRepository
 
         // IDs are passed twice to prepare(): once for WHERE IN, once for
         // ORDER BY FIELD — so every value goes through proper parameterisation.
-        return $wpdb->get_results($wpdb->prepare(
+        $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT
                 p.ID,
                 p.post_title,
@@ -318,7 +351,34 @@ final class SearchRepository
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
             ...array_merge($ids, $ids, [min(count($ids), 50)])
-        ));
+        ), ARRAY_A);
+
+        if (!is_array($rows)) {
+            return [];
+        }
+
+        $dtos = [];
+        foreach ($rows as $row) {
+            $id = $row['ID'] ?? null;
+            if (!is_numeric($id)) {
+                throw new \LogicException('SearchRepository::hydratePages: missing/invalid ID');
+            }
+            if (!isset($row['post_title'])) {
+                throw new \LogicException('SearchRepository::hydratePages: missing post_title');
+            }
+            if (!isset($row['post_name'])) {
+                throw new \LogicException('SearchRepository::hydratePages: missing post_name');
+            }
+            $dtos[] = new PageHydratedDTO(
+                id:           (int) $id,
+                title:        (string) $row['post_title'],
+                slug:         (string) $row['post_name'],
+                categoryName: isset($row['category_name']) ? (string) $row['category_name'] : null,
+                categorySlug: isset($row['category_slug']) ? (string) $row['category_slug'] : null,
+                avatarHash:   isset($row['avatar_hash']) ? (string) $row['avatar_hash'] : null,
+            );
+        }
+        return $dtos;
     }
 
     // ── Trending queries ────────────────────────────────────────────────
@@ -329,15 +389,46 @@ final class SearchRepository
      * Uses ServiceLocator so bcc-search has no direct dependency on
      * bcc-trust-engine's internal TableRegistry or read model tables.
      *
+     * The contract returns `object[]` (stdClass rows). Adapt them at the
+     * repository boundary into typed DTOs so no stdClass leaks into
+     * bcc-search's service/controller layer.
+     *
      * @param int $limit Max results.
-     * @return object[] Rows with ->ID, ->total_score, ->reputation_tier.
+     * @return list<TrendingPageRowDTO>
      */
     public static function getTrendingFromReadModel(int $limit): array
     {
         if (!class_exists('\\BCC\\Core\\ServiceLocator')) {
             return [];
         }
-        return \BCC\Core\ServiceLocator::resolveTrendingData()->getTrendingPages($limit);
+        $rows = \BCC\Core\ServiceLocator::resolveTrendingData()->getTrendingPages($limit);
+
+        $dtos = [];
+        foreach ($rows as $row) {
+            // Contract returns untyped object; convert to array for safe access.
+            // Pin expected keys so a contract drift (added/removed fields
+            // upstream) surfaces here instead of leaking corrupt data.
+            $data = get_object_vars($row);
+            foreach (['ID', 'total_score', 'reputation_tier'] as $required) {
+                if (!array_key_exists($required, $data)) {
+                    throw new \LogicException(
+                        "TrendingDataInterface adapter missing key: {$required}"
+                    );
+                }
+            }
+            if (!is_numeric($data['ID'])) {
+                throw new \LogicException('TrendingDataInterface adapter: non-numeric ID');
+            }
+            if (!is_numeric($data['total_score'])) {
+                throw new \LogicException('TrendingDataInterface adapter: non-numeric total_score');
+            }
+            $dtos[] = new TrendingPageRowDTO(
+                id:             (int) $data['ID'],
+                totalScore:     (float) $data['total_score'],
+                reputationTier: (string) $data['reputation_tier'],
+            );
+        }
+        return $dtos;
     }
 
     /**
