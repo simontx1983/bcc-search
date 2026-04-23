@@ -125,6 +125,17 @@ final class SearchRepository
             }
 
             update_option('bcc_ft_index_v2_installed', 1, false);
+
+            // Ranking quality changes when FULLTEXT becomes available (MATCH
+            // AGAINST replaces LIKE fallback), so any cached results built
+            // pre-install would now rank differently. Bust the search cache
+            // version so stale entries are not served alongside fresh ones.
+            // Runs inside the GET_LOCK region so only the installing worker
+            // does this work; subsequent callers short-circuit on the
+            // v2_installed option and never enter this branch.
+            if (class_exists('\\BCC\\Search\\Controllers\\SearchController')) {
+                \BCC\Search\Controllers\SearchController::bust_search_cache();
+            }
         } finally {
             $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");
         }
@@ -184,8 +195,11 @@ final class SearchRepository
 
             // Strip FULLTEXT boolean operators and keywords to prevent
             // query-semantics injection / relevance manipulation.
-            $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query);
-            $ft_clean = preg_replace('/\b(AND|OR|NOT)\b/i', ' ', $ft_clean);
+            // preg_replace returns null only on regex compile failure, which would
+            // indicate a code bug; coalesce to '' so the sanitizer degrades to
+            // the LIKE fallback rather than blowing up.
+            $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query) ?? '';
+            $ft_clean = preg_replace('/\b(AND|OR|NOT)\b/i', ' ', $ft_clean) ?? '';
             $ft_clean = trim($ft_clean);
 
             // If sanitization stripped everything, skip FULLTEXT and fall
@@ -199,8 +213,16 @@ final class SearchRepository
             // Search title + content via FULLTEXT, also match category names
             // via LEFT JOIN so "Cosmos validator" finds pages categorised as
             // "Validators" even if the title doesn't contain that word.
+            //
+            // The LEFT JOIN on pcm + catm fans out to one row per category
+            // per page. Without DISTINCT, a page with N categories produces
+            // N duplicate candidate rows — silently shrinking the effective
+            // LIMIT, biasing rank, and wasting downstream enrichment work.
+            // Force DISTINCT whenever the cat-match join is present,
+            // regardless of whether the typed category filter is active.
             $cat_match_join = '';
             $cat_match_where = '';
+            $ft_distinct = $distinct;
             if ($cat_info) {
                 $cat_match_join = "
                     LEFT JOIN {$cat_info['table']} pcm ON pcm.{$cat_info['page_col']} = p.ID
@@ -212,10 +234,11 @@ final class SearchRepository
                     "OR catm.post_title LIKE %s",
                     '%' . $wpdb->esc_like($query) . '%'
                 );
+                $ft_distinct = 'DISTINCT';
             }
 
             $sql = $wpdb->prepare(
-                "SELECT {$distinct} p.ID, p.post_title
+                "SELECT {$ft_distinct} p.ID, p.post_title
                  FROM {$posts_table} p
                  {$cat_join}
                  {$cat_match_join}
@@ -468,21 +491,29 @@ final class SearchRepository
             return $cached;
         }
 
-        $cats = get_posts([
-            'post_type'      => 'peepso-page-cat',
-            'post_status'    => 'publish',
-            'orderby'        => 'menu_order',
-            'order'          => 'ASC',
-            'posts_per_page' => 100,
-            'fields'         => 'all',
-        ]);
+        // Direct SELECT of only post_name + post_title avoids inflating full
+        // WP_Post objects (which drag post_content/excerpt/meta and can reach
+        // 5–10KB each). On a site with 100 categories loaded per search
+        // request, the savings is up to ~1MB of PHP memory per request before
+        // wp_cache absorbs it — meaningful under concurrent load.
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT post_name AS slug, post_title AS name
+             FROM {$wpdb->posts}
+             WHERE post_type = 'peepso-page-cat'
+               AND post_status = 'publish'
+             ORDER BY menu_order ASC, post_title ASC
+             LIMIT 100"
+        );
 
         $options = [['slug' => '', 'name' => 'All Types']];
-        foreach ($cats as $cat) {
-            $options[] = [
-                'slug' => $cat->post_name,
-                'name' => $cat->post_title,
-            ];
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                $options[] = [
+                    'slug' => (string) $row->slug,
+                    'name' => (string) $row->name,
+                ];
+            }
         }
 
         wp_cache_set(self::CAT_CACHE_KEY, $options, self::CACHE_GROUP, self::CAT_CACHE_TTL);

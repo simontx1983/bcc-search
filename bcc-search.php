@@ -53,6 +53,35 @@ if ( ! file_exists( $bcc_search_autoloader ) ) {
 }
 require_once $bcc_search_autoloader;
 
+// ── Runtime FT-index self-healing (activation-hook skip recovery) ────────────
+//
+// Install paths that bypass register_activation_hook (wp-cli bulk activate,
+// multisite network-activate edge cases, file-copy deployments) leave the
+// FT index uninstalled. Every search then falls through to LIKE '%…%' on
+// post_content, a trivial DoS surface. Schedule a daily wp-cron retry
+// that calls ensureFulltextIndex() until the install option is set.
+add_action('init', function (): void {
+    if (get_option('bcc_ft_index_v2_installed')) {
+        return;
+    }
+    if (!wp_next_scheduled('bcc_search_ensure_ft_index')) {
+        wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'bcc_search_ensure_ft_index');
+    }
+});
+add_action('bcc_search_ensure_ft_index', function (): void {
+    if (get_option('bcc_ft_index_v2_installed')) {
+        // Already installed — deschedule this self-heal cron.
+        $ts = wp_next_scheduled('bcc_search_ensure_ft_index');
+        if ($ts) {
+            wp_unschedule_event($ts, 'bcc_search_ensure_ft_index');
+        }
+        return;
+    }
+    if (class_exists('\\BCC\\Search\\Repositories\\SearchRepository')) {
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+    }
+});
+
 // ── Cache invalidation (must run on every request, not just REST) ────────────
 add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_cache_hooks']);
 

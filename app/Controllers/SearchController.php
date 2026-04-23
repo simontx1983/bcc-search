@@ -21,6 +21,11 @@ class SearchController
     const CACHE_GROUP        = 'bcc_search';
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
+    // Rebuild lock TTL MUST exceed the cache hard TTL (SEARCH_CACHE_TTL + 30s
+    // stale buffer) so a slow rebuild cannot have its lock auto-expire while
+    // still holding it. If the lock expires mid-rebuild, a second worker can
+    // acquire it and begin a duplicate rebuild, racing on wp_cache_set().
+    const REBUILD_LOCK_TTL   = 120;
 
     /**
      * Resolve PeepSo frontend asset paths.
@@ -161,8 +166,17 @@ class SearchController
         // stale-while-revalidate pattern can serve old data while one
         // worker rebuilds the entry.
         $cache_version = self::getCacheVersion();
-        $cache_key     = 'search_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $cache_version);
-        $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
+        // Visibility-bucket: logged-in vs logged-out. PeepSo can gate
+        // certain pages/categories by login state via visibility ACL;
+        // if that ACL applies, a member's primed cache would otherwise
+        // leak to a non-member hitting the same $q/$type. Separating
+        // buckets prevents cross-audience cache poisoning regardless of
+        // whether the site currently enables closed pages.
+        $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
+        $cache_key         = 'search_' . md5(
+            mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $visibility_bucket . '|' . $cache_version
+        );
+        $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key      = null;
         $lock_acquired = false;
@@ -179,7 +193,7 @@ class SearchController
             // Try to acquire the rebuild lock (atomic). If another worker
             // is already rebuilding, serve stale data instead of blocking.
             $lock_key = 'bcc_search_lock_' . md5($cache_key);
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
@@ -191,12 +205,32 @@ class SearchController
         } else {
             // ── Stampede protection for cold cache (no stale entry to serve) ──
             $lock_key = 'bcc_search_lock_' . md5($cache_key);
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
-                // Another worker is building this entry from scratch.
-                // Return empty rather than piling onto the DB.
-                return new \WP_REST_Response(['results' => [], 'total' => 0, 'cached' => false]);
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+                // Another worker is already building this entry. Short
+                // bounded spin-wait so losers serve the winner's result
+                // instead of returning an empty "no matches" lie — the
+                // prior behaviour made search appear broken to every
+                // concurrent user during any cache flush / eviction.
+                $deadline = microtime(true) + 1.5; // 1.5s budget total
+                do {
+                    usleep(80 * 1000); // 80ms between polls
+                    $retry = wp_cache_get($cache_key, self::CACHE_GROUP);
+                    if (is_array($retry) && isset($retry['data']) && is_array($retry['data'])) {
+                        return new \WP_REST_Response($retry['data']);
+                    }
+                    if (is_array($retry)) { // legacy flat-array format
+                        return new \WP_REST_Response($retry);
+                    }
+                } while (microtime(true) < $deadline);
+
+                // Winner is still working past our wait budget. Fall through
+                // and build ourselves rather than return an empty response —
+                // worst case two workers hit the DB once each, which is a
+                // far milder failure mode than lying to users.
+                $lock_acquired = false;
+            } else {
+                $lock_acquired = true;
             }
-            $lock_acquired = true;
         }
 
         try {
@@ -260,7 +294,13 @@ class SearchController
 
             return new \WP_REST_Response($response);
         } finally {
-            wp_cache_delete($lock_key, self::CACHE_GROUP);
+            // Only delete the rebuild lock if we actually own it.
+            // The cold-cache spin-wait fall-through path proceeds without
+            // the lock; deleting another worker's lock there would
+            // trigger a stampede on this key.
+            if ($lock_acquired) {
+                wp_cache_delete($lock_key, self::CACHE_GROUP);
+            }
         }
     }
 
@@ -399,6 +439,18 @@ class SearchController
         try {
             return ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($pageIds);
         } catch (\Throwable $e) {
+            // Silent failure here degrades ranking to text-relevance only —
+            // low-trust content can then bubble up. Log with rate-limited
+            // dedup so ops sees sustained trust-engine outages without the
+            // per-request log spam a hot search endpoint would produce.
+            if (class_exists('\\BCC\\Core\\Log\\Logger')
+                && !wp_cache_get('bcc_search_enrich_fail_logged', self::CACHE_GROUP)) {
+                wp_cache_set('bcc_search_enrich_fail_logged', 1, self::CACHE_GROUP, 60);
+                \BCC\Core\Log\Logger::error('[bcc-search] score_enrichment_failed', [
+                    'error'    => $e->getMessage(),
+                    'page_cnt' => count($pageIds),
+                ]);
+            }
             return [];
         }
     }
@@ -440,7 +492,7 @@ class SearchController
             }
 
             // Stale — try to acquire rebuild lock.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
@@ -450,7 +502,7 @@ class SearchController
             return new \WP_REST_Response($cached);
         } else {
             // Cold miss — try to acquire lock.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, 30)) {
+            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
                 // Another worker is building — return empty.
                 return new \WP_REST_Response(['results' => [], 'categories' => []]);
             }
