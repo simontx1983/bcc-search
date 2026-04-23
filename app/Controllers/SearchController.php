@@ -50,14 +50,28 @@ class SearchController
     const BREAKER_REBUILD_THRESHOLD = 50;
     const BREAKER_TRIP_TTL          = 30;
     const BREAKER_TRIPPED_KEY       = 'bcc_search_breaker_tripped';
-    // Rebuild lock TTL. Previously 120s "to exceed cache hard TTL". That
-    // reasoning was wrong in practice: a rebuild finishes in well under 1s,
-    // so the long TTL's only real effect was to orphan the lock for 2
-    // minutes whenever the builder worker fatal'd between wp_cache_add and
-    // the finally block — losers then saw stale/empty data for that full
-    // window. 20s covers realistic rebuild time (incl. trust-engine round-
-    // trip under DB latency) with margin, and caps post-crash degradation.
-    const REBUILD_LOCK_TTL   = 20;
+    // Rebuild lock TTL. Bumped from 20→45 after observing that a degraded
+    // trust engine can push enrichment latency into the 5–15s range, and
+    // a 20s TTL would then let the lock auto-expire mid-rebuild, allowing
+    // a second rebuilder to start for the same key and pile more load
+    // onto the already-struggling read model. 45s is the worst-case
+    // budget for (searchCandidates + enrichScoresIfAvailable + hydrate +
+    // cache writes) under observed tail latencies, plus margin. Post-
+    // SIGKILL degradation is bounded at 45s per key, which LKG fallback
+    // covers cleanly.
+    const REBUILD_LOCK_TTL   = 45;
+
+    // Concurrency gate: even with the breaker, we cap the number of
+    // in-flight rebuilds globally. Rebuilders that would push us past
+    // this cap serve LKG/503 without starting heavy work. Counter lives
+    // in the object cache with a TTL safety net so a SIGKILL'd worker's
+    // un-decremented slot self-expires.
+    const MAX_CONCURRENT_REBUILDS = 20;
+    const ACTIVE_REBUILDS_KEY     = 'bcc_search_active_rebuilds';
+    // TTL > REBUILD_LOCK_TTL so a stuck worker's slot outlives its own
+    // lock (the lock will be released first via TTL expiry; the gauge
+    // will recover on the next natural reset).
+    const ACTIVE_REBUILDS_TTL     = 90;
 
     /**
      * Gate: return a 503 if PeepSo is not loaded.
@@ -219,7 +233,28 @@ class SearchController
         $type = trim((string) $request->get_param('type'));
 
         // Fetch categories once per request — used for validation and response.
-        $categories = SearchRepository::getCategories();
+        // getCategories() throws RuntimeException on DB error (so a broken
+        // query can't poison the 12h-cached category list). Serve a
+        // generic 503 rather than letting the exception escape — we have
+        // no LKG key yet at this point.
+        try {
+            $categories = SearchRepository::getCategories();
+        } catch (\RuntimeException $e) {
+            if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                \BCC\Core\Log\Logger::error('[bcc-search] getCategories failed', [
+                    'error' => $e->getMessage(),
+                ]);
+            }
+            return new \WP_REST_Response(
+                [
+                    'code'    => 'categories_unavailable',
+                    'message' => 'Search is temporarily unavailable. Please retry shortly.',
+                    'data'    => ['status' => 503],
+                ],
+                503,
+                ['Retry-After' => '5']
+            );
+        }
 
         // Validate $type against known category slugs to prevent wasted
         // DB queries on nonexistent categories and limit the SQL surface.
@@ -313,6 +348,7 @@ class SearchController
             }
         }
 
+        $slot_reserved = false;
         try {
             // Circuit breaker: if too many rebuilds have started in the
             // recent window (cache-wide version bump, trust-engine
@@ -322,12 +358,33 @@ class SearchController
             if (!self::circuitBreakerAllowsRebuild()) {
                 return $this->breakerTrippedResponse($lkg_key);
             }
+            // Concurrency gate — bounded by MAX_CONCURRENT_REBUILDS so
+            // a trust-engine slowdown can't pile up N rebuilders on the
+            // same struggling read model beyond the cap.
+            if (!self::reserveRebuildSlot()) {
+                return $this->breakerTrippedResponse($lkg_key);
+            }
+            $slot_reserved = true;
             self::recordRebuildAndMaybeTrip();
 
             $cap = $this->getCandidateCap($q);
 
             // ── Phase 1: Lightweight candidate query (via repository) ───────
-            $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
+            // RuntimeException here = repository detected $wpdb->last_error.
+            // Treat as transient upstream failure: serve LKG if we have it,
+            // else 503. Crucially we do NOT write ANY cache in this path —
+            // an empty-due-to-DB-error payload that poisoned LKG would
+            // silently pin "no results" for LKG_CACHE_TTL.
+            try {
+                $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
+            } catch (\RuntimeException $e) {
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error('[bcc-search] searchCandidates failed', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+                return $this->breakerTrippedResponse($lkg_key);
+            }
 
             if (empty($candidate_rows)) {
                 $response = ['results' => [], 'categories' => $categories];
@@ -408,7 +465,20 @@ class SearchController
                 }
             }
 
-            $results = $this->hydrateAndFormat($winner_ids, $scores_by_id, $filtered_cat_name, $filtered_cat_slug);
+            try {
+                $results = $this->hydrateAndFormat($winner_ids, $scores_by_id, $filtered_cat_name, $filtered_cat_slug);
+            } catch (\RuntimeException $e) {
+                // hydratePages DB error. Serving [] now would be truthful
+                // ("we couldn't build the response") but caching [] as
+                // LKG would poison subsequent losers for an hour. Same
+                // LKG/503 escape hatch as the candidate-query path.
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error('[bcc-search] hydratePages failed', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+                return $this->breakerTrippedResponse($lkg_key);
+            }
 
             $response = [
                 'results'    => $results,
@@ -423,6 +493,9 @@ class SearchController
             // callers return before it as well, so we always own the lock
             // by the time this block runs.
             wp_cache_delete($lock_key, self::CACHE_GROUP);
+            if ($slot_reserved) {
+                self::releaseRebuildSlot();
+            }
         }
     }
 
@@ -456,8 +529,23 @@ class SearchController
             'expires_at' => time() + $softTtl,
         ];
 
+        // Version-scoped cache: always written. Suppresses re-query
+        // stampedes for legitimately empty queries until the next
+        // version bump.
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
-        wp_cache_set($lkg_key,   $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+
+        // LKG mirror: NEVER written for empty results. A transient DB
+        // failure that produced an empty payload (searchCandidates DB
+        // error, hydratePages DB error) would otherwise pin "no results"
+        // into LKG for the full LKG_CACHE_TTL window, and every
+        // cold-miss loser for that fingerprint would be served that
+        // empty response with a 200 — a silent correctness failure
+        // that is invisible to error telemetry. Keeping LKG non-empty
+        // means the only way to poison it is a verified non-empty
+        // response.
+        if (!empty($response['results'])) {
+            wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+        }
     }
 
     /**
@@ -678,16 +766,30 @@ class SearchController
             }
         }
 
+        $slot_reserved = false;
         try {
             // Circuit breaker: same protection as handle_search.
             if (!self::circuitBreakerAllowsRebuild()) {
                 return $this->breakerTrippedResponse($lkg_key);
             }
+            if (!self::reserveRebuildSlot()) {
+                return $this->breakerTrippedResponse($lkg_key);
+            }
+            $slot_reserved = true;
             self::recordRebuildAndMaybeTrip();
 
             $winner_ids   = [];
             $scores_by_id = [];
-            $categories   = SearchRepository::getCategories();
+            try {
+                $categories = SearchRepository::getCategories();
+            } catch (\RuntimeException $e) {
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error('[bcc-search] trending getCategories failed', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+                return $this->breakerTrippedResponse($lkg_key);
+            }
 
             // Fast path: trust-engine read model for trending pages.
             // LogicException from a contract drift would otherwise crash
@@ -730,7 +832,16 @@ class SearchController
             // enrichment load on the trust engine for no ranking benefit
             // (candidate pool was already "most recent", not "best scored").
             if (empty($winner_ids)) {
-                $candidate_ids = SearchRepository::getFallbackPageIds(self::PRERANK_TOP_K);
+                try {
+                    $candidate_ids = SearchRepository::getFallbackPageIds(self::PRERANK_TOP_K);
+                } catch (\RuntimeException $e) {
+                    if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                        \BCC\Core\Log\Logger::error('[bcc-search] trending fallback query failed', [
+                            'error' => $e->getMessage(),
+                        ]);
+                    }
+                    return $this->breakerTrippedResponse($lkg_key);
+                }
 
                 if (!empty($candidate_ids)) {
                     $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
@@ -751,7 +862,16 @@ class SearchController
                 return new \WP_REST_Response($response);
             }
 
-            $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
+            try {
+                $results = $this->hydrateAndFormat($winner_ids, $scores_by_id);
+            } catch (\RuntimeException $e) {
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error('[bcc-search] trending hydratePages failed', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+                return $this->breakerTrippedResponse($lkg_key);
+            }
 
             $response = [
                 'results'    => $results,
@@ -763,6 +883,9 @@ class SearchController
             return new \WP_REST_Response($response);
         } finally {
             wp_cache_delete($lock_key, self::CACHE_GROUP);
+            if ($slot_reserved) {
+                self::releaseRebuildSlot();
+            }
         }
     }
 
@@ -788,7 +911,13 @@ class SearchController
         ];
 
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
-        wp_cache_set($lkg_key,   $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+
+        // LKG: skip empty payloads so a trust-engine outage + fallback
+        // failure can't pin "no trending" into LKG for an hour. Same
+        // reasoning as cacheSearchResult().
+        if (!empty($response['results'])) {
+            wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+        }
     }
 
     /** Cache TTL used uniformly for both bust and heal writes (see getCacheVersion). */
@@ -981,6 +1110,68 @@ class SearchController
                     'node'               => gethostname() ?: 'unknown',
                 ]);
             }
+        }
+    }
+
+    /**
+     * Reserve a slot in the global concurrent-rebuilds gauge.
+     *
+     * Atomic increment-then-compare via wp_cache_incr. If the increment
+     * pushes us past MAX_CONCURRENT_REBUILDS, we decrement back out and
+     * return false — the caller should serve LKG/503 instead of starting
+     * heavy work.
+     *
+     * The gauge key is TTL'd at ACTIVE_REBUILDS_TTL so a SIGKILL'd
+     * worker's un-decremented slot self-clears. TTL is intentionally
+     * longer than REBUILD_LOCK_TTL so lock expiry resolves first.
+     *
+     * On non-persistent caches this returns true unconditionally — the
+     * counter is per-request memory there and can't reflect global state.
+     * Same rationale as the circuit breaker.
+     */
+    private static function reserveRebuildSlot(): bool
+    {
+        if (!wp_using_ext_object_cache()) {
+            return true;
+        }
+        wp_cache_add(self::ACTIVE_REBUILDS_KEY, 0, self::CACHE_GROUP, self::ACTIVE_REBUILDS_TTL);
+        $count = wp_cache_incr(self::ACTIVE_REBUILDS_KEY, 1, self::CACHE_GROUP);
+        if (!is_int($count)) {
+            // Backend does not support atomic incr — skip the gauge
+            // rather than race on a non-atomic get-then-set.
+            return true;
+        }
+        if ($count > self::MAX_CONCURRENT_REBUILDS) {
+            wp_cache_decr(self::ACTIVE_REBUILDS_KEY, 1, self::CACHE_GROUP);
+            if (class_exists('\\BCC\\Core\\Log\\Logger')
+                && wp_cache_add('bcc_search_slot_exhausted_logged', 1, self::CACHE_GROUP, 30)
+            ) {
+                \BCC\Core\Log\Logger::warning('[bcc-search] rebuild slot exhausted', [
+                    'max'  => self::MAX_CONCURRENT_REBUILDS,
+                    'node' => gethostname() ?: 'unknown',
+                ]);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Release a previously-reserved slot.
+     *
+     * Decrement with underflow clamp. A negative value after decrement
+     * means the counter TTL expired while the slot was held (e.g., a
+     * rebuild took longer than ACTIVE_REBUILDS_TTL); snap back to 0 so
+     * the gauge is self-healing.
+     */
+    private static function releaseRebuildSlot(): void
+    {
+        if (!wp_using_ext_object_cache()) {
+            return;
+        }
+        $count = wp_cache_decr(self::ACTIVE_REBUILDS_KEY, 1, self::CACHE_GROUP);
+        if (is_int($count) && $count < 0) {
+            wp_cache_set(self::ACTIVE_REBUILDS_KEY, 0, self::CACHE_GROUP, self::ACTIVE_REBUILDS_TTL);
         }
     }
 

@@ -23,6 +23,24 @@ final class SearchRepository
     private const CACHE_GROUP = 'bcc_search';
     private const CAT_CACHE_KEY = 'bcc_search_categories';
     private const CAT_CACHE_TTL = 43200; // 12 hours
+
+    /**
+     * Throw RuntimeException if the last query left an error on $wpdb.
+     *
+     * Centralised so the controller's LKG/503 escape hatch is the ONLY
+     * way a DB error surfaces (never silently-to-empty-result, which
+     * would poison the LKG mirror). The indirection also defeats
+     * PHPStan's after-narrowing of `$wpdb->last_error` across multiple
+     * queries in the same scope.
+     */
+    private static function throwOnDbError(string $context): void
+    {
+        global $wpdb;
+        $err = (string) $wpdb->last_error;
+        if ($err !== '') {
+            throw new \RuntimeException("{$context}: {$err}");
+        }
+    }
     // peepso_page_categories table presence rarely changes (install/activate
     // only). Cache the result long-term to skip the information_schema-ish
     // SHOW TABLES round-trip on hot-path searches. A PeepSo install/uninstall
@@ -41,7 +59,6 @@ final class SearchRepository
     public static function peepsoCategoryTable(): ?array
     {
         // Keyed by $wpdb->prefix so a multisite switch_to_blog() re-checks.
-        /** @var array<string, array{table: string, page_col: string, cat_col: string}|null> $cache */
         static $cache = [];
 
         global $wpdb;
@@ -317,19 +334,29 @@ final class SearchRepository
                     $cap
                 );
 
+                // LIMIT %d is applied in $sql (prepared above); $cap is
+                // the caller's result ceiling.
                 $rows = $wpdb->get_results($sql, ARRAY_A);
 
-                // Distinguish "FT errored" from "FT returned zero rows".
-                // Errors fall through to title-prefix LIKE (degraded but
-                // available). Zero rows do NOT fall through — the caller
-                // then runs a redundant second query for a legitimately
-                // empty result set, which is pure waste under load.
+                // Fall-through policy:
+                //   - FT errored:  fall through to title-prefix (degraded but available).
+                //   - FT returned zero rows:  ALSO fall through. InnoDB strips
+                //     stopwords from the FT term ("the", "and", "or", "from",
+                //     "with", …). A query like "the matrix" reduces to
+                //     "matrix*" inside FT and works, but a query of just "the"
+                //     or "from" returns zero FT rows even when titles starting
+                //     with those words exist. Title-prefix LIKE 'the%' is
+                //     index-eligible and cheap, so paying one extra query on
+                //     truly-empty results is worth correctness on stopword
+                //     queries.
+                //   - FT returned non-empty rows:  return them.
                 if ($wpdb->last_error) {
                     error_log('[bcc-search] FULLTEXT query error, falling back to title-prefix: ' . $wpdb->last_error);
                     // Fall through to title-prefix LIKE below.
-                } elseif (is_array($rows)) {
+                } elseif (is_array($rows) && !empty($rows)) {
                     return self::candidatesToDtos($rows);
                 }
+                // Otherwise (empty rows, or non-array) fall through to LIKE.
             }
         }
 
@@ -359,7 +386,13 @@ final class SearchRepository
 
         $rows = $wpdb->get_results($sql, ARRAY_A);
 
-        if ($wpdb->last_error || !is_array($rows)) {
+        // A DB error on the title-prefix fallback is a hard failure. The
+        // FT path already falls through on errors, so by the time we're
+        // here the FT path also failed OR wasn't tried. Throwing rather
+        // than returning [] prevents the controller from cache-poisoning
+        // the LKG with a "no results" payload built from a broken query.
+        self::throwOnDbError('searchCandidates title-prefix query failed');
+        if (!is_array($rows)) {
             return [];
         }
 
@@ -443,6 +476,10 @@ final class SearchRepository
             ...array_merge($ids, $ids, [count($ids)])
         ), ARRAY_A);
 
+        // A DB error here means the hydrate batch is corrupt — throw
+        // rather than return [], which the controller would otherwise
+        // cache as "0 results" for the LKG 1h window.
+        self::throwOnDbError('hydratePages page query failed');
         if (!is_array($rows)) {
             return [];
         }
@@ -471,6 +508,7 @@ final class SearchRepository
                 ...$ids
             ), ARRAY_A);
 
+            self::throwOnDbError('hydratePages category batch query failed');
             if (is_array($cat_rows)) {
                 foreach ($cat_rows as $cr) {
                     $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
@@ -572,7 +610,7 @@ final class SearchRepository
         global $wpdb;
         $posts_table = $wpdb->posts;
 
-        return array_map('intval', $wpdb->get_col($wpdb->prepare(
+        $col = $wpdb->get_col($wpdb->prepare(
             "SELECT p.ID
              FROM {$posts_table} p
              WHERE p.post_type = 'peepso-page'
@@ -580,7 +618,12 @@ final class SearchRepository
              ORDER BY p.ID DESC
              LIMIT %d",
             $limit
-        )));
+        ));
+
+        // DB errors must propagate so the controller can take the LKG/503
+        // path rather than serving "trending: []" from a broken query.
+        self::throwOnDbError('getFallbackPageIds query failed');
+        return array_map('intval', is_array($col) ? $col : []);
     }
 
     // ── Categories ──────────────────────────────────────────────────────
@@ -612,6 +655,11 @@ final class SearchRepository
              ORDER BY menu_order ASC, post_title ASC
              LIMIT 100"
         );
+
+        // Throw on DB error so the controller can treat categories as
+        // "unknown" rather than caching an empty list that would also
+        // invalidate all type=... filters for the CAT_CACHE_TTL window.
+        self::throwOnDbError('getCategories query failed');
 
         $options = [['slug' => '', 'name' => 'All Types']];
         if (is_array($rows)) {
