@@ -174,20 +174,103 @@
         };
     }
 
+    // ─── Users vertical: DOM-agnostic result renderer ──────────────────────
+    //
+    // Kept outside initWidget so the code path is clearly separate from
+    // project-result rendering; there is no shared mutable state.
+    function buildUserItem(user, query) {
+        const li   = document.createElement('li');
+        const link = document.createElement('a');
+        link.href      = safeUrl(user.profile_url);
+        link.className = RESULT_CLASS + ' bcc-search__user-result';
+        link.setAttribute('role', 'option');
+        link.setAttribute('tabindex', '-1');
+
+        const avatarHtml = user.avatar_url
+            ? `<img class="bcc-search__avatar" src="${safeUrl(user.avatar_url)}" alt="" loading="lazy">`
+            : '<span class="bcc-search__avatar bcc-search__avatar--empty" aria-hidden="true"></span>';
+
+        link.innerHTML = `
+            ${avatarHtml}
+            <span class="bcc-search__meta">
+                <span class="bcc-search__name">${highlight(user.display_name || user.username, query)}</span>
+                <span class="bcc-search__sub"><span class="bcc-search__handle">@${escHtml(user.username)}</span></span>
+            </span>
+        `;
+
+        li.appendChild(link);
+        return li;
+    }
+
+    // ─── Groups vertical: DOM-agnostic result renderer ─────────────────────
+    //
+    // Sibling to buildUserItem. Separate function kept deliberately so
+    // each vertical's row shape can evolve independently without one
+    // affecting the other.
+    function buildGroupItem(group, query) {
+        const li   = document.createElement('li');
+        const link = document.createElement('a');
+        link.href      = safeUrl(group.group_url);
+        link.className = RESULT_CLASS + ' bcc-search__group-result';
+        link.setAttribute('role', 'option');
+        link.setAttribute('tabindex', '-1');
+
+        const avatarHtml = group.avatar_url
+            ? `<img class="bcc-search__avatar" src="${safeUrl(group.avatar_url)}" alt="" loading="lazy">`
+            : '<span class="bcc-search__avatar bcc-search__avatar--empty" aria-hidden="true"></span>';
+
+        const descHtml = group.description
+            ? `<span class="bcc-search__sub"><span class="bcc-search__desc">${escHtml(group.description)}</span></span>`
+            : '';
+
+        link.innerHTML = `
+            ${avatarHtml}
+            <span class="bcc-search__meta">
+                <span class="bcc-search__name">${highlight(group.name, query)}</span>
+                ${descHtml}
+            </span>
+        `;
+
+        li.appendChild(link);
+        return li;
+    }
+
     // ─── Init each .bcc-search widget on the page ───────────────────────────────
     function initWidget(widget) {
-        const input    = widget.querySelector('.bcc-search__input');
-        const chipsEl  = widget.querySelector('.bcc-search__chips');
-        const dropdown = widget.querySelector('.bcc-search__dropdown');
-        const listEl   = widget.querySelector('.bcc-search__results');
-        const emptyEl  = widget.querySelector('.bcc-search__empty');
-        const clearBtn = widget.querySelector('.bcc-search__clear');
+        const input      = widget.querySelector('.bcc-search__input');
+        const chipsEl    = widget.querySelector('.bcc-search__chips');
+        const tabsEl     = widget.querySelector('.bcc-search__tabs');
+        const dropdown   = widget.querySelector('.bcc-search__dropdown');
+        const listEl     = widget.querySelector('.bcc-search__results');
+        const emptyEl    = widget.querySelector('.bcc-search__empty');
+        const clearBtn   = widget.querySelector('.bcc-search__clear');
+        const userListEl  = widget.querySelector('.bcc-search__user-results');
+        const userEmpty   = widget.querySelector('.bcc-search__user-empty');
+        const groupListEl = widget.querySelector('.bcc-search__group-results');
+        const groupEmpty  = widget.querySelector('.bcc-search__group-empty');
+        const projPane    = widget.querySelector('.bcc-search__pane--projects');
+        const userPane    = widget.querySelector('.bcc-search__pane--users');
+        const groupPane   = widget.querySelector('.bcc-search__pane--groups');
 
         if (!input || !dropdown || !listEl) return;
 
-        let controller   = null;
-        let activeIdx    = -1;
-        let currentType  = '';
+        let controller      = null;          // projects AbortController
+        let userController  = null;          // users AbortController (independent)
+        let groupController = null;          // groups AbortController (independent)
+        let activeIdx       = -1;
+        let currentType     = '';
+        // Active vertical: 'projects' (default), 'users', or 'groups'.
+        // The Projects pipeline never observes this value; it's only
+        // checked at input time to decide which fetch path to run.
+        let activeVertical  = (widget.getAttribute('data-vertical') || 'projects');
+        // Per-widget in-memory cache of the last query + results per
+        // vertical. Saves a roundtrip when the tab is re-activated
+        // with the same query, without reusing the server-side cache
+        // key. Sibling state to lastUserQuery / lastUserResults.
+        let lastUserQuery    = '';
+        let lastUserResults  = null;
+        let lastGroupQuery   = '';
+        let lastGroupResults = null;
 
         // ── Chips: render from API categories ─────────────────────────────────
         // counts is optional — when provided, chips show (N) and hide zeros.
@@ -489,15 +572,276 @@
             doSearch(q, type);
         }, DEBOUNCE_MS);
 
+        // ── Users vertical: fetch + render ────────────────────────────────
+        //
+        // Runs on its own AbortController and its own empty/results
+        // elements. Never touches listEl / emptyEl / chipsEl / the
+        // project cache. Same debounce window as projects so typing
+        // feels identical on both tabs.
+        function renderUserResults(users, query) {
+            if (!userListEl) return;
+            userListEl.innerHTML = '';
+            if (!users || users.length === 0) {
+                if (userEmpty) {
+                    var suffix = query ? ' for “' + query + '”' : '';
+                    userEmpty.textContent = 'No users found' + suffix + '.';
+                    userEmpty.hidden = false;
+                }
+                return;
+            }
+            if (userEmpty) userEmpty.hidden = true;
+
+            var ul = document.createElement('ul');
+            ul.className = 'bcc-search__group-list';
+            users.forEach(function (u) { ul.appendChild(buildUserItem(u, query)); });
+            userListEl.appendChild(ul);
+
+            // Same entrance stagger as projects for visual consistency.
+            var allItems = userListEl.querySelectorAll('.' + RESULT_CLASS);
+            allItems.forEach(function (el, i) {
+                el.style.animationDelay = (i * 15) + 'ms';
+            });
+        }
+
+        async function doUserSearch(q) {
+            q = String(q).trim();
+            if (q.length < MIN_CHARS) return;
+
+            // Serve from the in-memory last-query cache when the tab
+            // is re-activated with the same query — avoids a server
+            // roundtrip on common UX flows (click Users → click
+            // Projects → click Users).
+            if (q === lastUserQuery && lastUserResults !== null) {
+                renderUserResults(lastUserResults, q);
+                openDropdown();
+                return;
+            }
+
+            if (userController) userController.abort();
+            userController = new AbortController();
+
+            widget.classList.add('bcc-search--loading');
+
+            // bccSearch.userSearchUrl is injected via wp_localize_script
+            // from render.php / the shortcode handler. Guard anyway so
+            // a missing localization doesn't wedge the tab.
+            var base = (typeof bccSearch !== 'undefined' && bccSearch.userSearchUrl)
+                ? bccSearch.userSearchUrl
+                : '';
+            if (!base) {
+                renderUserResults([], q);
+                openDropdown();
+                widget.classList.remove('bcc-search--loading');
+                return;
+            }
+
+            var url = new URL(base);
+            url.searchParams.set('q', q);
+
+            try {
+                const res = await fetch(url.toString(), { signal: userController.signal });
+                widget.classList.remove('bcc-search--loading');
+
+                if (!res.ok) {
+                    renderUserResults([], q);
+                    openDropdown();
+                    return;
+                }
+                const json = await res.json();
+                var users = Array.isArray(json.results) ? json.results : [];
+                lastUserQuery   = q;
+                lastUserResults = users;
+                renderUserResults(users, q);
+                openDropdown();
+            } catch (e) {
+                widget.classList.remove('bcc-search--loading');
+                if (e.name !== 'AbortError') {
+                    console.error('[BCC Search users]', e);
+                }
+            }
+        }
+
+        const debouncedUserSearch = debounce(function (q) {
+            if (q.length < MIN_CHARS) {
+                closeDropdown();
+                return;
+            }
+            doUserSearch(q);
+        }, DEBOUNCE_MS);
+
+        // ── Groups vertical: fetch + render ───────────────────────────────
+        //
+        // Structurally mirrors the Users vertical: own AbortController,
+        // own DOM targets, own last-query memory cache. No state
+        // touches projects or users.
+        function renderGroupResults(groups, query) {
+            if (!groupListEl) return;
+            groupListEl.innerHTML = '';
+            if (!groups || groups.length === 0) {
+                if (groupEmpty) {
+                    var suffix = query ? ' for “' + query + '”' : '';
+                    groupEmpty.textContent = 'No groups found' + suffix + '.';
+                    groupEmpty.hidden = false;
+                }
+                return;
+            }
+            if (groupEmpty) groupEmpty.hidden = true;
+
+            var ul = document.createElement('ul');
+            ul.className = 'bcc-search__group-list';
+            groups.forEach(function (g) { ul.appendChild(buildGroupItem(g, query)); });
+            groupListEl.appendChild(ul);
+
+            var allItems = groupListEl.querySelectorAll('.' + RESULT_CLASS);
+            allItems.forEach(function (el, i) {
+                el.style.animationDelay = (i * 15) + 'ms';
+            });
+        }
+
+        async function doGroupSearch(q) {
+            q = String(q).trim();
+            if (q.length < MIN_CHARS) return;
+
+            if (q === lastGroupQuery && lastGroupResults !== null) {
+                renderGroupResults(lastGroupResults, q);
+                openDropdown();
+                return;
+            }
+
+            if (groupController) groupController.abort();
+            groupController = new AbortController();
+
+            widget.classList.add('bcc-search--loading');
+
+            var base = (typeof bccSearch !== 'undefined' && bccSearch.groupSearchUrl)
+                ? bccSearch.groupSearchUrl
+                : '';
+            if (!base) {
+                renderGroupResults([], q);
+                openDropdown();
+                widget.classList.remove('bcc-search--loading');
+                return;
+            }
+
+            var url = new URL(base);
+            url.searchParams.set('q', q);
+
+            try {
+                const res = await fetch(url.toString(), { signal: groupController.signal });
+                widget.classList.remove('bcc-search--loading');
+
+                if (!res.ok) {
+                    renderGroupResults([], q);
+                    openDropdown();
+                    return;
+                }
+                const json = await res.json();
+                var groups = Array.isArray(json.results) ? json.results : [];
+                lastGroupQuery   = q;
+                lastGroupResults = groups;
+                renderGroupResults(groups, q);
+                openDropdown();
+            } catch (e) {
+                widget.classList.remove('bcc-search--loading');
+                if (e.name !== 'AbortError') {
+                    console.error('[BCC Search groups]', e);
+                }
+            }
+        }
+
+        const debouncedGroupSearch = debounce(function (q) {
+            if (q.length < MIN_CHARS) {
+                closeDropdown();
+                return;
+            }
+            doGroupSearch(q);
+        }, DEBOUNCE_MS);
+
+        // ── Tabs: switch vertical ────────────────────────────────────────
+        function setVertical(next) {
+            if (next !== 'projects' && next !== 'users' && next !== 'groups') return;
+            if (next === activeVertical) return;
+            activeVertical = next;
+            widget.setAttribute('data-vertical', next);
+
+            // Update tab visual + ARIA state.
+            if (tabsEl) {
+                Array.from(tabsEl.querySelectorAll('.bcc-search__tab')).forEach(function (btn) {
+                    var isActive = btn.getAttribute('data-vertical') === next;
+                    btn.classList.toggle('bcc-search__tab--active', isActive);
+                    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+                });
+            }
+
+            // Swap panes. Category chips are projects-only — hide
+            // them under non-project verticals (CSS also enforces
+            // this, defence-in-depth).
+            if (projPane)  projPane.hidden  = (next !== 'projects');
+            if (userPane)  userPane.hidden  = (next !== 'users');
+            if (groupPane) groupPane.hidden = (next !== 'groups');
+            if (chipsEl)   chipsEl.hidden   = (next !== 'projects');
+
+            // Abort any in-flight fetch from the OTHER verticals so
+            // their response can't race into the newly-visible pane.
+            if (next !== 'projects' && controller)      controller.abort();
+            if (next !== 'users'    && userController)  userController.abort();
+            if (next !== 'groups'   && groupController) groupController.abort();
+
+            var q = input.value.trim();
+            if (next === 'projects') {
+                if (q.length >= MIN_CHARS) {
+                    debouncedSearch(q, currentType);
+                } else {
+                    showSuggestions();
+                }
+            } else if (next === 'users') {
+                if (q.length >= MIN_CHARS) {
+                    // Lazy-load: first tab click triggers the first fetch.
+                    debouncedUserSearch(q);
+                } else {
+                    renderUserResults([], '');
+                    openDropdown();
+                }
+            } else { // 'groups'
+                if (q.length >= MIN_CHARS) {
+                    debouncedGroupSearch(q);
+                } else {
+                    renderGroupResults([], '');
+                    openDropdown();
+                }
+            }
+        }
+
+        if (tabsEl) {
+            Array.from(tabsEl.querySelectorAll('.bcc-search__tab')).forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    setVertical(btn.getAttribute('data-vertical') || 'projects');
+                });
+            });
+        }
+
         // ── Event: input (single handler for search + clear button visibility) ─
         input.addEventListener('input', function () {
             if (clearBtn) clearBtn.hidden = this.value.length === 0;
             var q = this.value.trim();
             if (q.length < MIN_CHARS) {
-                showSuggestions();
+                if (activeVertical === 'users') {
+                    renderUserResults([], '');
+                } else if (activeVertical === 'groups') {
+                    renderGroupResults([], '');
+                } else {
+                    // Projects keeps its trending/recent overlay.
+                    showSuggestions();
+                }
                 return;
             }
-            debouncedSearch(q, currentType);
+            if (activeVertical === 'users') {
+                debouncedUserSearch(q);
+            } else if (activeVertical === 'groups') {
+                debouncedGroupSearch(q);
+            } else {
+                debouncedSearch(q, currentType);
+            }
         });
 
         // ── Event: clear button ─────────────────────────────────────────────

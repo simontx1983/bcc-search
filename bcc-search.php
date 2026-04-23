@@ -98,6 +98,12 @@ add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_c
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
+    // Users vertical — isolated controller, cache group, and throttle
+    // bucket. No shared state with the projects controller so adding it
+    // here cannot degrade the existing endpoint.
+    (new \BCC\Search\Controllers\UserSearchController())->register_routes();
+    // Groups vertical — same isolation pattern as Users.
+    (new \BCC\Search\Controllers\GroupSearchController())->register_routes();
 });
 
 // ── Gutenberg block registration ────────────────────────────────────────────
@@ -147,9 +153,11 @@ add_shortcode('bcc_search', function ($atts) {
         true
     );
     wp_localize_script('bcc-search', 'bccSearch', [
-        'restUrl'   => esc_url_raw(rest_url('bcc/v1/search')),
-        'tierCss'   => ['elite' => 'platinum', 'trusted' => 'gold', 'neutral' => 'silver', 'caution' => 'bronze', 'risky' => 'risky'],
-        'tierLabel' => ['elite' => 'Elite', 'trusted' => 'Trusted', 'neutral' => 'Neutral', 'caution' => 'Caution', 'risky' => 'Risky'],
+        'restUrl'        => esc_url_raw(rest_url('bcc/v1/search')),
+        'userSearchUrl'  => esc_url_raw(rest_url('bcc/v1/search/users')),
+        'groupSearchUrl' => esc_url_raw(rest_url('bcc/v1/search/groups')),
+        'tierCss'        => ['elite' => 'platinum', 'trusted' => 'gold', 'neutral' => 'silver', 'caution' => 'bronze', 'risky' => 'risky'],
+        'tierLabel'      => ['elite' => 'Elite', 'trusted' => 'Trusted', 'neutral' => 'Neutral', 'caution' => 'Caution', 'risky' => 'Risky'],
     ]);
 
     ob_start();

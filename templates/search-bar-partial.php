@@ -14,9 +14,39 @@ if (!defined('ABSPATH')) {
     exit;
 }
 ?>
-<div class="bcc-search" role="search" aria-label="<?php esc_attr_e('Search projects', 'bcc-search'); ?>">
+<div class="bcc-search" role="search" aria-label="<?php esc_attr_e('Search', 'bcc-search'); ?>" data-vertical="projects">
+
+    <!-- Vertical tabs. Projects (default) + Users. The Users vertical
+         is lazy-loaded: clicking the tab is what triggers the first
+         /search/users call. Tab state lives in the widget's
+         data-vertical attribute so CSS can scope visibility. -->
+    <div class="bcc-search__tabs" role="tablist" aria-label="<?php esc_attr_e('Search vertical', 'bcc-search'); ?>">
+        <button
+            class="bcc-search__tab bcc-search__tab--active"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            data-vertical="projects"
+        ><?php esc_html_e('Projects', 'bcc-search'); ?></button>
+        <button
+            class="bcc-search__tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            data-vertical="users"
+        ><?php esc_html_e('Users', 'bcc-search'); ?></button>
+        <button
+            class="bcc-search__tab"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            data-vertical="groups"
+        ><?php esc_html_e('Groups', 'bcc-search'); ?></button>
+    </div>
 
     <?php if ($show_type) : ?>
+    <!-- Category chips: only apply to the Projects vertical. Hidden
+         via CSS when the Users tab is active. -->
     <div class="bcc-search__chips" role="radiogroup" aria-label="<?php esc_attr_e('Filter by type', 'bcc-search'); ?>">
         <button class="bcc-search__chip bcc-search__chip--active" type="button" data-type=""><?php esc_html_e('All Types', 'bcc-search'); ?></button>
     </div>
@@ -51,8 +81,24 @@ if (!defined('ABSPATH')) {
     </div>
 
     <div class="bcc-search__dropdown" id="<?php echo esc_attr($results_id); ?>" role="listbox" aria-label="<?php esc_attr_e('Search results', 'bcc-search'); ?>" hidden>
-        <div class="bcc-search__results"></div>
-        <p class="bcc-search__empty" hidden><?php esc_html_e('No projects found.', 'bcc-search'); ?></p>
+        <!-- Projects vertical: existing pane. Untouched rendering. -->
+        <div class="bcc-search__pane bcc-search__pane--projects">
+            <div class="bcc-search__results"></div>
+            <p class="bcc-search__empty" hidden><?php esc_html_e('No projects found.', 'bcc-search'); ?></p>
+        </div>
+        <!-- Users vertical: separate pane, rendered by its own code
+             path. No cross-contamination with the projects results. -->
+        <div class="bcc-search__pane bcc-search__pane--users" hidden>
+            <div class="bcc-search__user-results"></div>
+            <p class="bcc-search__user-empty" hidden><?php esc_html_e('No users found.', 'bcc-search'); ?></p>
+        </div>
+        <!-- Groups vertical: sibling of Users — fully independent
+             render path, independent AbortController, independent
+             in-memory last-query cache. -->
+        <div class="bcc-search__pane bcc-search__pane--groups" hidden>
+            <div class="bcc-search__group-results"></div>
+            <p class="bcc-search__group-empty" hidden><?php esc_html_e('No groups found.', 'bcc-search'); ?></p>
+        </div>
     </div>
 
 </div>

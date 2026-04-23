@@ -412,3 +412,126 @@
         height: 36px;
     }
 }
+
+/* =============================================================
+   Users vertical (Phase 1)
+
+   Tabs + user-result rows. Kept in a dedicated block at the bottom
+   of the file so the existing Projects styles remain the canonical
+   reference and are untouched.
+   ============================================================= */
+
+/* ── Tabs ── */
+.bcc-search__tabs {
+    display: flex;
+    gap: 4px;
+    padding: 6px 10px 2px;
+    border-bottom: 1px solid var(--BCC--BORDER, rgba(255,255,255,0.08));
+}
+
+.bcc-search__tab {
+    background: transparent;
+    color: var(--BCC--TEXT, rgba(255,255,255,0.72));
+    border: none;
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 8px 8px 0 0;
+    transition: color 0.15s ease, background 0.15s ease;
+}
+
+.bcc-search__tab:hover {
+    background: var(--BCC--SURFACE, rgba(255,255,255,0.04));
+}
+
+.bcc-search__tab--active {
+    color: var(--BCC--TRUST, #3b82f6);
+    box-shadow: inset 0 -2px 0 0 var(--BCC--TRUST, #3b82f6);
+    background: transparent;
+}
+
+/* ── Pane visibility ── */
+/* Category chips only apply to the Projects vertical; JS toggles the
+   `hidden` attribute but belt-and-braces this at the CSS layer too. */
+.bcc-search[data-vertical="users"] .bcc-search__chips,
+.bcc-search[data-vertical="groups"] .bcc-search__chips {
+    display: none;
+}
+
+.bcc-search__pane {
+    /* No positioning tricks — hidden attribute handles visibility.
+       Block-level so stagger animation measures correctly. */
+}
+
+/* ── User result row ── */
+.bcc-search__user-result {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    color: inherit;
+    text-decoration: none;
+}
+
+.bcc-search__user-result:hover,
+.bcc-search__user-result.bcc-search__result--active {
+    background: var(--BCC--SURFACE-HOVER, rgba(59,130,246,0.08));
+}
+
+.bcc-search__user-result .bcc-search__avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.bcc-search__avatar--empty {
+    display: inline-block;
+    background: var(--BCC--BORDER, rgba(255,255,255,0.08));
+    border-radius: 50%;
+}
+
+.bcc-search__handle {
+    color: var(--BCC--TEXT-MUTED, rgba(255,255,255,0.52));
+    font-size: 0.8125rem;
+}
+
+/* ── Group result row ─────────────────────────────────────────
+   Sibling of .bcc-search__user-result. Separate selector so each
+   vertical can evolve its row shape independently. */
+.bcc-search__group-result {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    color: inherit;
+    text-decoration: none;
+}
+
+.bcc-search__group-result:hover,
+.bcc-search__group-result.bcc-search__result--active {
+    background: var(--BCC--SURFACE-HOVER, rgba(59,130,246,0.08));
+}
+
+.bcc-search__group-result .bcc-search__avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;   /* square-ish for groups vs. circular for users */
+    flex-shrink: 0;
+}
+
+.bcc-search__group-result .bcc-search__avatar--empty {
+    border-radius: 8px;
+}
+
+.bcc-search__desc {
+    color: var(--BCC--TEXT-MUTED, rgba(255,255,255,0.62));
+    font-size: 0.8125rem;
+    display: -webkit-box;
+    -webkit-line-clamp: 1;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+
