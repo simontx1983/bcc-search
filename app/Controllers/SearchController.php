@@ -394,6 +394,8 @@ class SearchController
                 // (truly cold endpoint or LKG-evicted query).
                 $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
                 if (is_array($lkg)) {
+                    $lkg['stale']           = true;
+                    $lkg['system_degraded'] = true;
                     return new \WP_REST_Response($lkg);
                 }
                 return new \WP_REST_Response(
@@ -492,6 +494,8 @@ class SearchController
                 }
                 $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
                 if (is_array($lkg)) {
+                    $lkg['stale']           = true;
+                    $lkg['system_degraded'] = true;
                     return new \WP_REST_Response($lkg);
                 }
                 return new \WP_REST_Response(
@@ -934,6 +938,8 @@ class SearchController
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
                 $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
                 if (is_array($lkg)) {
+                    $lkg['stale']           = true;
+                    $lkg['system_degraded'] = true;
                     return new \WP_REST_Response($lkg);
                 }
                 return new \WP_REST_Response(
@@ -1414,6 +1420,11 @@ class SearchController
     {
         $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
         if (is_array($lkg)) {
+            // LKG can be up to LKG_CACHE_TTL old (1 h default). Tag the
+            // payload so the frontend can surface "showing cached results"
+            // UI instead of presenting stale rankings as authoritative.
+            $lkg['stale']            = true;
+            $lkg['system_degraded']  = true;
             return new \WP_REST_Response($lkg);
         }
         return new \WP_REST_Response(
