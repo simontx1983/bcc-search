@@ -57,15 +57,25 @@ require_once $bcc_search_autoloader;
 //
 // Install paths that bypass register_activation_hook (wp-cli bulk activate,
 // multisite network-activate edge cases, file-copy deployments) leave the
-// FT index uninstalled. Every search then falls through to LIKE '%…%' on
-// post_content, a trivial DoS surface. Schedule a daily wp-cron retry
-// that calls ensureFulltextIndex() until the install option is set.
+// FT index uninstalled. Without the FT index, searches fall through to the
+// title-prefix LIKE path — correct but strictly less useful than FT scoring
+// on post_content. Schedule an HOURLY retry (not daily) so the degraded
+// window after a bypassed activation is short. Also run a one-shot attempt
+// on admin_init for the first admin page-load after install.
 add_action('init', function (): void {
     if (get_option('bcc_ft_index_v2_installed')) {
         return;
     }
     if (!wp_next_scheduled('bcc_search_ensure_ft_index')) {
-        wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'bcc_search_ensure_ft_index');
+        wp_schedule_event(time() + 60, 'hourly', 'bcc_search_ensure_ft_index');
+    }
+});
+add_action('admin_init', function (): void {
+    if (get_option('bcc_ft_index_v2_installed')) {
+        return;
+    }
+    if (class_exists('\\BCC\\Search\\Repositories\\SearchRepository')) {
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
     }
 });
 add_action('bcc_search_ensure_ft_index', function (): void {

@@ -21,11 +21,49 @@ class SearchController
     const CACHE_GROUP        = 'bcc_search';
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
-    // Rebuild lock TTL MUST exceed the cache hard TTL (SEARCH_CACHE_TTL + 30s
-    // stale buffer) so a slow rebuild cannot have its lock auto-expire while
-    // still holding it. If the lock expires mid-rebuild, a second worker can
-    // acquire it and begin a duplicate rebuild, racing on wp_cache_set().
-    const REBUILD_LOCK_TTL   = 120;
+    // Rebuild lock TTL. Previously 120s "to exceed cache hard TTL". That
+    // reasoning was wrong in practice: a rebuild finishes in well under 1s,
+    // so the long TTL's only real effect was to orphan the lock for 2
+    // minutes whenever the builder worker fatal'd between wp_cache_add and
+    // the finally block — losers then saw stale/empty data for that full
+    // window. 20s covers realistic rebuild time (incl. trust-engine round-
+    // trip under DB latency) with margin, and caps post-crash degradation.
+    const REBUILD_LOCK_TTL   = 20;
+
+    /**
+     * Gate: return a 503 if PeepSo is not loaded.
+     *
+     * This plugin exists to search PeepSo pages; every result's page_url
+     * and avatar_url is built from PeepSo's page-root and asset URI. If
+     * PeepSo is deactivated at runtime (older WP without Requires Plugins
+     * enforcement, a multisite subsite with PeepSo inactive, an admin who
+     * disables PeepSo before bcc-search), responding 200 would emit
+     * broken relative URLs like `pages/123/xyz-avatar-full.jpg` into the
+     * client. Fail visibly instead.
+     *
+     * Log rate-limited to once per hour per node via wp_cache_add — an
+     * atomic test-and-set that cannot double-log under concurrency.
+     */
+    private function peepsoOrFail(): ?\WP_REST_Response
+    {
+        if (class_exists('PeepSo')) {
+            return null;
+        }
+        if (class_exists('\\BCC\\Core\\Log\\Logger')
+            && wp_cache_add('bcc_search_no_peepso_logged', 1, self::CACHE_GROUP, 3600)
+        ) {
+            \BCC\Core\Log\Logger::error('[bcc-search] PeepSo not loaded at REST time — search disabled');
+        }
+        return new \WP_REST_Response(
+            [
+                'code'    => 'dependency_unavailable',
+                'message' => 'Search is temporarily unavailable.',
+                'data'    => ['status' => 503],
+            ],
+            503,
+            ['Retry-After' => '60']
+        );
+    }
 
     /**
      * Resolve PeepSo frontend asset paths.
@@ -120,17 +158,15 @@ class SearchController
         // Rate limiting by client IP.
         // Delegates to bcc-core's Throttle which tries trust-engine's atomic
         // RateLimiter first, then ext object cache, then transients.
-        if (class_exists('\\BCC\\Trust\\Security\\IpResolver')) {
-            $ip = \BCC\Trust\Security\IpResolver::getClientIp();
-        } else {
-            $ip = sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
-        }
-        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
-            $ip = '0.0.0.0';
-        }
-
-        $rate_key = "bcc_search_rate_{$ip}";
-        if (!Throttle::allow('search', self::RATE_LIMIT, self::RATE_WINDOW, $rate_key)) {
+        //
+        // Pass $key=null: Throttle builds the key itself using user_id for
+        // logged-in users and IpResolver::resolve() + /24 IPv4 (or /64 IPv6)
+        // subnet normalisation for anonymous callers. Passing an explicit
+        // per-exact-IP key (the old behaviour) would bypass that subnet
+        // normalisation, so rotating-IP abuse (mobile NAT, cheap VPN pools)
+        // got its own bucket per request. The rest of the BCC ecosystem
+        // uses the same normalised scheme.
+        if (!Throttle::allow('search', self::RATE_LIMIT, self::RATE_WINDOW)) {
             // Mirror WP_Error payload shape so clients don't have to special-case
             // rate-limit responses. Return WP_REST_Response (not WP_Error) so the
             // controller has a single narrow return type.
@@ -141,13 +177,22 @@ class SearchController
             ], 429);
         }
 
+        // PeepSo must be loaded: every result's avatar_url/page_url is
+        // built from PeepSo page-root config. Without PeepSo we'd emit
+        // broken relative URLs and lie to the client.
+        if ($response = $this->peepsoOrFail()) {
+            return $response;
+        }
+
         // ── Trending: top-scored pages, no query needed ──────────────────
         if ($request->get_param('trending') === '1') {
             return $this->handle_trending();
         }
 
-        $q    = trim($request->get_param('q'));
-        $type = trim($request->get_param('type'));
+        // get_param returns mixed; sanitize_text_field should yield string,
+        // but coerce explicitly — trim(null) is a deprecation warning on 8.1+.
+        $q    = trim((string) $request->get_param('q'));
+        $type = trim((string) $request->get_param('type'));
 
         // Fetch categories once per request — used for validation and response.
         $categories = SearchRepository::getCategories();
@@ -186,8 +231,7 @@ class SearchController
         );
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
-        $lock_key      = null;
-        $lock_acquired = false;
+        $lock_key = 'bcc_search_lock_' . md5($cache_key);
 
         if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
@@ -200,44 +244,35 @@ class SearchController
             // Cache is stale but still in the buffer window.
             // Try to acquire the rebuild lock (atomic). If another worker
             // is already rebuilding, serve stale data instead of blocking.
-            $lock_key = 'bcc_search_lock_' . md5($cache_key);
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
-            $lock_acquired = true;
             // We won the lock — fall through to rebuild below.
-        } elseif (is_array($cached)) {
-            // Legacy cache format (pre-upgrade) — serve as-is.
-            return new \WP_REST_Response($cached);
         } else {
             // ── Stampede protection for cold cache (no stale entry to serve) ──
-            $lock_key = 'bcc_search_lock_' . md5($cache_key);
+            //
+            // Previous implementation busy-waited up to 1.5s for the winner,
+            // then fell through and built a second time if the winner hadn't
+            // finished. Under 100–1000 concurrent users that held a PHP-FPM
+            // worker hostage per loser and cascaded to a pool-exhaustion
+            // outage of the whole site. New policy:
+            //   - Try to acquire the lock.
+            //   - If lost: return 503 Retry-After: 1. The frontend re-polls
+            //     after ~1s, by which time the winner has populated the
+            //     cache. Worker is released immediately.
+            //   - Never fall through and build concurrently — that defeats
+            //     the entire purpose of the lock.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
-                // Another worker is already building this entry. Short
-                // bounded spin-wait so losers serve the winner's result
-                // instead of returning an empty "no matches" lie — the
-                // prior behaviour made search appear broken to every
-                // concurrent user during any cache flush / eviction.
-                $deadline = microtime(true) + 1.5; // 1.5s budget total
-                do {
-                    usleep(80 * 1000); // 80ms between polls
-                    $retry = wp_cache_get($cache_key, self::CACHE_GROUP);
-                    if (is_array($retry) && isset($retry['data']) && is_array($retry['data'])) {
-                        return new \WP_REST_Response($retry['data']);
-                    }
-                    if (is_array($retry)) { // legacy flat-array format
-                        return new \WP_REST_Response($retry);
-                    }
-                } while (microtime(true) < $deadline);
-
-                // Winner is still working past our wait budget. Fall through
-                // and build ourselves rather than return an empty response —
-                // worst case two workers hit the DB once each, which is a
-                // far milder failure mode than lying to users.
-                $lock_acquired = false;
-            } else {
-                $lock_acquired = true;
+                return new \WP_REST_Response(
+                    [
+                        'code'    => 'rebuild_in_progress',
+                        'message' => 'Search is warming up. Please retry shortly.',
+                        'data'    => ['status' => 503],
+                    ],
+                    503,
+                    ['Retry-After' => '1']
+                );
             }
         }
 
@@ -263,7 +298,27 @@ class SearchController
             // ── Phase 2: Score, rank, then hydrate winners ──────────────────
             // Use enriched scores (same composite ranking as /discover) so
             // search and discovery produce consistent trust-based ordering.
-            $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
+            $enrich_failed = false;
+            $scores_by_id  = self::enrichScoresIfAvailable($candidate_ids, $enrich_failed);
+
+            if ($enrich_failed) {
+                // Trust-engine is active but threw. Silently returning a
+                // text-only ranking would let low-trust/spam content
+                // surface — a trust-manipulation surface. Prefer stale
+                // cache when available, else 503 Retry-After.
+                if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
+                    return new \WP_REST_Response($cached['data']);
+                }
+                return new \WP_REST_Response(
+                    [
+                        'code'    => 'score_enrichment_failed',
+                        'message' => 'Temporarily unavailable. Please retry shortly.',
+                        'data'    => ['status' => 503],
+                    ],
+                    503,
+                    ['Retry-After' => '5']
+                );
+            }
 
             $rank_scores = [];
             foreach ($candidate_ids as $id) {
@@ -302,13 +357,10 @@ class SearchController
 
             return new \WP_REST_Response($response);
         } finally {
-            // Only delete the rebuild lock if we actually own it.
-            // The cold-cache spin-wait fall-through path proceeds without
-            // the lock; deleting another worker's lock there would
-            // trigger a stampede on this key.
-            if ($lock_acquired) {
-                wp_cache_delete($lock_key, self::CACHE_GROUP);
-            }
+            // Losers return 503 before entering the try-block and stale-hit
+            // callers return before it as well, so we always own the lock
+            // by the time this block runs.
+            wp_cache_delete($lock_key, self::CACHE_GROUP);
         }
     }
 
@@ -432,28 +484,38 @@ class SearchController
     /**
      * Resolve enriched trust scores for a set of page IDs.
      *
-     * Wraps the ServiceLocator call with class_exists + try/catch so
-     * callers get an empty array instead of a fatal when the trust
-     * engine plugin is inactive or throws.
+     * Distinguishes two failure modes:
+     *   - Trust-engine not installed (class_exists() false): $failed stays
+     *     false and we return []. Callers can fall back to text-only
+     *     ranking because there is no trust system to lie about.
+     *   - Trust-engine installed but threw: $failed is set true and we
+     *     return []. Callers MUST NOT return a text-only ranking in this
+     *     case — low-trust/spam content can bubble to the top, which is
+     *     a trust-manipulation surface. Serve stale cache or a 503.
      *
      * @param int[] $pageIds
+     * @param-out bool $failed
      * @return array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}>
      */
-    private static function enrichScoresIfAvailable(array $pageIds): array
+    private static function enrichScoresIfAvailable(array $pageIds, ?bool &$failed = null): array
     {
+        $failed = false;
         if (!class_exists('\\BCC\\Core\\ServiceLocator')) {
             return [];
         }
         try {
             return ServiceLocator::resolveScoreReadService()->getEnrichedScoresForPageIds($pageIds);
         } catch (\Throwable $e) {
-            // Silent failure here degrades ranking to text-relevance only —
-            // low-trust content can then bubble up. Log with rate-limited
-            // dedup so ops sees sustained trust-engine outages without the
-            // per-request log spam a hot search endpoint would produce.
+            $failed = true;
+            // Log with rate-limited dedup so ops sees sustained trust-engine
+            // outages without the per-request spam a hot search endpoint
+            // would otherwise produce. wp_cache_add is an atomic
+            // test-and-set: at most one log line per 60s wins across all
+            // concurrent workers. The prior get-then-set pattern raced
+            // under concurrency and produced N duplicate lines per outage.
             if (class_exists('\\BCC\\Core\\Log\\Logger')
-                && !wp_cache_get('bcc_search_enrich_fail_logged', self::CACHE_GROUP)) {
-                wp_cache_set('bcc_search_enrich_fail_logged', 1, self::CACHE_GROUP, 60);
+                && wp_cache_add('bcc_search_enrich_fail_logged', 1, self::CACHE_GROUP, 60)
+            ) {
                 \BCC\Core\Log\Logger::error('[bcc-search] score_enrichment_failed', [
                     'error'    => $e->getMessage(),
                     'page_cnt' => count($pageIds),
@@ -485,6 +547,12 @@ class SearchController
      */
     private function handle_trending()
     {
+        // Same runtime-dependency gate as handle_search — results would
+        // emit broken URLs without PeepSo.
+        if ($response = $this->peepsoOrFail()) {
+            return $response;
+        }
+
         $cache_version = self::getCacheVersion();
         $cache_key     = 'trending_' . $cache_version;
         $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
@@ -505,14 +573,24 @@ class SearchController
                 return new \WP_REST_Response($cached['data']);
             }
             $lock_acquired = true;
-        } elseif (is_array($cached)) {
-            // Legacy cache format (pre-upgrade) — serve as-is.
-            return new \WP_REST_Response($cached);
         } else {
             // Cold miss — try to acquire lock.
+            //
+            // Previous behaviour was to return `['results' => [], 'categories' => []]`
+            // to every loser, which is a silent lie: the UI rendered "no
+            // trending" to real users on every cache flush/bust. Return
+            // 503 Retry-After instead so the frontend re-polls when the
+            // winner has populated the cache.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
-                // Another worker is building — return empty.
-                return new \WP_REST_Response(['results' => [], 'categories' => []]);
+                return new \WP_REST_Response(
+                    [
+                        'code'    => 'rebuild_in_progress',
+                        'message' => 'Trending is warming up. Please retry shortly.',
+                        'data'    => ['status' => 503],
+                    ],
+                    503,
+                    ['Retry-After' => '1']
+                );
             }
             $lock_acquired = true;
         }
@@ -659,21 +737,18 @@ class SearchController
             return $version;
         }
 
-        // Loser: brief backoff to give the winner time to populate the cache.
-        usleep(5000); // 5ms
-        $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
-        if (self::isValidVersionValue($cached)) {
-            return (int) $cached;
-        }
-
-        // Second short retry — covers slower environments (networked Redis,
-        // overloaded nodes, disk-backed caches) where the winner's write
-        // takes >5ms. Total backoff of 10ms under contention is negligible
-        // and meaningfully reduces worst-case DB hits.
-        usleep(5000); // 5ms
-        $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
-        if (self::isValidVersionValue($cached)) {
-            return (int) $cached;
+        // Loser: bounded exponential backoff with a small random jitter.
+        // Each step re-reads the cache; most losers find the winner's write
+        // within the first 5ms step. Jitter prevents N losers from all
+        // resuming on the same tick and stampeding the DB when the winner
+        // is still a few ms away. Total worst-case wait ≈ 36ms, which is
+        // negligible versus the wp_options read this replaces.
+        foreach ([5000, 10000, 20000] as $waitUs) {
+            usleep($waitUs + random_int(0, 2000));
+            $cached = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
+            if (self::isValidVersionValue($cached)) {
+                return (int) $cached;
+            }
         }
 
         // Winner not done within backoff window — last resort, do our own

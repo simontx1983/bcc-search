@@ -127,18 +127,40 @@ final class SearchRepository
             update_option('bcc_ft_index_v2_installed', 1, false);
 
             // Ranking quality changes when FULLTEXT becomes available (MATCH
-            // AGAINST replaces LIKE fallback), so any cached results built
-            // pre-install would now rank differently. Bust the search cache
-            // version so stale entries are not served alongside fresh ones.
-            // Runs inside the GET_LOCK region so only the installing worker
-            // does this work; subsequent callers short-circuit on the
+            // AGAINST replaces title-prefix fallback), so any cached results
+            // built pre-install would now rank differently. Bust the search
+            // cache version so stale entries are not served alongside fresh
+            // ones. Runs inside the GET_LOCK region so only the installing
+            // worker does this work; subsequent callers short-circuit on the
             // v2_installed option and never enter this branch.
             if (class_exists('\\BCC\\Search\\Controllers\\SearchController')) {
                 \BCC\Search\Controllers\SearchController::bust_search_cache();
             }
         } finally {
-            $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");
+            $released = $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");
+            // RELEASE_LOCK returns 1 on success, 0 if not held by this thread,
+            // NULL if the named lock does not exist. Anything other than 1 is
+            // unexpected given we just acquired it — surface for observability.
+            if ((int) $released !== 1 && class_exists('\\BCC\\Core\\Log\\Logger')) {
+                \BCC\Core\Log\Logger::warning('[bcc-search] ensureFulltextIndex: RELEASE_LOCK unexpected result', [
+                    'result' => var_export($released, true),
+                ]);
+            }
         }
+    }
+
+    /**
+     * Whether the v2 FT index has been confirmed installed.
+     *
+     * Cheap option-backed flag — no DB roundtrip on hot paths. When false,
+     * searchCandidates() degrades to the title-prefix-only LIKE path and
+     * MUST NOT run a leading-wildcard scan on post_content (table-scan
+     * amplifies under any concurrency and was the primary DoS surface
+     * before the v2 index existed).
+     */
+    private static function isFulltextIndexInstalled(): bool
+    {
+        return (bool) get_option('bcc_ft_index_v2_installed');
     }
 
     // ── Candidate search query ──────────────────────────────────────────
@@ -147,14 +169,19 @@ final class SearchRepository
      * Find candidate page IDs matching a search query.
      *
      * Strategy:
-     *   - Queries >= 3 chars: FULLTEXT MATCH...AGAINST in BOOLEAN MODE
-     *     (uses index, no table scan). Falls back to prefix LIKE if
-     *     FULLTEXT index doesn't exist yet or returns no results.
-     *   - Queries < 3 chars: prefix LIKE only (2-char queries are too
-     *     short for FULLTEXT minimum word length).
+     *   - Queries >= 3 chars AND v2 FT index installed: FULLTEXT
+     *     MATCH...AGAINST in BOOLEAN MODE (uses index, no table scan).
+     *   - All other paths: title-prefix LIKE only — `post_title LIKE 'q%'`.
+     *     Index-usable and bounded.
      *
-     * The old LIKE '%query%' (leading wildcard) is removed entirely —
-     * it forced full table scans and was the primary scaling bottleneck.
+     * HARD RULE: we never run a leading-wildcard LIKE on `post_content`.
+     * The old `LIKE '%query%'` path was a full table scan that under
+     * concurrency turned the search endpoint into a DoS amplifier on any
+     * install where the FT index had not yet been created (wp-cli bulk
+     * activate, multisite network activate, deploy-as-file-copy). Content
+     * matching is only available through the FT index; if the index is
+     * absent, we degrade to title-prefix-only and let the hourly self-heal
+     * cron install the index in the background.
      *
      * @param string $query Search term (min 2 chars).
      * @param string $type  Category slug filter (empty = all).
@@ -188,101 +215,108 @@ final class SearchRepository
 
         $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish'";
 
-        // ── FULLTEXT path (queries >= 3 chars) ──────────────────────────
-        if (mb_strlen($query) >= 3) {
-            // FULLTEXT index is created on activation; LIKE fallback handles absence.
-            // Do NOT call ensureFulltextIndex() here — it risks ALTER TABLE mid-request.
-
+        // ── FULLTEXT path ────────────────────────────────────────────────
+        // Gated on BOTH length and index presence. When the v2 index has
+        // not been installed yet, searchCandidates() MUST skip straight to
+        // title-prefix LIKE — a MATCH AGAINST without the index is a hard
+        // error from MySQL, not a silent scan, but belt-and-braces here
+        // keeps the degraded path single-purpose and easy to audit.
+        if (mb_strlen($query) >= 3 && self::isFulltextIndexInstalled()) {
             // Strip FULLTEXT boolean operators and keywords to prevent
             // query-semantics injection / relevance manipulation.
-            // preg_replace returns null only on regex compile failure, which would
-            // indicate a code bug; coalesce to '' so the sanitizer degrades to
-            // the LIKE fallback rather than blowing up.
+            // preg_replace returns null only on regex compile failure, which
+            // would indicate a code bug; coalesce to '' so the sanitizer
+            // degrades to the title-prefix fallback rather than blowing up.
             $ft_clean = preg_replace('/[+\-><~*"()@]/', ' ', $query) ?? '';
             $ft_clean = preg_replace('/\b(AND|OR|NOT)\b/i', ' ', $ft_clean) ?? '';
             $ft_clean = trim($ft_clean);
 
-            // If sanitization stripped everything, skip FULLTEXT and fall
-            // through to the LIKE fallback to avoid a standalone '*' term.
-            if ($ft_clean === '') {
-                goto like_fallback;
-            }
+            // If sanitization stripped everything, fall through to title-
+            // prefix LIKE below — a standalone '*' term is not useful.
+            if ($ft_clean !== '') {
+                $ft_term = $ft_clean . '*';
 
-            $ft_term = $ft_clean . '*';
+                // Search title + content via FULLTEXT, also match category
+                // names via LEFT JOIN so "Cosmos validator" finds pages
+                // categorised as "Validators" even if the title doesn't
+                // contain that word. Category match is PREFIX LIKE ('q%'),
+                // never leading-wildcard: peepso-page-cat titles are short
+                // and prefix match is the intended UX anyway.
+                //
+                // The LEFT JOIN on pcm + catm fans out to one row per
+                // category per page. Without DISTINCT, a page with N
+                // categories produces N duplicate candidate rows — silently
+                // shrinking the effective LIMIT, biasing rank, and wasting
+                // downstream enrichment work. Force DISTINCT whenever the
+                // cat-match join is present.
+                $cat_match_join  = '';
+                $cat_match_where = '';
+                $ft_distinct     = $distinct;
+                if ($cat_info) {
+                    $cat_match_join = "
+                        LEFT JOIN {$cat_info['table']} pcm ON pcm.{$cat_info['page_col']} = p.ID
+                        LEFT JOIN {$posts_table} catm ON catm.ID = pcm.{$cat_info['cat_col']}
+                            AND catm.post_type = 'peepso-page-cat'
+                            AND catm.post_status = 'publish'
+                    ";
+                    $cat_match_where = $wpdb->prepare(
+                        "OR catm.post_title LIKE %s",
+                        $wpdb->esc_like($query) . '%'
+                    );
+                    $ft_distinct = 'DISTINCT';
+                }
 
-            // Search title + content via FULLTEXT, also match category names
-            // via LEFT JOIN so "Cosmos validator" finds pages categorised as
-            // "Validators" even if the title doesn't contain that word.
-            //
-            // The LEFT JOIN on pcm + catm fans out to one row per category
-            // per page. Without DISTINCT, a page with N categories produces
-            // N duplicate candidate rows — silently shrinking the effective
-            // LIMIT, biasing rank, and wasting downstream enrichment work.
-            // Force DISTINCT whenever the cat-match join is present,
-            // regardless of whether the typed category filter is active.
-            $cat_match_join = '';
-            $cat_match_where = '';
-            $ft_distinct = $distinct;
-            if ($cat_info) {
-                $cat_match_join = "
-                    LEFT JOIN {$cat_info['table']} pcm ON pcm.{$cat_info['page_col']} = p.ID
-                    LEFT JOIN {$posts_table} catm ON catm.ID = pcm.{$cat_info['cat_col']}
-                        AND catm.post_type = 'peepso-page-cat'
-                        AND catm.post_status = 'publish'
-                ";
-                $cat_match_where = $wpdb->prepare(
-                    "OR catm.post_title LIKE %s",
-                    '%' . $wpdb->esc_like($query) . '%'
+                $sql = $wpdb->prepare(
+                    "SELECT {$ft_distinct} p.ID, p.post_title
+                     FROM {$posts_table} p
+                     {$cat_join}
+                     {$cat_match_join}
+                     WHERE {$base_where}
+                       AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
+                            {$cat_match_where})
+                       {$cat_where}
+                     ORDER BY MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE) DESC,
+                              p.post_title ASC
+                     LIMIT %d",
+                    $ft_term,
+                    $ft_term,
+                    $cap
                 );
-                $ft_distinct = 'DISTINCT';
+
+                $rows = $wpdb->get_results($sql, ARRAY_A);
+
+                if ($wpdb->last_error) {
+                    error_log('[bcc-search] FULLTEXT query error, falling back to title-prefix: ' . $wpdb->last_error);
+                }
+
+                if (!$wpdb->last_error && is_array($rows) && !empty($rows)) {
+                    return self::candidatesToDtos($rows);
+                }
+                // Fall through to title-prefix LIKE if FT errored or empty.
             }
-
-            $sql = $wpdb->prepare(
-                "SELECT {$ft_distinct} p.ID, p.post_title
-                 FROM {$posts_table} p
-                 {$cat_join}
-                 {$cat_match_join}
-                 WHERE {$base_where}
-                   AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
-                        {$cat_match_where})
-                   {$cat_where}
-                 ORDER BY MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE) DESC,
-                          p.post_title ASC
-                 LIMIT %d",
-                $ft_term,
-                $ft_term,
-                $cap
-            );
-
-            $rows = $wpdb->get_results($sql, ARRAY_A);
-
-            if ($wpdb->last_error) {
-                error_log('[bcc-search] FULLTEXT query error, falling back to LIKE: ' . $wpdb->last_error);
-            }
-
-            if (!$wpdb->last_error && is_array($rows) && !empty($rows)) {
-                return self::candidatesToDtos($rows);
-            }
-            // Fall through to LIKE if FULLTEXT unavailable or empty.
         }
 
-        // @phpcs:ignore Generic.PHP.DiscourageGoto -- structured fallback from FULLTEXT sanitizer
-        like_fallback:
-        // ── LIKE fallback (title prefix + content substring) ────────────
-        $prefix_like   = $wpdb->esc_like($query) . '%';
-        $content_like  = '%' . $wpdb->esc_like($query) . '%';
+        // ── Title-prefix LIKE fallback (NO post_content, NO leading wildcard) ──
+        // Used when:
+        //   - query < 3 chars (too short for FULLTEXT minword), OR
+        //   - v2 FT index not yet installed (self-heal window), OR
+        //   - FT sanitiser reduced the term to empty, OR
+        //   - FT returned zero rows / errored.
+        //
+        // `post_title LIKE 'q%'` is index-eligible on wp_posts. `post_content`
+        // is NEVER scanned here — that was the DoS surface before v2.
+        $prefix_like = $wpdb->esc_like($query) . '%';
 
         $sql = $wpdb->prepare(
             "SELECT {$distinct} p.ID, p.post_title
              FROM {$posts_table} p
              {$cat_join}
              WHERE {$base_where}
-               AND (p.post_title LIKE %s OR p.post_content LIKE %s)
+               AND p.post_title LIKE %s
                {$cat_where}
              ORDER BY p.post_title ASC
              LIMIT %d",
             $prefix_like,
-            $content_like,
             $cap
         );
 
@@ -347,6 +381,37 @@ final class SearchRepository
         $id_placeholders    = implode(',', array_fill(0, count($ids), '%d'));
         $field_placeholders = implode(',', array_fill(0, count($ids), '%d'));
 
+        // Category resolution uses a correlated subquery that picks the
+        // page's PRIMARY category by (menu_order ASC, post_title ASC)
+        // rather than an unstable MIN(post_title). A page with multiple
+        // categories was previously rendering an arbitrary/alphabetic
+        // label in the UI, which didn't match the admin's menu_order
+        // intent. Two correlated subqueries × up to 50 rows = 100 index
+        // lookups; cheap at this batch size. No aggregation remains, so
+        // the GROUP BY is dropped.
+        $cat_subquery_title = '';
+        $cat_subquery_slug  = '';
+        if ($cat_info) {
+            $cat_subquery_title =
+                "(SELECT catl.post_title
+                  FROM {$cat_info['table']} pcl
+                  INNER JOIN {$posts_table} catl ON catl.ID = pcl.{$cat_info['cat_col']}
+                  WHERE pcl.{$cat_info['page_col']} = p.ID
+                    AND catl.post_type = 'peepso-page-cat'
+                    AND catl.post_status = 'publish'
+                  ORDER BY catl.menu_order ASC, catl.post_title ASC
+                  LIMIT 1)";
+            $cat_subquery_slug =
+                "(SELECT catl.post_name
+                  FROM {$cat_info['table']} pcl
+                  INNER JOIN {$posts_table} catl ON catl.ID = pcl.{$cat_info['cat_col']}
+                  WHERE pcl.{$cat_info['page_col']} = p.ID
+                    AND catl.post_type = 'peepso-page-cat'
+                    AND catl.post_status = 'publish'
+                  ORDER BY catl.menu_order ASC, catl.post_title ASC
+                  LIMIT 1)";
+        }
+
         // IDs are passed twice to prepare(): once for WHERE IN, once for
         // ORDER BY FIELD — so every value goes through proper parameterisation.
         $rows = $wpdb->get_results($wpdb->prepare(
@@ -355,22 +420,15 @@ final class SearchRepository
                 p.post_title,
                 p.post_name,
                 " . ($cat_info
-                    ? "MIN(catl.post_title) AS category_name,
-                       MIN(catl.post_name)  AS category_slug,"
+                    ? "{$cat_subquery_title} AS category_name,
+                       {$cat_subquery_slug}  AS category_slug,"
                     : "NULL AS category_name,
                        NULL AS category_slug,") . "
                 pm_av.meta_value     AS avatar_hash
              FROM {$posts_table} p
-             " . ($cat_info
-                ? "LEFT JOIN {$cat_info['table']}  pcl   ON pcl.{$cat_info['page_col']} = p.ID
-                   LEFT JOIN {$posts_table}        catl  ON catl.ID = pcl.{$cat_info['cat_col']}
-                                                         AND catl.post_type = 'peepso-page-cat'
-                                                         AND catl.post_status = 'publish'"
-                : "") . "
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
              WHERE p.ID IN ({$id_placeholders})
-             GROUP BY p.ID
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
             ...array_merge($ids, $ids, [min(count($ids), 50)])
