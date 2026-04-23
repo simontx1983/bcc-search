@@ -2,3 +2,21 @@ node_modules
 .env
 .DS_Store
 Thumbs.db
+
+# Composer
+/vendor/
+/composer.lock
+
+# PHPUnit
+/phpunit.xml
+/.phpunit.result.cache
+
+# PHPStan
+/phpstan.neon
+/phpstan-baseline.neon
+/phpstan/
+/php-stubs/
+/szepeviktor/
+
+# Tests
+/tests/
