@@ -27,6 +27,16 @@ final class SearchRepository
     /**
      * Throw RuntimeException if the last query left an error on $wpdb.
      *
+     * **IMMEDIATE-CHECK CONTRACT**: callers MUST invoke this on the
+     * line immediately following their wpdb accessor call, before any
+     * other wpdb operation on the same request. The helper reads
+     * $wpdb->last_error — which is reset at the start of the next
+     * _do_query() invocation — so any intervening wpdb call clobbers
+     * the error state and this check will silently miss a failed
+     * query. Pattern: run the wpdb accessor, assign its return into a
+     * local, then on the very next line call throwOnDbError with a
+     * descriptive context string and nothing else between the two.
+     *
      * Centralised so the controller's LKG/503 escape hatch is the ONLY
      * way a DB error surfaces (never silently-to-empty-result, which
      * would poison the LKG mirror). The indirection also defeats
@@ -96,7 +106,16 @@ final class SearchRepository
 
         $table = $wpdb->prefix . 'peepso_page_categories';
 
-        if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) !== $table) {
+        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+        // Immediate-check contract: capture last_error right after the
+        // query while it still unambiguously belongs to this SHOW TABLES
+        // call. Prior to this we have no $wpdb calls on this code path,
+        // so $wpdb->last_error would be either '' or left over from an
+        // earlier request — either way, after this line we know
+        // definitively whether the discovery query itself errored.
+        self::throwOnDbError('peepsoCategoryTable discovery query failed');
+
+        if ($found !== $table) {
             $cache[$prefix] = null;
             wp_cache_set($ck, 'absent', self::CACHE_GROUP, self::PEEPSO_TABLE_CACHE_TTL);
             return null;

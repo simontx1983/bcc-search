@@ -32,6 +32,24 @@ class SearchController
     // 12 winners wasted ~4× the enrichment work per search.
     const PRERANK_TOP_K      = 24;
 
+    // Query-quality gate: TTL for the short-circuit cache on rejected
+    // junk queries (aaaa, 1111, ----, pure-stopword-only). Kept short so
+    // a legitimate stopword-list update flushes the gate quickly; long
+    // enough to absorb burst spam of the same query. No LKG is written
+    // for junk — they never reach the good-data mirror.
+    const JUNK_CACHE_TTL     = 30;
+
+    // Verified-empty LKG: how many consecutive error-free empty rebuilds
+    // are required before we promote an empty response into LKG. Below
+    // the threshold, empty responses are still cached at the version-
+    // scoped key (to suppress re-query stampede) but not mirrored to
+    // LKG — the rule is "LKG is good-data-only" and a single empty
+    // response could still mask a transient upstream issue. After the
+    // threshold, losers serve the empty LKG as 200 instead of cascading
+    // to rebuild.
+    const EMPTY_STABILITY_THRESHOLD = 2;
+    const EMPTY_STABILITY_TTL       = 3600;
+
     // ── Circuit breaker: endpoint-level overload protection ────────────
     //
     // The stampede lock is per-(q, type, version). Under a sudden
@@ -50,6 +68,32 @@ class SearchController
     const BREAKER_REBUILD_THRESHOLD = 50;
     const BREAKER_TRIP_TTL          = 30;
     const BREAKER_TRIPPED_KEY       = 'bcc_search_breaker_tripped';
+
+    /**
+     * Resolve the concurrent-rebuilds cap via filter. Defaults to
+     * MAX_CONCURRENT_REBUILDS. Ops can tune capacity per-node without
+     * redeploying code:
+     *
+     *     add_filter('bcc_search_max_concurrent_rebuilds', fn() => 40);
+     *
+     * Floored at 1 so a bad filter value can't disable the gate.
+     */
+    private static function resolveMaxConcurrentRebuilds(): int
+    {
+        $v = (int) apply_filters('bcc_search_max_concurrent_rebuilds', self::MAX_CONCURRENT_REBUILDS);
+        return max(1, $v);
+    }
+
+    /**
+     * Resolve the breaker-trip threshold via filter.
+     *
+     *     add_filter('bcc_search_breaker_rebuild_threshold', fn() => 100);
+     */
+    private static function resolveBreakerRebuildThreshold(): int
+    {
+        $v = (int) apply_filters('bcc_search_breaker_rebuild_threshold', self::BREAKER_REBUILD_THRESHOLD);
+        return max(1, $v);
+    }
     // Rebuild lock TTL. Bumped from 20→45 after observing that a degraded
     // trust engine can push enrichment latency into the 5–15s range, and
     // a 20s TTL would then let the lock auto-expire mid-rebuild, allowing
@@ -271,6 +315,22 @@ class SearchController
             return new \WP_REST_Response(['results' => [], 'categories' => $categories]);
         }
 
+        // Query-quality gate. Runs BEFORE the version-scoped cache lookup
+        // so junk never hits wp_cache OR the DB: at 500 req/s of "aaaa",
+        // even a cache-hit path is wasted work. Junk gets a dedicated
+        // short-TTL cache under its own key (not version-scoped — so a
+        // page-save bust doesn't evict it and force re-evaluation).
+        if (!$this->isQuerySearchable($q)) {
+            $junk_key = 'search_junk_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type));
+            $junk_cached = wp_cache_get($junk_key, self::CACHE_GROUP);
+            if (is_array($junk_cached)) {
+                return new \WP_REST_Response($junk_cached);
+            }
+            $response = ['results' => [], 'categories' => $categories];
+            wp_cache_set($junk_key, $response, self::CACHE_GROUP, self::JUNK_CACHE_TTL);
+            return new \WP_REST_Response($response);
+        }
+
         // Return cached results if available.
         // The cache stores a wrapper: ['data' => ..., 'expires_at' => timestamp].
         // 'expires_at' is the SOFT expiry (when the data becomes stale).
@@ -350,6 +410,12 @@ class SearchController
 
         $slot_reserved = false;
         try {
+            // Loud warning (rate-limited to 1/h per node) if we're
+            // entering the rebuild path without persistent cache —
+            // all of breaker/gauge/LKG are inoperative in that
+            // configuration.
+            self::warnIfNonPersistentCacheAtRebuild();
+
             // Circuit breaker: if too many rebuilds have started in the
             // recent window (cache-wide version bump, trust-engine
             // latency spike pushing rebuilds past their budget), stop
@@ -358,9 +424,9 @@ class SearchController
             if (!self::circuitBreakerAllowsRebuild()) {
                 return $this->breakerTrippedResponse($lkg_key);
             }
-            // Concurrency gate — bounded by MAX_CONCURRENT_REBUILDS so
-            // a trust-engine slowdown can't pile up N rebuilders on the
-            // same struggling read model beyond the cap.
+            // Concurrency gate — bounded by resolveMaxConcurrentRebuilds()
+            // so a trust-engine slowdown can't pile up N rebuilders on
+            // the same struggling read model beyond the cap.
             if (!self::reserveRebuildSlot()) {
                 return $this->breakerTrippedResponse($lkg_key);
             }
@@ -500,6 +566,36 @@ class SearchController
     }
 
     /**
+     * Decide whether an empty response has been confirmed stable enough
+     * to be promoted into LKG.
+     *
+     * A successful-but-empty rebuild increments a per-fingerprint
+     * counter (LKG key salted with a literal so it can't collide with
+     * another LKG entry). Once the counter reaches
+     * EMPTY_STABILITY_THRESHOLD the verdict flips to "true" and the
+     * caller writes the empty payload into LKG. Without this promotion,
+     * a query that is legitimately empty most of the time would force
+     * every cold-miss loser into a rebuild — exactly the workload the
+     * LKG mirror is supposed to absorb.
+     *
+     * Returns false on non-atomic-incr backends (we'd rather under-
+     * promote than risk a race-to-write producing false stability).
+     */
+    private static function isEmptyResultVerifiedStable(string $lkg_key): bool
+    {
+        if (!wp_using_ext_object_cache()) {
+            return false;
+        }
+        $counter_key = 'bcc_search_empty_count_' . md5($lkg_key);
+        wp_cache_add($counter_key, 0, self::CACHE_GROUP, self::EMPTY_STABILITY_TTL);
+        $count = wp_cache_incr($counter_key, 1, self::CACHE_GROUP);
+        if (!is_int($count)) {
+            return false;
+        }
+        return $count >= self::EMPTY_STABILITY_THRESHOLD;
+    }
+
+    /**
      * Store a search result with stale-while-revalidate semantics.
      *
      * The wrapper stores a soft expiry ('expires_at') jittered by ±20% of
@@ -534,16 +630,19 @@ class SearchController
         // version bump.
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
 
-        // LKG mirror: NEVER written for empty results. A transient DB
-        // failure that produced an empty payload (searchCandidates DB
-        // error, hydratePages DB error) would otherwise pin "no results"
-        // into LKG for the full LKG_CACHE_TTL window, and every
-        // cold-miss loser for that fingerprint would be served that
-        // empty response with a 200 — a silent correctness failure
-        // that is invisible to error telemetry. Keeping LKG non-empty
-        // means the only way to poison it is a verified non-empty
-        // response.
+        // LKG mirror policy:
+        //   - Non-empty: always write (standard last-known-good).
+        //   - Empty + verified stable: write too (see
+        //     isEmptyResultVerifiedStable). Queries that are legitimately
+        //     empty most of the time still need LKG so cold-miss losers
+        //     don't cascade to rebuild on every hit.
+        //   - Empty + not-yet-verified: skip. A single empty rebuild
+        //     could be masking a transient upstream failure that
+        //     returned "no rows" — promotion after N consecutive
+        //     error-free empties avoids that poisoning surface.
         if (!empty($response['results'])) {
+            wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+        } elseif (self::isEmptyResultVerifiedStable($lkg_key)) {
             wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
         }
     }
@@ -691,6 +790,89 @@ class SearchController
     }
 
     /**
+     * Minimum InnoDB FT stopwords — superset of the default stopword list,
+     * small enough to check in O(1) via hash lookup. Used by the query-
+     * quality gate to reject queries that consist solely of stopwords
+     * (which always resolve to title-prefix LIKE and are a cheap abuse
+     * surface even with the rate limiter in place).
+     *
+     * @return array<string,bool>
+     */
+    private static function stopwordSet(): array
+    {
+        static $set = null;
+        if ($set !== null) {
+            return $set;
+        }
+        $words = [
+            'a','about','an','and','are','as','at','be','but','by','com','de',
+            'en','for','from','how','i','in','is','it','la','of','on','or',
+            'so','that','the','this','to','was','we','what','when','where',
+            'who','will','with','und','www',
+        ];
+        $set = array_fill_keys($words, true);
+        return $set;
+    }
+
+    /**
+     * Query-quality gate.
+     *
+     * Returns false when the query is low-entropy junk that MUST NOT
+     * reach the DB (aaaa, 1111, ----, stopword-only, non-alphanumeric
+     * sludge). The caller short-circuits to an empty response cached
+     * for JUNK_CACHE_TTL. This is the last line of defence behind the
+     * rate limiter — a multi-subnet attacker can bypass the per-subnet
+     * bucket, but even if they reach the rebuild path, junk queries
+     * don't cause any DB work.
+     */
+    private function isQuerySearchable(string $q): bool
+    {
+        // Trimmed by the controller before we're called; still defend
+        // against stray whitespace.
+        $q = trim($q);
+        $len = mb_strlen($q);
+        if ($len < 2) {
+            return false;
+        }
+
+        // No alphanumeric at all: "----", "****", unicode punctuation
+        // spam. Rejected regardless of length.
+        if (!preg_match('/[\p{L}\p{N}]/u', $q)) {
+            return false;
+        }
+
+        // All one character (aaaa, 1111, .....). Cheap low-entropy
+        // signal; attackers often generate junk this way.
+        $first = mb_substr($q, 0, 1);
+        if ($first !== '' && mb_str_split($q) === array_fill(0, $len, $first)) {
+            return false;
+        }
+
+        // Stopword-only: every whitespace-separated token is a known
+        // stopword. "the", "the and", "will of the", etc. A legitimate
+        // user query always has at least one content word; if there
+        // isn't one, the FT path can't match (stopwords stripped) and
+        // the LIKE fallback is busywork across every hot-word page.
+        $lowered = mb_strtolower($q);
+        $tokens  = preg_split('/\s+/u', $lowered, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        if ($tokens !== []) {
+            $stopwords = self::stopwordSet();
+            $allStop = true;
+            foreach ($tokens as $t) {
+                if (!isset($stopwords[$t])) {
+                    $allStop = false;
+                    break;
+                }
+            }
+            if ($allStop) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Dynamic candidate cap — shorter queries cast a wider net.
      */
     private function getCandidateCap(string $query): int
@@ -768,6 +950,8 @@ class SearchController
 
         $slot_reserved = false;
         try {
+            self::warnIfNonPersistentCacheAtRebuild();
+
             // Circuit breaker: same protection as handle_search.
             if (!self::circuitBreakerAllowsRebuild()) {
                 return $this->breakerTrippedResponse($lkg_key);
@@ -912,10 +1096,15 @@ class SearchController
 
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
 
-        // LKG: skip empty payloads so a trust-engine outage + fallback
-        // failure can't pin "no trending" into LKG for an hour. Same
-        // reasoning as cacheSearchResult().
+        // LKG policy mirrors cacheSearchResult: non-empty always writes,
+        // empty writes only after the stability counter confirms the
+        // "no trending" state. Prevents a trust-engine outage + fallback
+        // failure from pinning "no trending" into LKG for an hour while
+        // still supporting the legitimately-empty-trending edge case
+        // (e.g., fresh install with no pages yet).
         if (!empty($response['results'])) {
+            wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
+        } elseif (self::isEmptyResultVerifiedStable($lkg_key)) {
             wp_cache_set($lkg_key, $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
         }
     }
@@ -1061,6 +1250,41 @@ class SearchController
     }
 
     /**
+     * Loud warning when the rebuild path runs without a persistent
+     * object cache. Without one:
+     *   - The circuit breaker is inoperative (per-request memory
+     *     can't gauge cross-request state).
+     *   - The concurrent-rebuilds slot counter is inoperative (same).
+     *   - The cache-version damping window is ineffective.
+     *   - LKG is per-request only — losers across requests get no
+     *     fallback.
+     *
+     * Rate-limited to one warning per hour per node via a WP transient
+     * (options-backed; survives request boundaries even without a
+     * persistent cache, which is exactly when this warning needs to
+     * fire).
+     */
+    private static function warnIfNonPersistentCacheAtRebuild(): void
+    {
+        if (wp_using_ext_object_cache()) {
+            return;
+        }
+        if (get_transient('bcc_search_nonpersistent_warned')) {
+            return;
+        }
+        set_transient('bcc_search_nonpersistent_warned', '1', HOUR_IN_SECONDS);
+
+        $msg = '[bcc-search] PRODUCTION RISK: rebuild path entered without a persistent object cache. Circuit breaker, concurrent-rebuild slot gauge, and LKG fallback are all inoperative. Deploy Redis/Memcached/Object Cache Pro before running at scale.';
+        if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+            \BCC\Core\Log\Logger::warning($msg, [
+                'node' => gethostname() ?: 'unknown',
+            ]);
+        } else {
+            error_log($msg . ' node=' . (gethostname() ?: 'unknown'));
+        }
+    }
+
+    /**
      * Circuit breaker check. True when rebuilds are allowed.
      *
      * On non-persistent caches this always returns true: wp_cache_* is
@@ -1100,11 +1324,13 @@ class SearchController
             // on a get-then-set.
             return;
         }
-        if ($count === self::BREAKER_REBUILD_THRESHOLD + 1) {
+        $threshold = self::resolveBreakerRebuildThreshold();
+        if ($count === $threshold + 1) {
             wp_cache_set(self::BREAKER_TRIPPED_KEY, 1, self::CACHE_GROUP, self::BREAKER_TRIP_TTL);
             if (class_exists('\\BCC\\Core\\Log\\Logger')) {
                 \BCC\Core\Log\Logger::warning('[bcc-search] circuit breaker tripped', [
                     'rebuilds_in_window' => $count,
+                    'threshold'          => $threshold,
                     'window_sec'         => self::BREAKER_WINDOW_SEC,
                     'trip_ttl_sec'       => self::BREAKER_TRIP_TTL,
                     'node'               => gethostname() ?: 'unknown',
@@ -1141,13 +1367,14 @@ class SearchController
             // rather than race on a non-atomic get-then-set.
             return true;
         }
-        if ($count > self::MAX_CONCURRENT_REBUILDS) {
+        $max = self::resolveMaxConcurrentRebuilds();
+        if ($count > $max) {
             wp_cache_decr(self::ACTIVE_REBUILDS_KEY, 1, self::CACHE_GROUP);
             if (class_exists('\\BCC\\Core\\Log\\Logger')
                 && wp_cache_add('bcc_search_slot_exhausted_logged', 1, self::CACHE_GROUP, 30)
             ) {
                 \BCC\Core\Log\Logger::warning('[bcc-search] rebuild slot exhausted', [
-                    'max'  => self::MAX_CONCURRENT_REBUILDS,
+                    'max'  => $max,
                     'node' => gethostname() ?: 'unknown',
                 ]);
             }
