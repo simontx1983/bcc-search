@@ -21,6 +21,35 @@ class SearchController
     const CACHE_GROUP        = 'bcc_search';
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
+    // LKG (last-known-good) mirror TTL. LKG entries are NOT version-scoped
+    // so they survive cache_version bumps. A cold-miss stampede loser or a
+    // trust-engine enrichment failure returns the LKG payload as a 200
+    // rather than a 503 Retry-After. 1h balances "still useful during
+    // recovery" vs "doesn't pin fossilised data forever".
+    const LKG_CACHE_TTL      = 3600;
+    // Pre-rank cap: keep top-K candidates by text relevance before calling
+    // trust-engine enrichment. Enriching all 100 candidates just to pick
+    // 12 winners wasted ~4× the enrichment work per search.
+    const PRERANK_TOP_K      = 24;
+
+    // ── Circuit breaker: endpoint-level overload protection ────────────
+    //
+    // The stampede lock is per-(q, type, version). Under a sudden
+    // cache-wide version bump (save_post fan-out, multi-node cache
+    // flush), hundreds of DISTINCT cache_keys can all be cold at once.
+    // Each one's lock winner legitimately proceeds to rebuild — so N
+    // unique queries means N concurrent rebuilds, each doing a full
+    // searchCandidates + enrichScoresIfAvailable + hydrate cycle.
+    //
+    // The breaker caps global rebuild concurrency per node by counting
+    // rebuild *starts* in a 10s window. Above BREAKER_REBUILD_THRESHOLD
+    // rebuilds in-window, the breaker trips for BREAKER_TRIP_TTL and
+    // every new would-be rebuilder serves LKG (200) or 503 instead of
+    // starting another expensive pipeline. Cache hits remain unaffected.
+    const BREAKER_WINDOW_SEC        = 10;
+    const BREAKER_REBUILD_THRESHOLD = 50;
+    const BREAKER_TRIP_TTL          = 30;
+    const BREAKER_TRIPPED_KEY       = 'bcc_search_breaker_tripped';
     // Rebuild lock TTL. Previously 120s "to exceed cache hard TTL". That
     // reasoning was wrong in practice: a rebuild finishes in well under 1s,
     // so the long TTL's only real effect was to orphan the lock for 2
@@ -93,6 +122,17 @@ class SearchController
     /**
      * Register cache-busting hooks.
      * Called on 'init' so they fire on admin saves, not just REST requests.
+     *
+     * Trust-score events (endorsement/vote/recalc/dispute_resolved) are
+     * intentionally NOT wired up. The previous policy was to bump the
+     * global cache version on every score mutation; under any meaningful
+     * write rate that pattern destroyed the cache faster than it could
+     * be populated, forcing every incoming search into a cold-miss
+     * rebuild and turning the stampede-lock loser branch into a 503
+     * retry storm. SEARCH_CACHE_TTL (60s) is the freshness budget for
+     * trust-score drift in search results. Only events that change
+     * which pages EXIST or what category they belong to bust the cache:
+     * page save/delete and category save/delete.
      */
     public static function register_cache_hooks(): void
     {
@@ -109,22 +149,6 @@ class SearchController
                 self::bust_search_cache();
             }
         });
-
-        // Trust score changes: bust on all events that mutate read-model
-        // trust_score. The prior policy relied on a 60s cache TTL to damp
-        // stampedes on individual votes, but that left /discover fresh and
-        // search stale during the gap, and the reject path of dispute
-        // adjudication does not fire bcc_trust_score_recalculated at all.
-        //
-        // bust_search_cache() only bumps an option-backed version counter
-        // (wp_cache_set + update_option), so the "stampede" cost is a single
-        // cheap write regardless of how many hooks fire in a second. Data
-        // correctness beats the write-amplification hypothetical.
-        add_action('bcc_trust_endorsement_added', [__CLASS__, 'bust_search_cache'], 10, 0);
-        add_action('bcc_trust_endorsement_removed', [__CLASS__, 'bust_search_cache'], 10, 0);
-        add_action('bcc_trust_score_recalculated', [__CLASS__, 'bust_search_cache'], 10, 0);
-        add_action('bcc_trust_vote_changed', [__CLASS__, 'bust_search_cache'], 10, 0);
-        add_action('bcc.domain.dispute_resolved', [__CLASS__, 'bust_search_cache'], 10, 0);
     }
 
     public function register_routes(): void
@@ -226,9 +250,13 @@ class SearchController
         // buckets prevents cross-audience cache poisoning regardless of
         // whether the site currently enables closed pages.
         $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
-        $cache_key         = 'search_' . md5(
-            mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $visibility_bucket . '|' . $cache_version
-        );
+        $key_fingerprint   = mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $visibility_bucket;
+        $cache_key         = 'search_' . md5($key_fingerprint . '|' . $cache_version);
+        // LKG: identical fingerprint, version omitted. Survives version
+        // bumps so cold-miss losers and enrichment failures can serve a
+        // 200 instead of a 503 even when the active cache_key has just
+        // been version-rotated to a key that nobody has populated yet.
+        $lkg_key           = 'search_lkg_' . md5($key_fingerprint);
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key = 'bcc_search_lock_' . md5($cache_key);
@@ -264,6 +292,15 @@ class SearchController
             //   - Never fall through and build concurrently — that defeats
             //     the entire purpose of the lock.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+                // Cold-miss loser. Try LKG first — it survives version
+                // bumps, so during a cache-version rotation we still
+                // have a valid (slightly stale) payload to serve. Only
+                // fall through to 503 when nothing is available at all
+                // (truly cold endpoint or LKG-evicted query).
+                $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
+                if (is_array($lkg)) {
+                    return new \WP_REST_Response($lkg);
+                }
                 return new \WP_REST_Response(
                     [
                         'code'    => 'rebuild_in_progress',
@@ -277,6 +314,16 @@ class SearchController
         }
 
         try {
+            // Circuit breaker: if too many rebuilds have started in the
+            // recent window (cache-wide version bump, trust-engine
+            // latency spike pushing rebuilds past their budget), stop
+            // doing heavy work and serve LKG/503 until the breaker
+            // cools. Winner still releases the lock in the finally.
+            if (!self::circuitBreakerAllowsRebuild()) {
+                return $this->breakerTrippedResponse($lkg_key);
+            }
+            self::recordRebuildAndMaybeTrip();
+
             $cap = $this->getCandidateCap($q);
 
             // ── Phase 1: Lightweight candidate query (via repository) ───────
@@ -284,30 +331,45 @@ class SearchController
 
             if (empty($candidate_rows)) {
                 $response = ['results' => [], 'categories' => $categories];
-                $this->cacheSearchResult($cache_key, $response);
+                $this->cacheSearchResult($cache_key, $lkg_key, $response);
                 return new \WP_REST_Response($response);
             }
 
-            $candidate_ids = [];
-            $titles_by_id  = [];
+            $titles_by_id = [];
             foreach ($candidate_rows as $row) {
-                $candidate_ids[]          = $row->id;
-                $titles_by_id[$row->id]   = $row->title;
+                $titles_by_id[$row->id] = $row->title;
             }
 
-            // ── Phase 2: Score, rank, then hydrate winners ──────────────────
+            // ── Phase 2: Pre-rank by text relevance, then enrich top-K ──────
+            // Previous policy enriched ALL candidates (up to 100) then picked
+            // 12. That wasted ~4× the trust-engine round-trip work per search
+            // and put proportional read-model load on every rebuild. Text
+            // relevance is cheap and purely string-based — compute it for
+            // all candidates, keep the top PRERANK_TOP_K, and enrich only
+            // those.
+            $text_scores = [];
+            foreach ($candidate_rows as $row) {
+                $text_scores[$row->id] = $this->computeTextScore($row->title, $q);
+            }
+            arsort($text_scores);
+            $prerank_ids = array_slice(array_keys($text_scores), 0, self::PRERANK_TOP_K);
+
             // Use enriched scores (same composite ranking as /discover) so
             // search and discovery produce consistent trust-based ordering.
             $enrich_failed = false;
-            $scores_by_id  = self::enrichScoresIfAvailable($candidate_ids, $enrich_failed);
+            $scores_by_id  = self::enrichScoresIfAvailable($prerank_ids, $enrich_failed);
 
             if ($enrich_failed) {
                 // Trust-engine is active but threw. Silently returning a
                 // text-only ranking would let low-trust/spam content
                 // surface — a trust-manipulation surface. Prefer stale
-                // cache when available, else 503 Retry-After.
+                // cache when available, then LKG, else 503.
                 if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
                     return new \WP_REST_Response($cached['data']);
+                }
+                $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
+                if (is_array($lkg)) {
+                    return new \WP_REST_Response($lkg);
                 }
                 return new \WP_REST_Response(
                     [
@@ -321,17 +383,17 @@ class SearchController
             }
 
             $rank_scores = [];
-            foreach ($candidate_ids as $id) {
-                $ranking = $scores_by_id[$id]['ranking_score'] ?? 0.0;
-                $title   = $titles_by_id[$id] ?? '';
-                $rank_scores[$id] = $this->computeRankScore($title, $q, $ranking);
+            foreach ($prerank_ids as $id) {
+                $ranking            = $scores_by_id[$id]['ranking_score'] ?? 0.0;
+                $text               = $text_scores[$id] ?? 0.0;
+                $rank_scores[$id]   = $this->blendRankScore($text, $ranking);
             }
 
-            usort($candidate_ids, static function (int $a, int $b) use ($rank_scores): int {
+            usort($prerank_ids, static function (int $a, int $b) use ($rank_scores): int {
                 return ($rank_scores[$b] <=> $rank_scores[$a]) ?: ($a <=> $b);
             });
 
-            $winner_ids = array_slice($candidate_ids, 0, self::LIMIT);
+            $winner_ids = array_slice($prerank_ids, 0, self::LIMIT);
 
             // Resolve filtered category name.
             $filtered_cat_name = null;
@@ -353,7 +415,7 @@ class SearchController
                 'categories' => $categories,
             ];
 
-            $this->cacheSearchResult($cache_key, $response);
+            $this->cacheSearchResult($cache_key, $lkg_key, $response);
 
             return new \WP_REST_Response($response);
         } finally {
@@ -375,10 +437,15 @@ class SearchController
      * Jitter prevents all cache entries set at the same time from expiring
      * simultaneously, which would cause a coordinated stampede.
      *
+     * Also writes an LKG (last-known-good) mirror that is NOT version-
+     * scoped, so losers on a post-version-bump cold miss and enrichment
+     * failures can serve a 200 rather than a 503.
+     *
      * @param string              $cache_key
+     * @param string              $lkg_key
      * @param array<string,mixed> $response
      */
-    private function cacheSearchResult(string $cache_key, array $response): void
+    private function cacheSearchResult(string $cache_key, string $lkg_key, array $response): void
     {
         $jitter    = (int) (self::SEARCH_CACHE_TTL * 0.2);                 // ±20%
         $softTtl   = self::SEARCH_CACHE_TTL + random_int(-$jitter, $jitter); // 48-72s
@@ -390,19 +457,18 @@ class SearchController
         ];
 
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
+        wp_cache_set($lkg_key,   $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
     }
 
     /**
-     * Compute a blended rank score from match relevance (40%) and trust (60%).
+     * Cheap, purely string-based text-relevance score in [0,1].
      *
-     * The $compositeScore is the ranking_score from the trust engine's read
-     * model — the same formula used by GET /bcc/v1/discover. This ensures
-     * search and discovery produce consistent trust-based ordering.
-     *
-     * The composite score is unbounded (typically 0–80 range). We normalize
-     * it to 0–1 using a soft cap at 80 before blending with text relevance.
+     * Computed for every candidate (up to the candidate cap) before trust
+     * enrichment so we can pre-rank and only enrich the top-K. Isolated
+     * from trust blending so it is safe to call without a trust-engine
+     * present.
      */
-    private function computeRankScore(string $title, string $query, float $compositeScore): float
+    private function computeTextScore(string $title, string $query): float
     {
         $titleLower = mb_strtolower($title);
         $queryLower = mb_strtolower($query);
@@ -421,12 +487,23 @@ class SearchController
         }
 
         $lengthBonus = 1.0 - (min(mb_strlen($titleLower), 100) / 200);
-        $relevance   = ($matchScore * 0.6) + ($lengthBonus * 0.4);
+        return ($matchScore * 0.6) + ($lengthBonus * 0.4);
+    }
 
-        // Normalize composite ranking score to 0–1 with soft cap at 80.
+    /**
+     * Blend pre-computed text-relevance score with trust ranking.
+     *
+     * $textScore is the [0,1] output of computeTextScore().
+     * $compositeScore is ranking_score from the trust engine read model
+     * (same formula as GET /bcc/v1/discover). Unbounded (typically 0–80);
+     * normalised via soft cap at 80 before blending.
+     *
+     * Output weighting is 60% trust / 40% text relevance.
+     */
+    private function blendRankScore(float $textScore, float $compositeScore): float
+    {
         $trust = min($compositeScore / 80.0, 1.0);
-
-        return ($trust * 0.6) + ($relevance * 0.4);
+        return ($trust * 0.6) + ($textScore * 0.4);
     }
 
     /**
@@ -554,11 +631,15 @@ class SearchController
         }
 
         $cache_version = self::getCacheVersion();
-        $cache_key     = 'trending_' . $cache_version;
-        $cached        = wp_cache_get($cache_key, self::CACHE_GROUP);
+        // Visibility bucket: mirrors the search path. PeepSo ACLs can hide
+        // pages from logged-out callers, so a member priming this cache
+        // must not leak member-only pages to a non-member (or vice versa).
+        $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
+        $cache_key         = 'trending_' . $visibility_bucket . '_' . $cache_version;
+        $lkg_key           = 'trending_lkg_' . $visibility_bucket;
+        $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
-        $lock_key      = 'bcc_trending_lock_' . md5($cache_key);
-        $lock_acquired = false;
+        $lock_key = 'bcc_trending_lock_' . md5($cache_key);
 
         if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
@@ -572,16 +653,19 @@ class SearchController
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
-            $lock_acquired = true;
         } else {
             // Cold miss — try to acquire lock.
             //
             // Previous behaviour was to return `['results' => [], 'categories' => []]`
             // to every loser, which is a silent lie: the UI rendered "no
-            // trending" to real users on every cache flush/bust. Return
-            // 503 Retry-After instead so the frontend re-polls when the
-            // winner has populated the cache.
+            // trending" to real users on every cache flush/bust. Serve LKG
+            // (survives version bumps) first; only 503 when even LKG is
+            // unavailable.
             if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+                $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
+                if (is_array($lkg)) {
+                    return new \WP_REST_Response($lkg);
+                }
                 return new \WP_REST_Response(
                     [
                         'code'    => 'rebuild_in_progress',
@@ -592,16 +676,32 @@ class SearchController
                     ['Retry-After' => '1']
                 );
             }
-            $lock_acquired = true;
         }
 
         try {
+            // Circuit breaker: same protection as handle_search.
+            if (!self::circuitBreakerAllowsRebuild()) {
+                return $this->breakerTrippedResponse($lkg_key);
+            }
+            self::recordRebuildAndMaybeTrip();
+
             $winner_ids   = [];
             $scores_by_id = [];
             $categories   = SearchRepository::getCategories();
 
             // Fast path: trust-engine read model for trending pages.
-            $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
+            // LogicException from a contract drift would otherwise crash
+            // the whole endpoint; downgrade to the fallback path instead.
+            try {
+                $rows = SearchRepository::getTrendingFromReadModel(self::LIMIT);
+            } catch (\LogicException $e) {
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error('[bcc-search] trending read-model contract drift', [
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+                $rows = [];
+            }
             if (!empty($rows)) {
                 $trending_ids = array_map(static fn($r) => $r->id, $rows);
                 // Use enriched scores so trending response includes the same
@@ -625,8 +725,12 @@ class SearchController
             }
 
             // Fallback: fetch recent IDs and sort by composite ranking score.
+            // Cap at PRERANK_TOP_K (24) rather than 100 — we only need LIMIT
+            // winners and the old 100-candidate fan-out put 8× the
+            // enrichment load on the trust engine for no ranking benefit
+            // (candidate pool was already "most recent", not "best scored").
             if (empty($winner_ids)) {
-                $candidate_ids = SearchRepository::getFallbackPageIds(100);
+                $candidate_ids = SearchRepository::getFallbackPageIds(self::PRERANK_TOP_K);
 
                 if (!empty($candidate_ids)) {
                     $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
@@ -643,7 +747,7 @@ class SearchController
 
             if (empty($winner_ids)) {
                 $response = ['results' => [], 'categories' => $categories];
-                $this->cacheTrendingResult($cache_key, $response);
+                $this->cacheTrendingResult($cache_key, $lkg_key, $response);
                 return new \WP_REST_Response($response);
             }
 
@@ -654,7 +758,7 @@ class SearchController
                 'categories' => $categories,
             ];
 
-            $this->cacheTrendingResult($cache_key, $response);
+            $this->cacheTrendingResult($cache_key, $lkg_key, $response);
 
             return new \WP_REST_Response($response);
         } finally {
@@ -665,10 +769,14 @@ class SearchController
     /**
      * Store a trending result with stale-while-revalidate semantics.
      *
+     * Also writes an LKG mirror (no version scoping) so that cold-miss
+     * losers during a cache-version bump serve a 200 rather than a 503.
+     *
      * @param string              $cache_key
+     * @param string              $lkg_key
      * @param array<string,mixed> $response
      */
-    private function cacheTrendingResult(string $cache_key, array $response): void
+    private function cacheTrendingResult(string $cache_key, string $lkg_key, array $response): void
     {
         $jitter  = (int) (self::TRENDING_CACHE_TTL * 0.2);
         $softTtl = self::TRENDING_CACHE_TTL + random_int(-$jitter, $jitter);
@@ -680,6 +788,7 @@ class SearchController
         ];
 
         wp_cache_set($cache_key, $wrapper, self::CACHE_GROUP, $hardTtl);
+        wp_cache_set($lkg_key,   $response, self::CACHE_GROUP, self::LKG_CACHE_TTL);
     }
 
     /** Cache TTL used uniformly for both bust and heal writes (see getCacheVersion). */
@@ -822,8 +931,116 @@ class SearchController
         ));
     }
 
+    /**
+     * Circuit breaker check. True when rebuilds are allowed.
+     *
+     * On non-persistent caches this always returns true: wp_cache_* is
+     * per-request memory there, so there is no cross-request gauge to
+     * read — but installs without a persistent object cache are also
+     * not the high-traffic topology the breaker exists to protect.
+     */
+    private static function circuitBreakerAllowsRebuild(): bool
+    {
+        if (!wp_using_ext_object_cache()) {
+            return true;
+        }
+        return !wp_cache_get(self::BREAKER_TRIPPED_KEY, self::CACHE_GROUP);
+    }
+
+    /**
+     * Record a rebuild start; trip the breaker if the per-window
+     * count exceeds BREAKER_REBUILD_THRESHOLD.
+     *
+     * Uses wp_cache_incr for atomicity — concurrent workers on the
+     * same node increment the same counter without racing. Bucket
+     * key rotates every BREAKER_WINDOW_SEC seconds so the counter
+     * self-clears without an eviction step.
+     */
+    private static function recordRebuildAndMaybeTrip(): void
+    {
+        if (!wp_using_ext_object_cache()) {
+            return;
+        }
+        $bucket = (int) floor(time() / self::BREAKER_WINDOW_SEC);
+        $key    = 'bcc_search_rebuilds_' . $bucket;
+        wp_cache_add($key, 0, self::CACHE_GROUP, self::BREAKER_WINDOW_SEC * 2);
+        $count = wp_cache_incr($key, 1, self::CACHE_GROUP);
+        if (!is_int($count)) {
+            // wp_cache_incr returns false on backends that don't
+            // support atomic incr; skip the gauge rather than race
+            // on a get-then-set.
+            return;
+        }
+        if ($count === self::BREAKER_REBUILD_THRESHOLD + 1) {
+            wp_cache_set(self::BREAKER_TRIPPED_KEY, 1, self::CACHE_GROUP, self::BREAKER_TRIP_TTL);
+            if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                \BCC\Core\Log\Logger::warning('[bcc-search] circuit breaker tripped', [
+                    'rebuilds_in_window' => $count,
+                    'window_sec'         => self::BREAKER_WINDOW_SEC,
+                    'trip_ttl_sec'       => self::BREAKER_TRIP_TTL,
+                    'node'               => gethostname() ?: 'unknown',
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Build the "breaker tripped — serve LKG or 503" response.
+     *
+     * Shared by the search and trending paths so both endpoints respond
+     * identically under sustained overload.
+     *
+     * @param string $lkg_key
+     */
+    private function breakerTrippedResponse(string $lkg_key): \WP_REST_Response
+    {
+        $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
+        if (is_array($lkg)) {
+            return new \WP_REST_Response($lkg);
+        }
+        return new \WP_REST_Response(
+            [
+                'code'    => 'temporarily_overloaded',
+                'message' => 'Search is temporarily rate-limited. Please retry shortly.',
+                'data'    => ['status' => 503],
+            ],
+            503,
+            ['Retry-After' => '5']
+        );
+    }
+
+    /**
+     * Per-request flag: a bust has been requested but the actual write is
+     * deferred to 'shutdown'. Coalesces multiple hooks (e.g. save_post +
+     * delete_post + meta updates within one request) into a single
+     * update_option() + wp_cache_set() pair.
+     */
+    private static bool $bustQueued = false;
+
     public static function bust_search_cache(): void
     {
+        if (self::$bustQueued) {
+            return;
+        }
+        self::$bustQueued = true;
+        // Defer to 'shutdown' so a single user action that fires multiple
+        // hooks produces exactly one DB write. Priority 0 so we run before
+        // other shutdown work that might inspect the option.
+        add_action('shutdown', [__CLASS__, 'flushBustIfQueued'], 0);
+    }
+
+    /**
+     * Shutdown handler: write the version bump if one was queued.
+     *
+     * Public because WP needs to invoke it as a hook callback; not part
+     * of the supported API surface.
+     */
+    public static function flushBustIfQueued(): void
+    {
+        if (!self::$bustQueued) {
+            return;
+        }
+        self::$bustQueued = false;
         $version = time();
         update_option(self::SEARCH_VERSION_KEY, $version, false);
         // Uniform TTL with the heal path — no "forever" keys in multi-node

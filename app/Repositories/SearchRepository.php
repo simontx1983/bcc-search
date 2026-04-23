@@ -23,6 +23,13 @@ final class SearchRepository
     private const CACHE_GROUP = 'bcc_search';
     private const CAT_CACHE_KEY = 'bcc_search_categories';
     private const CAT_CACHE_TTL = 43200; // 12 hours
+    // peepso_page_categories table presence rarely changes (install/activate
+    // only). Cache the result long-term to skip the information_schema-ish
+    // SHOW TABLES round-trip on hot-path searches. A PeepSo install/uninstall
+    // during an active request window is rare; a stale negative caches only
+    // degrades to "no category filter" until next cache expiry.
+    private const PEEPSO_TABLE_CACHE_KEY = 'bcc_search_peepso_cat_table';
+    private const PEEPSO_TABLE_CACHE_TTL = 3600;
 
     // ── PeepSo table discovery (cached per-process) ─────────────────────
 
@@ -34,6 +41,7 @@ final class SearchRepository
     public static function peepsoCategoryTable(): ?array
     {
         // Keyed by $wpdb->prefix so a multisite switch_to_blog() re-checks.
+        /** @var array<string, array{table: string, page_col: string, cat_col: string}|null> $cache */
         static $cache = [];
 
         global $wpdb;
@@ -43,10 +51,37 @@ final class SearchRepository
             return $cache[$prefix];
         }
 
+        // Cross-request cache. Sentinel 'absent' encodes the negative
+        // result without conflating with wp_cache_get's false return.
+        // Shape is revalidated on read — the object cache layer is
+        // shared across plugins on the node and we defend against
+        // another plugin writing garbage to the same key.
+        $ck = self::PEEPSO_TABLE_CACHE_KEY . '_' . md5($prefix);
+        $x  = wp_cache_get($ck, self::CACHE_GROUP);
+        if (is_array($x)
+            && isset($x['table'], $x['page_col'], $x['cat_col'])
+            && is_string($x['table'])
+            && is_string($x['page_col'])
+            && is_string($x['cat_col'])
+        ) {
+            $shape = [
+                'table'    => $x['table'],
+                'page_col' => $x['page_col'],
+                'cat_col'  => $x['cat_col'],
+            ];
+            $cache[$prefix] = $shape;
+            return $shape;
+        }
+        if ($x === 'absent') {
+            $cache[$prefix] = null;
+            return null;
+        }
+
         $table = $wpdb->prefix . 'peepso_page_categories';
 
         if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table)) !== $table) {
             $cache[$prefix] = null;
+            wp_cache_set($ck, 'absent', self::CACHE_GROUP, self::PEEPSO_TABLE_CACHE_TTL);
             return null;
         }
 
@@ -55,6 +90,7 @@ final class SearchRepository
             'page_col' => 'pm_page_id',
             'cat_col'  => 'pm_cat_id',
         ];
+        wp_cache_set($ck, $cache[$prefix], self::CACHE_GROUP, self::PEEPSO_TABLE_CACHE_TTL);
 
         return $cache[$prefix];
     }
@@ -237,40 +273,38 @@ final class SearchRepository
                 $ft_term = $ft_clean . '*';
 
                 // Search title + content via FULLTEXT, also match category
-                // names via LEFT JOIN so "Cosmos validator" finds pages
-                // categorised as "Validators" even if the title doesn't
-                // contain that word. Category match is PREFIX LIKE ('q%'),
-                // never leading-wildcard: peepso-page-cat titles are short
-                // and prefix match is the intended UX anyway.
+                // names so "Cosmos validator" finds pages categorised as
+                // "Validators" even if the title doesn't contain that word.
                 //
-                // The LEFT JOIN on pcm + catm fans out to one row per
-                // category per page. Without DISTINCT, a page with N
-                // categories produces N duplicate candidate rows — silently
-                // shrinking the effective LIMIT, biasing rank, and wasting
-                // downstream enrichment work. Force DISTINCT whenever the
-                // cat-match join is present.
-                $cat_match_join  = '';
+                // The previous implementation used a LEFT JOIN on
+                // (peepso_page_categories + wp_posts-as-category). That
+                // fanned out rows per category per page, forcing DISTINCT
+                // + filesort on the MATCH() score — measurably expensive
+                // under concurrency. Replaced with a correlated EXISTS
+                // subquery: no fan-out, no DISTINCT needed (the outer
+                // join on $type-filter still sets $distinct when applicable),
+                // index-eligible via the category prefix LIKE.
                 $cat_match_where = '';
-                $ft_distinct     = $distinct;
                 if ($cat_info) {
-                    $cat_match_join = "
-                        LEFT JOIN {$cat_info['table']} pcm ON pcm.{$cat_info['page_col']} = p.ID
-                        LEFT JOIN {$posts_table} catm ON catm.ID = pcm.{$cat_info['cat_col']}
-                            AND catm.post_type = 'peepso-page-cat'
-                            AND catm.post_status = 'publish'
-                    ";
                     $cat_match_where = $wpdb->prepare(
-                        "OR catm.post_title LIKE %s",
+                        "OR EXISTS (
+                            SELECT 1
+                            FROM {$cat_info['table']} pcm
+                            INNER JOIN {$posts_table} catm
+                              ON catm.ID = pcm.{$cat_info['cat_col']}
+                            WHERE pcm.{$cat_info['page_col']} = p.ID
+                              AND catm.post_type = 'peepso-page-cat'
+                              AND catm.post_status = 'publish'
+                              AND catm.post_title LIKE %s
+                        )",
                         $wpdb->esc_like($query) . '%'
                     );
-                    $ft_distinct = 'DISTINCT';
                 }
 
                 $sql = $wpdb->prepare(
-                    "SELECT {$ft_distinct} p.ID, p.post_title
+                    "SELECT {$distinct} p.ID, p.post_title
                      FROM {$posts_table} p
                      {$cat_join}
-                     {$cat_match_join}
                      WHERE {$base_where}
                        AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
                             {$cat_match_where})
@@ -285,14 +319,17 @@ final class SearchRepository
 
                 $rows = $wpdb->get_results($sql, ARRAY_A);
 
+                // Distinguish "FT errored" from "FT returned zero rows".
+                // Errors fall through to title-prefix LIKE (degraded but
+                // available). Zero rows do NOT fall through — the caller
+                // then runs a redundant second query for a legitimately
+                // empty result set, which is pure waste under load.
                 if ($wpdb->last_error) {
                     error_log('[bcc-search] FULLTEXT query error, falling back to title-prefix: ' . $wpdb->last_error);
-                }
-
-                if (!$wpdb->last_error && is_array($rows) && !empty($rows)) {
+                    // Fall through to title-prefix LIKE below.
+                } elseif (is_array($rows)) {
                     return self::candidatesToDtos($rows);
                 }
-                // Fall through to title-prefix LIKE if FT errored or empty.
             }
         }
 
@@ -381,61 +418,71 @@ final class SearchRepository
         $id_placeholders    = implode(',', array_fill(0, count($ids), '%d'));
         $field_placeholders = implode(',', array_fill(0, count($ids), '%d'));
 
-        // Category resolution uses a correlated subquery that picks the
-        // page's PRIMARY category by (menu_order ASC, post_title ASC)
-        // rather than an unstable MIN(post_title). A page with multiple
-        // categories was previously rendering an arbitrary/alphabetic
-        // label in the UI, which didn't match the admin's menu_order
-        // intent. Two correlated subqueries × up to 50 rows = 100 index
-        // lookups; cheap at this batch size. No aggregation remains, so
-        // the GROUP BY is dropped.
-        $cat_subquery_title = '';
-        $cat_subquery_slug  = '';
-        if ($cat_info) {
-            $cat_subquery_title =
-                "(SELECT catl.post_title
-                  FROM {$cat_info['table']} pcl
-                  INNER JOIN {$posts_table} catl ON catl.ID = pcl.{$cat_info['cat_col']}
-                  WHERE pcl.{$cat_info['page_col']} = p.ID
-                    AND catl.post_type = 'peepso-page-cat'
-                    AND catl.post_status = 'publish'
-                  ORDER BY catl.menu_order ASC, catl.post_title ASC
-                  LIMIT 1)";
-            $cat_subquery_slug =
-                "(SELECT catl.post_name
-                  FROM {$cat_info['table']} pcl
-                  INNER JOIN {$posts_table} catl ON catl.ID = pcl.{$cat_info['cat_col']}
-                  WHERE pcl.{$cat_info['page_col']} = p.ID
-                    AND catl.post_type = 'peepso-page-cat'
-                    AND catl.post_status = 'publish'
-                  ORDER BY catl.menu_order ASC, catl.post_title ASC
-                  LIMIT 1)";
-        }
-
-        // IDs are passed twice to prepare(): once for WHERE IN, once for
-        // ORDER BY FIELD — so every value goes through proper parameterisation.
+        // Main hydrate query: page + avatar only. Primary-category resolution
+        // is pulled out into a SECOND single batched query below. The old
+        // shape used two correlated `ORDER BY ... LIMIT 1` subqueries in the
+        // SELECT list — MySQL evaluates them independently (the optimizer
+        // can't combine identically-scoped scalar subqueries), producing
+        // 2N index lookups for N pages. For the hydrate batch size (max 50)
+        // that's 100 lookups per request; at 500 req/s that is 50K/s of
+        // avoidable work. One flat IN(...) query over page_categories
+        // replaces both subqueries with a single, ORDER-BY + LIMIT-bounded
+        // batch.
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT
                 p.ID,
                 p.post_title,
                 p.post_name,
-                " . ($cat_info
-                    ? "{$cat_subquery_title} AS category_name,
-                       {$cat_subquery_slug}  AS category_slug,"
-                    : "NULL AS category_name,
-                       NULL AS category_slug,") . "
-                pm_av.meta_value     AS avatar_hash
+                pm_av.meta_value AS avatar_hash
              FROM {$posts_table} p
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
              WHERE p.ID IN ({$id_placeholders})
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
-            ...array_merge($ids, $ids, [min(count($ids), 50)])
+            ...array_merge($ids, $ids, [count($ids)])
         ), ARRAY_A);
 
         if (!is_array($rows)) {
             return [];
+        }
+
+        // Batch-fetch the primary category for each hydrated ID. Returns
+        // up to (# distinct cats per page) * (# pages) rows — bounded in
+        // practice at a few hundred. We iterate ORDER BY page, menu_order,
+        // title and keep only the first hit per page (that is the primary
+        // per the admin's intent).
+        $primary_cat_by_page = [];
+        if ($cat_info) {
+            $cat_rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT pcl.{$cat_info['page_col']} AS page_id,
+                        catl.post_title            AS name,
+                        catl.post_name             AS slug,
+                        catl.menu_order            AS menu_order
+                 FROM {$cat_info['table']} pcl
+                 INNER JOIN {$posts_table} catl
+                         ON catl.ID = pcl.{$cat_info['cat_col']}
+                        AND catl.post_type = 'peepso-page-cat'
+                        AND catl.post_status = 'publish'
+                 WHERE pcl.{$cat_info['page_col']} IN ({$id_placeholders})
+                 ORDER BY pcl.{$cat_info['page_col']} ASC,
+                          catl.menu_order ASC,
+                          catl.post_title ASC",
+                ...$ids
+            ), ARRAY_A);
+
+            if (is_array($cat_rows)) {
+                foreach ($cat_rows as $cr) {
+                    $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
+                    if ($pid <= 0 || isset($primary_cat_by_page[$pid])) {
+                        continue; // Keep only the first (primary) row per page.
+                    }
+                    $primary_cat_by_page[$pid] = [
+                        'name' => isset($cr['name']) ? (string) $cr['name'] : null,
+                        'slug' => isset($cr['slug']) ? (string) $cr['slug'] : null,
+                    ];
+                }
+            }
         }
 
         $dtos = [];
@@ -450,12 +497,14 @@ final class SearchRepository
             if (!isset($row['post_name'])) {
                 throw new \LogicException('SearchRepository::hydratePages: missing post_name');
             }
+            $pid       = (int) $id;
+            $cat       = $primary_cat_by_page[$pid] ?? null;
             $dtos[] = new PageHydratedDTO(
-                id:           (int) $id,
+                id:           $pid,
                 title:        (string) $row['post_title'],
                 slug:         (string) $row['post_name'],
-                categoryName: isset($row['category_name']) ? (string) $row['category_name'] : null,
-                categorySlug: isset($row['category_slug']) ? (string) $row['category_slug'] : null,
+                categoryName: ($cat && $cat['name'] !== null) ? $cat['name'] : null,
+                categorySlug: ($cat && $cat['slug'] !== null) ? $cat['slug'] : null,
                 avatarHash:   isset($row['avatar_hash']) ? (string) $row['avatar_hash'] : null,
             );
         }
