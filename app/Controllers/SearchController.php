@@ -72,13 +72,21 @@ class SearchController
             }
         });
 
-        // Trust score changes: bust on endorsement and score recalculation events.
-        // Individual votes rely on the 60s cache TTL for freshness — busting on
-        // every single vote causes stampedes under active voting. Score recalcs
-        // are batched by cron so they're safe to bust on directly.
+        // Trust score changes: bust on all events that mutate read-model
+        // trust_score. The prior policy relied on a 60s cache TTL to damp
+        // stampedes on individual votes, but that left /discover fresh and
+        // search stale during the gap, and the reject path of dispute
+        // adjudication does not fire bcc_trust_score_recalculated at all.
+        //
+        // bust_search_cache() only bumps an option-backed version counter
+        // (wp_cache_set + update_option), so the "stampede" cost is a single
+        // cheap write regardless of how many hooks fire in a second. Data
+        // correctness beats the write-amplification hypothetical.
         add_action('bcc_trust_endorsement_added', [__CLASS__, 'bust_search_cache'], 10, 0);
         add_action('bcc_trust_endorsement_removed', [__CLASS__, 'bust_search_cache'], 10, 0);
         add_action('bcc_trust_score_recalculated', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc_trust_vote_changed', [__CLASS__, 'bust_search_cache'], 10, 0);
+        add_action('bcc.domain.dispute_resolved', [__CLASS__, 'bust_search_cache'], 10, 0);
     }
 
     public function register_routes(): void
