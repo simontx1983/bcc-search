@@ -574,7 +574,7 @@ final class SearchRepository
      * Get trending pages via the TrendingDataInterface contract.
      *
      * Uses ServiceLocator so bcc-search has no direct dependency on
-     * bcc-trust-engine's internal TableRegistry or read model tables.
+     * bcc-trust's internal TableRegistry or read model tables.
      *
      * The contract returns `object[]` (stdClass rows). Adapt them at the
      * repository boundary into typed DTOs so no stdClass leaks into

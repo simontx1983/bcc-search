@@ -365,9 +365,10 @@ class SearchController
             }
 
             // Cache is stale but still in the buffer window.
-            // Try to acquire the rebuild lock (atomic). If another worker
-            // is already rebuilding, serve stale data instead of blocking.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+            // Try to acquire the rebuild lock (atomic via MySQL GET_LOCK).
+            // If another worker is already rebuilding, serve stale data
+            // instead of blocking.
+            if (!\BCC\Core\DB\AdvisoryLock::acquire($lock_key, 0)) {
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
@@ -380,13 +381,14 @@ class SearchController
             // finished. Under 100–1000 concurrent users that held a PHP-FPM
             // worker hostage per loser and cascaded to a pool-exhaustion
             // outage of the whole site. New policy:
-            //   - Try to acquire the lock.
+            //   - Try to acquire the lock (MySQL GET_LOCK — atomic across
+            //     all DB sessions, regardless of cache backend).
             //   - If lost: return 503 Retry-After: 1. The frontend re-polls
             //     after ~1s, by which time the winner has populated the
             //     cache. Worker is released immediately.
             //   - Never fall through and build concurrently — that defeats
             //     the entire purpose of the lock.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+            if (!\BCC\Core\DB\AdvisoryLock::acquire($lock_key, 0)) {
                 // Cold-miss loser. Try LKG first — it survives version
                 // bumps, so during a cache-version rotation we still
                 // have a valid (slightly stale) payload to serve. Only
@@ -562,7 +564,7 @@ class SearchController
             // Losers return 503 before entering the try-block and stale-hit
             // callers return before it as well, so we always own the lock
             // by the time this block runs.
-            wp_cache_delete($lock_key, self::CACHE_GROUP);
+            \BCC\Core\DB\AdvisoryLock::release($lock_key);
             if ($slot_reserved) {
                 self::releaseRebuildSlot();
             }
@@ -922,8 +924,8 @@ class SearchController
                 return new \WP_REST_Response($cached['data']);
             }
 
-            // Stale — try to acquire rebuild lock.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+            // Stale — try to acquire rebuild lock (atomic via MySQL GET_LOCK).
+            if (!\BCC\Core\DB\AdvisoryLock::acquire($lock_key, 0)) {
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
@@ -935,7 +937,7 @@ class SearchController
             // trending" to real users on every cache flush/bust. Serve LKG
             // (survives version bumps) first; only 503 when even LKG is
             // unavailable.
-            if (!wp_cache_add($lock_key, 1, self::CACHE_GROUP, self::REBUILD_LOCK_TTL)) {
+            if (!\BCC\Core\DB\AdvisoryLock::acquire($lock_key, 0)) {
                 $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
                 if (is_array($lkg)) {
                     $lkg['stale']           = true;
@@ -1072,7 +1074,7 @@ class SearchController
 
             return new \WP_REST_Response($response);
         } finally {
-            wp_cache_delete($lock_key, self::CACHE_GROUP);
+            \BCC\Core\DB\AdvisoryLock::release($lock_key);
             if ($slot_reserved) {
                 self::releaseRebuildSlot();
             }

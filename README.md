@@ -56,7 +56,7 @@ GET /wp-json/bcc/v1/search?q=bitcoin&type=validators
       "url": "https://example.com/pages/bitcoin-builders-co/",
       "avatar": "https://example.com/wp-content/peepso/pages/42/avatar-full.jpg",
       "score": 187,
-      "tier": "gold",
+      "tier": "trusted",
       "category": "Builders",
       "category_slug": "builders"
     }
