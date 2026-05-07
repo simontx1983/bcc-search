@@ -8,6 +8,32 @@
  * Requires at least: 5.8
  * Requires PHP: 7.4
  * Requires Plugins: bcc-core
+ *
+ * Architectural seam (see docs/pattern-registry.md → "Search"):
+ *
+ *   This plugin is the CANONICAL search engine — owns ranking,
+ *   throttling, caching (incl. LKG + version bump), the query-quality
+ *   gate, and the circuit breaker. Other plugins / the headless
+ *   frontend MUST NOT call this plugin's routes directly.
+ *
+ *   The headless frontend talks to `GET /bcc/v1/cards/search`
+ *   (`BCC\Trust\Core\REST\CardsSearchEndpoint`), which is a thin §A2
+ *   view-model adapter that calls back into this plugin via
+ *   `rest_do_request('/bcc/v1/search')`. That wrapper translates
+ *   `category_slug` → `card_kind`, `reputation_tier` → `card_tier`,
+ *   and the WordPress permalink → the headless route prefix
+ *   (`/v/`, `/p/`, `/c/`) so the frontend never sees ineligible
+ *   identifiers.
+ *
+ *   Routes exposed by this plugin:
+ *     GET /bcc/v1/search          — pages search (consumed via wrapper)
+ *     GET /bcc/v1/search/users    — DORMANT (Phase 2 multi-vertical)
+ *     GET /bcc/v1/search/groups   — DORMANT (Phase 2 multi-vertical)
+ *
+ *   When the multi-vertical UX lands, fan out INTERNALLY from
+ *   `/bcc/v1/search` to the user / group services — keep the
+ *   frontend on one contract. Do not have the frontend call the
+ *   three endpoints in parallel.
  */
 
 if (!defined('ABSPATH')) {
