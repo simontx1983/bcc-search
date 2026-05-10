@@ -1427,8 +1427,15 @@ class SearchController
             // UI instead of presenting stale rankings as authoritative.
             $lkg['stale']            = true;
             $lkg['system_degraded']  = true;
+            // Observability counter: LKG served because the live path
+            // tripped (breaker open / rebuild lock contention / explicit
+            // overload). Useful for "search has been serving stale results
+            // for N minutes" before users notice ranking quality drop.
+            \BCC\Core\Observability\DegradationMetrics::record('search_lkg', 'served');
             return new \WP_REST_Response($lkg);
         }
+        // No LKG available either — full 503. Worse outcome than LKG-served.
+        \BCC\Core\Observability\DegradationMetrics::record('search_lkg', 'unavailable_503');
         return new \WP_REST_Response(
             [
                 'code'    => 'temporarily_overloaded',
