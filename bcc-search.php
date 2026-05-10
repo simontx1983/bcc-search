@@ -117,6 +117,31 @@ add_action('bcc_search_ensure_ft_index', function (): void {
 // ── Cache invalidation (must run on every request, not just REST) ────────────
 add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_cache_hooks']);
 
+// ── System-health filter contribution ────────────────────────────────────────
+// Phase 3 of the post-stabilization observability initiative (2026-05-09).
+// Contributes a `search` block to the unified bcc_system_health envelope
+// surfacing FT-index install state + the persistent-cache prerequisite.
+// Breaker state and LKG hit counts are surfaced via the cross-plugin
+// `degradation_metrics.search_lkg` block (bcc-core's filter); this block
+// covers the install-time / boot-time signals that aren't event-counted.
+add_filter('bcc_system_health', function (array $health): array {
+    $health['search'] = [
+        // FT index installed → full-text scoring on post_content. False
+        // means searches fall through to the title-prefix LIKE path
+        // (correct but strictly less useful). Self-heal cron retries
+        // hourly until install succeeds.
+        'ft_index_installed' => (bool) get_option('bcc_ft_index_v2_installed'),
+        // Persistent object cache is a hard prerequisite for the
+        // breaker, concurrent-rebuild slot gauge, and LKG fallback.
+        // Without it, scale-out search behaviour degrades to per-request
+        // memory only.
+        'persistent_cache'   => function_exists('wp_using_ext_object_cache')
+            ? wp_using_ext_object_cache()
+            : false,
+    ];
+    return $health;
+});
+
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
