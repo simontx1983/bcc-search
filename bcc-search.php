@@ -153,19 +153,3 @@ add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\GroupSearchController())->register_routes();
 });
 
-// ── Gutenberg block registration ────────────────────────────────────────────
-add_filter('block_categories_all', function (array $categories): array {
-    // Avoid duplicate registration if another BCC Search block adds the category.
-    foreach ($categories as $cat) {
-        if (($cat['slug'] ?? '') === 'bcc-search') {
-            return $categories;
-        }
-    }
-    $categories[] = [
-        'slug'  => 'bcc-search',
-        'title' => __('BCC Search', 'bcc-search'),
-        'icon'  => null,
-    ];
-    return $categories;
-}, 10, 1);
-
