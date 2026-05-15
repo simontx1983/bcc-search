@@ -481,8 +481,9 @@ class SearchController
             arsort($text_scores);
             $prerank_ids = array_slice(array_keys($text_scores), 0, self::PRERANK_TOP_K);
 
-            // Use enriched scores (same composite ranking as /discover) so
-            // search and discovery produce consistent trust-based ordering.
+            // Use enriched scores (same composite ranking the directory uses
+            // via /cards) so search and browse produce consistent trust-based
+            // ordering.
             $enrich_failed = false;
             $scores_by_id  = self::enrichScoresIfAvailable($prerank_ids, $enrich_failed);
 
@@ -688,8 +689,8 @@ class SearchController
      *
      * $textScore is the [0,1] output of computeTextScore().
      * $compositeScore is ranking_score from the trust engine read model
-     * (same formula as GET /bcc/v1/discover). Unbounded (typically 0–80);
-     * normalised via soft cap at 80 before blending.
+     * (same formula the /cards directory ranks by). Unbounded (typically
+     * 0–80); normalised via soft cap at 80 before blending.
      *
      * Output weighting is 60% trust / 40% text relevance.
      */
@@ -702,8 +703,8 @@ class SearchController
     /**
      * Format hydrated DB rows into API response items.
      *
-     * Field names are aligned with GET /bcc/v1/discover so the frontend
-     * can consume both endpoints with the same component logic.
+     * Field names are aligned with the /cards directory item shape so the
+     * frontend can consume search and browse with the same component logic.
      *
      * @param int[] $winnerIds
      * @param array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}> $scoresById
