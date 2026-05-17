@@ -1,0 +1,666 @@
+/* ============================================================
+   BCC Search — Component Styles
+   Uses WP global color variables with fallbacks
+   ============================================================ */
+
+/* ── Variables ─────────────────────────────────────────────── */
+:root {
+  --bcc-bg:               var(--wp--preset--color--base, #ffffff);
+  --bcc-bg-light:         var(--wp--preset--color--base-light, #f7f7f7);
+  --bcc-border:           var(--wp--preset--color--contrast-ulight, #eeeeee);
+  --bcc-text-muted:       var(--wp--preset--color--contrast-slight, #b3b3b3);
+  --bcc-text-secondary:   var(--wp--preset--color--contrast-light, #777777);
+  --bcc-text:             var(--wp--preset--color--contrast-medium, #444444);
+  --bcc-text-strong:      var(--wp--preset--color--contrast, #111111);
+  --bcc-primary:          var(--wp--preset--color--primary, #16b5e6);
+  --bcc-primary-light:    var(--wp--preset--color--primary-l, #55ccf0);
+  --bcc-primary-dark:     var(--wp--preset--color--primary-d, #0f8fb4);
+  --bcc-overlay:          var(--wp--preset--color--overlay-1, rgba(0,0,0,0.15));
+  --bcc-overlay-light:    var(--wp--preset--color--overlay-2, rgba(0,0,0,0.06));
+  --bcc-radius:           10px;
+  --bcc-radius-sm:        6px;
+  --bcc-transition:       0.18s ease;
+}
+
+/* ============================================================
+   SEARCH BAR WIDGET
+   ============================================================ */
+
+.bcc-search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 480px;
+}
+
+/* ── Input ─────────────────────────────────────────────────── */
+.bcc-search-input {
+  width: 100%;
+  height: 40px;
+  padding: 0 100px 0 16px; /* right pad leaves room for 3 icons */
+  border: 1.5px solid var(--bcc-border);
+  border-radius: 20px;
+  background: var(--bcc-bg);
+  color: var(--bcc-text-strong);
+  font-size: 0.875rem;
+  line-height: 1;
+  outline: none;
+  transition: border-color var(--bcc-transition), box-shadow var(--bcc-transition);
+}
+
+.bcc-search-input::placeholder {
+  color: var(--bcc-text-muted);
+}
+
+.bcc-search-input:focus {
+  border-color: var(--bcc-primary);
+  box-shadow: 0 0 0 3px var(--bcc-overlay-light);
+}
+
+/* ── Icon cluster (right side of input) ───────────────────── */
+.bcc-search-actions {
+  position: absolute;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.bcc-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 50%;
+  padding: 0;
+  color: var(--bcc-text-secondary);
+  transition: color var(--bcc-transition), background var(--bcc-transition);
+  flex-shrink: 0;
+}
+
+.bcc-icon-btn:hover {
+  color: var(--bcc-primary);
+  background: var(--bcc-overlay-light);
+}
+
+.bcc-icon-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+/* spinner animation */
+.bcc-icon-btn.is-spinner {
+  pointer-events: none;
+  color: var(--bcc-primary);
+}
+.bcc-icon-btn.is-spinner svg {
+  animation: bcc-spin 0.7s linear infinite;
+}
+@keyframes bcc-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* go/view button — primary accent */
+.bcc-icon-btn.bcc-btn-go {
+  color: var(--bcc-primary);
+}
+.bcc-icon-btn.bcc-btn-go:hover {
+  color: var(--bcc-bg);
+  background: var(--bcc-primary);
+}
+
+/* hidden utility */
+.bcc-hidden { display: none !important; }
+
+/* ============================================================
+   DROPDOWN MODAL (results + filter tabs)
+   ============================================================ */
+
+.bcc-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  min-width: 320px;
+  background: var(--bcc-bg);
+  border: 1.5px solid var(--bcc-border);
+  border-radius: var(--bcc-radius);
+  box-shadow: 0 8px 32px var(--bcc-overlay);
+  z-index: 99999;
+  overflow: hidden;
+  display: none;
+}
+
+.bcc-dropdown.is-open {
+  display: block;
+}
+
+/* ── Filter tabs (only shown while/after typing) ───────────── */
+.bcc-filter-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1.5px solid var(--bcc-border);
+  padding: 0 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.bcc-filter-tabs::-webkit-scrollbar { display: none; }
+
+.bcc-filter-tab {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--bcc-text-secondary);
+  background: transparent;
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  cursor: pointer;
+  transition: color var(--bcc-transition), border-color var(--bcc-transition);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin-bottom: -1.5px;
+}
+
+.bcc-filter-tab:hover {
+  color: var(--bcc-primary);
+}
+
+.bcc-filter-tab.is-active {
+  color: var(--bcc-primary);
+  border-bottom-color: var(--bcc-primary);
+}
+
+/* ── Results list ───────────────────────────────────────────── */
+.bcc-results-list {
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 6px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--bcc-border) transparent;
+}
+
+.bcc-results-list::-webkit-scrollbar { width: 5px; }
+.bcc-results-list::-webkit-scrollbar-thumb {
+  background: var(--bcc-border);
+  border-radius: 4px;
+}
+
+/* ── Single result item ─────────────────────────────────────── */
+.bcc-result-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 15px;
+  cursor: pointer;
+  text-decoration: none;
+  color: inherit;
+  transition: background var(--bcc-transition);
+}
+
+.bcc-result-item:hover,
+.bcc-result-item.is-focused {
+  background: var(--bcc-primary);
+}
+
+.bcc-result-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--bcc-border);
+}
+
+.bcc-result-avatar.is-square {
+  border-radius: var(--bcc-radius-sm);
+}
+
+.bcc-result-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.bcc-result-name {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--bcc-text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bcc-result-meta {
+  font-size: 0.75rem;
+  color: var(--bcc-text-secondary);
+  margin-top: 1px;
+}
+
+.bcc-result-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: var(--bcc-overlay-light);
+  color: var(--bcc-primary);
+  border: 1px solid var(--bcc-primary-light);
+  flex-shrink: 0;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+/* tier colours */
+.bcc-tier-trusted  { color: var(--bcc-primary);       border-color: var(--bcc-primary-light); }
+.bcc-tier-verified { color: #22c55e;                   border-color: #86efac; }
+.bcc-tier-rising   { color: var(--wp--preset--color--custom-secondary, #f98a1c); border-color: var(--wp--preset--color--custom-secondary-light, #ffac55); }
+
+/* ── State messages (loading / empty / error) ──────────────── */
+.bcc-state-msg {
+  padding: 20px 16px;
+  text-align: center;
+  font-size: 0.82rem;
+  color: var(--bcc-text-muted);
+}
+
+/* ── "View all results" footer ──────────────────────────────── */
+.bcc-dropdown-footer {
+  border-top: 1.5px solid var(--bcc-border);
+  padding: 8px 14px;
+}
+
+.bcc-view-all-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px;
+  border: 1.5px solid var(--bcc-primary);
+  border-radius: var(--bcc-radius-sm);
+  background: transparent;
+  color: var(--bcc-primary);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background var(--bcc-transition), color var(--bcc-transition);
+}
+
+.bcc-view-all-btn:hover {
+  background: var(--bcc-primary);
+  color: var(--bcc-bg);
+}
+
+.bcc-view-all-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ============================================================
+   SEARCH RESULTS PAGE
+   ============================================================ */
+
+.bcc-results-page {
+  width: 100%;
+}
+
+/* ── Page header ────────────────────────────────────────────── */
+.bcc-rp-header {
+  padding: 24px 0 0;
+  border-bottom: 1.5px solid var(--bcc-border);
+  margin-bottom: 0;
+}
+
+.bcc-rp-query-label {
+  font-size: 0.8rem;
+  color: var(--bcc-text-secondary);
+  margin-bottom: 4px;
+}
+
+.bcc-rp-query-label strong {
+  color: var(--bcc-text-strong);
+}
+
+/* ── Page-level tabs ────────────────────────────────────────── */
+.bcc-rp-tabs {
+  display: flex;
+  gap: 0;
+  margin-top: 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.bcc-rp-tabs::-webkit-scrollbar { display: none; }
+
+.bcc-rp-tab {
+  flex-shrink: 0;
+  padding: 10px 18px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--bcc-text-secondary);
+  background: transparent;
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  transition: color var(--bcc-transition), border-color var(--bcc-transition);
+  margin-bottom: -1.5px;
+}
+
+.bcc-rp-tab:hover { color: var(--bcc-primary); }
+
+.bcc-rp-tab.is-active {
+  color: var(--bcc-primary);
+  border-bottom-color: var(--bcc-primary);
+}
+
+.bcc-rp-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 5px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--bcc-overlay-light);
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--bcc-text-secondary);
+  vertical-align: middle;
+}
+
+/* ── Tab panels ─────────────────────────────────────────────── */
+.bcc-rp-panel {
+  display: none;
+  padding: 24px 0;
+}
+.bcc-rp-panel.is-active { display: block; }
+
+/* ── Page-level result cards (wider than dropdown items) ────── */
+.bcc-rp-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px;
+  border-bottom: 1px solid var(--bcc-border);
+  border-radius: 15px;
+  text-decoration: none;
+  color: inherit;
+  transition: background var(--bcc-transition);
+}
+
+.bcc-rp-card:last-child { border-bottom: none; }
+
+.bcc-rp-card:hover { background: var(--bcc-primary); }
+
+.bcc-rp-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--bcc-border);
+}
+
+.bcc-rp-avatar.is-group {
+  border-radius: var(--bcc-radius-sm);
+}
+
+.bcc-rp-card-info { flex: 1; min-width: 0; }
+
+.bcc-rp-card-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--bcc-text-strong);
+}
+
+.bcc-rp-card-meta {
+  font-size: 0.78rem;
+  color: var(--bcc-text-secondary);
+  margin-top: 2px;
+}
+
+.bcc-rp-card-desc {
+  font-size: 0.8rem;
+  color: var(--bcc-text-secondary);
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bcc-rp-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 20px;
+  background: var(--bcc-overlay-light);
+  color: var(--bcc-primary);
+  border: 1px solid var(--bcc-primary-light);
+  flex-shrink: 0;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+/* ── Skeleton loader ────────────────────────────────────────── */
+.bcc-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bcc-border) 25%,
+    var(--bcc-bg-light) 50%,
+    var(--bcc-border) 75%
+  );
+  background-size: 200% 100%;
+  animation: bcc-shimmer 1.4s infinite;
+  border-radius: 4px;
+}
+@keyframes bcc-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.bcc-skeleton-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--bcc-border);
+}
+.bcc-skeleton-avatar {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.bcc-skeleton-lines { flex: 1; }
+.bcc-skeleton-line {
+  height: 12px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+}
+.bcc-skeleton-line.short { width: 45%; }
+.bcc-skeleton-line.long  { width: 75%; }
+
+/* ── Empty / error states ───────────────────────────────────── */
+.bcc-rp-empty {
+  padding: 40px 0;
+  text-align: center;
+  color: var(--bcc-text-muted);
+  font-size: 0.875rem;
+}
+.bcc-rp-empty strong {
+  display: block;
+  font-size: 1rem;
+  margin-bottom: 6px;
+  color: var(--bcc-text-secondary);
+}
+
+/* ── Load more ──────────────────────────────────────────────── */
+.bcc-load-more-wrap {
+  padding: 16px 0 0;
+  text-align: center;
+}
+
+.bcc-load-more-btn {
+  padding: 8px 24px;
+  border: 1.5px solid var(--bcc-primary);
+  border-radius: var(--bcc-radius-sm);
+  background: transparent;
+  color: var(--bcc-primary);
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--bcc-transition), color var(--bcc-transition);
+}
+.bcc-load-more-btn:hover {
+  background: var(--bcc-primary);
+  color: var(--bcc-bg);
+}
+
+/* ── Responsive ─────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .bcc-dropdown { min-width: unset; }
+  .bcc-rp-tab { padding: 8px 12px; font-size: 0.75rem; }
+}
+
+
+
+/* ============================================================
+   DARK MODE — force dropdown + input to follow site bg
+   ============================================================ */
+
+/* These ensure the search bar and dropdown always respect
+   the WP --base variable which flips in dark mode */
+.bcc-search-input,
+.bcc-dropdown,
+.bcc-dropdown-footer,
+.bcc-results-list {
+  background-color: var(--wp--preset--color--base, #ffffff);
+  color: var(--wp--preset--color--contrast, #111111);
+}
+
+.bcc-result-name,
+.bcc-rp-card-name {
+  color: var(--wp--preset--color--contrast, #111111);
+}
+
+.bcc-result-meta,
+.bcc-rp-card-meta,
+.bcc-rp-card-desc,
+.bcc-state-msg {
+  color: var(--wp--preset--color--contrast-light, #777777);
+}
+
+/* ============================================================
+   PRE-SEARCH: recent + trending
+   ============================================================ */
+.bcc-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bcc-text-muted);
+}
+
+.bcc-section-label svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+
+.bcc-clear-recent {
+  margin-left: auto;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--bcc-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.bcc-clear-recent:hover { text-decoration: underline; }
+
+.bcc-pre-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 15px;
+  cursor: pointer;
+  transition: background var(--bcc-transition);
+  color: var(--wp--preset--color--contrast, #111111);
+}
+
+.bcc-pre-item:hover,
+.bcc-pre-item.is-focused {
+  background: var(--bcc-primary);
+}
+
+.bcc-pre-icon {
+  display: flex;
+  align-items: center;
+  color: var(--bcc-text-muted);
+  flex-shrink: 0;
+}
+.bcc-pre-icon svg { width: 14px; height: 14px; }
+
+.bcc-pre-text {
+  flex: 1;
+  font-size: 0.875rem;
+}
+
+.bcc-remove-recent {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--bcc-text-muted);
+  border-radius: 50%;
+  padding: 0;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity var(--bcc-transition), color var(--bcc-transition);
+}
+.bcc-pre-item:hover .bcc-remove-recent { opacity: 1; }
+.bcc-remove-recent:hover { color: var(--bcc-primary); }
+.bcc-remove-recent svg { width: 12px; height: 12px; }
+
+.bcc-show-more-trend {
+  display: block;
+  width: 100%;
+  padding: 8px 14px;
+  text-align: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--bcc-primary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-top: 1px solid var(--bcc-border);
+  margin-top: 4px;
+}
+.bcc-show-more-trend:hover { background: var(--bcc-bg-light); }
+
+/* Remove native browser clear button on search inputs */
+.bcc-search-input::-webkit-search-cancel-button,
+.bcc-search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}

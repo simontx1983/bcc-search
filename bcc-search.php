@@ -43,6 +43,7 @@ if (!defined('ABSPATH')) {
 define('BCC_SEARCH_VERSION', '1.0.0');
 define('BCC_SEARCH_PATH', plugin_dir_path(__FILE__));
 define('BCC_SEARCH_URL', plugin_dir_url(__FILE__));
+define('BCC_SEARCH_RESULTS_SLUG', 'search');
 
 // ── Dependency check — bcc-core must be active ──────────────────────────────
 if ( ! defined( 'BCC_CORE_VERSION' ) ) {
@@ -142,6 +143,45 @@ add_filter('bcc_system_health', function (array $health): array {
     return $health;
 });
 
+// ── Asset enqueue ────────────────────────────────────────────────────────────
+add_action('wp_enqueue_scripts', function () {
+    $ver = BCC_SEARCH_VERSION;
+
+    wp_enqueue_style(
+        'bcc-search',
+        BCC_SEARCH_URL . 'assets/css/bcc-search.css',
+        [],
+        $ver
+    );
+
+    // Search bar script — on every page (the bar is in the header)
+    wp_enqueue_script(
+        'bcc-search-bar',
+        BCC_SEARCH_URL . 'assets/js/bcc-search-bar.js',
+        [],
+        $ver,
+        true
+    );
+
+    // Results page script — only on the designated search results page
+    if (is_page(BCC_SEARCH_RESULTS_SLUG) || get_query_var('pagename') === BCC_SEARCH_RESULTS_SLUG) {
+        wp_enqueue_script(
+            'bcc-search-results',
+            BCC_SEARCH_URL . 'assets/js/bcc-search-results.js',
+            [],
+            $ver,
+            true
+        );
+    }
+
+    // Shared JS config object
+    wp_localize_script('bcc-search-bar', 'bccSearchBar', [
+        'restUrl'    => esc_url_raw(rest_url('bcc/v1')),
+        'resultsUrl' => esc_url_raw(home_url('/' . BCC_SEARCH_RESULTS_SLUG . '/')),
+        'nonce'      => wp_create_nonce('wp_rest'),
+    ]);
+});
+
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
@@ -169,3 +209,105 @@ add_filter('block_categories_all', function (array $categories): array {
     return $categories;
 }, 10, 1);
 
+// ── Shortcode: [bcc_search] ──────────────────────────────────────────────────
+// Renders the search bar widget (the header/inline bar)
+add_shortcode('bcc_search', function (array $atts): string {
+    $atts = shortcode_atts([
+        'placeholder' => __('Search projects, people…', 'bcc-search'),
+        'show_type'   => '1',
+    ], $atts, 'bcc_search');
+
+    ob_start(); ?>
+    <div class="bcc-search-wrap" data-bcc-bar role="search" aria-label="<?php esc_attr_e('Site search', 'bcc-search'); ?>">
+
+      <input
+        type="search"
+        class="bcc-search-input"
+        placeholder="<?php echo esc_attr($atts['placeholder']); ?>"
+        autocomplete="off"
+        aria-label="<?php esc_attr_e('Search', 'bcc-search'); ?>"
+        aria-autocomplete="list"
+        aria-expanded="false"
+      >
+
+      <!-- Two icon buttons: [spinner↔clear] [search↔go] -->
+      <div class="bcc-search-actions" aria-hidden="true">
+        <!-- Left: spinner while loading, flips to clear when done (hidden at rest) -->
+        <button type="button" class="bcc-icon-btn bcc-btn-loader bcc-hidden"
+                title="<?php esc_attr_e('Clear search', 'bcc-search'); ?>"
+                aria-label="<?php esc_attr_e('Clear search', 'bcc-search'); ?>">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+        </button>
+        <!-- Right: search icon at rest, flips to go arrow while typing -->
+        <button type="button" class="bcc-icon-btn bcc-btn-search bcc-icon-btn-main"
+                title="<?php esc_attr_e('Search', 'bcc-search'); ?>"
+                aria-label="<?php esc_attr_e('Search', 'bcc-search'); ?>">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Dropdown -->
+      <div class="bcc-dropdown" role="listbox" aria-label="<?php esc_attr_e('Search results', 'bcc-search'); ?>">
+        <?php if ($atts['show_type'] !== '0'): ?>
+        <!-- Filter tabs — hidden until JS opens dropdown -->
+        <div class="bcc-filter-tabs" role="tablist" aria-label="<?php esc_attr_e('Filter results', 'bcc-search'); ?>"></div>
+        <?php endif; ?>
+        <div class="bcc-results-list" role="group"></div>
+        <div class="bcc-dropdown-footer bcc-hidden">
+          <a href="#" class="bcc-view-all-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="5" y1="12" x2="19" y2="12"/>
+              <polyline points="12 5 19 12 12 19"/>
+            </svg>
+            <?php esc_html_e('View all results', 'bcc-search'); ?>
+          </a>
+        </div>
+      </div>
+    </div>
+    <?php
+    return ob_get_clean();
+});
+
+// ── Shortcode: [bcc_search_results] ─────────────────────────────────────────
+// Place this on your /search/ page. Renders the full results page container.
+add_shortcode('bcc_search_results', function (): string {
+    ob_start(); ?>
+    <div class="bcc-results-page" data-bcc-results>
+      <div class="bcc-rp-header">
+        <div class="bcc-rp-query-label"></div>
+        <nav class="bcc-rp-tabs" role="tablist" aria-label="<?php esc_attr_e('Result type', 'bcc-search'); ?>"></nav>
+      </div>
+      <div class="bcc-rp-panels"></div>
+    </div>
+    <?php
+    return ob_get_clean();
+});
+
+// ── Gutenberg block: Search Results ─────────────────────────────────────────
+add_action('init', function () {
+    // Only register if block editor is available
+    if (!function_exists('register_block_type')) {
+        return;
+    }
+    register_block_type('bcc-search/results', [
+        'editor_script'   => 'bcc-search-results-block-editor',
+        'render_callback' => function (): string {
+            return do_shortcode('[bcc_search_results]');
+        },
+        'attributes'      => [],
+    ]);
+    wp_register_script(
+        'bcc-search-results-block-editor',
+        BCC_SEARCH_URL . 'assets/js/bcc-results-block-editor.js',
+        ['wp-blocks', 'wp-element', 'wp-block-editor'],
+        BCC_SEARCH_VERSION,
+        true
+    );
+});
