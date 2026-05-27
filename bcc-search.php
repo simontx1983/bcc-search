@@ -160,6 +160,75 @@ add_filter('bcc_expected_cron_hooks', function (array $hooks): array {
     return $hooks;
 });
 
+// ── Developer panel contribution (Operator OS v1 Phase 3) ───────────────────
+// Surface FT-index install state on the Developer page plus a manual
+// "rebuild" trigger that calls SearchRepository::ensureFulltextIndex().
+// Idempotent — the repo method early-returns if the index is already
+// installed (or re-creates it if a destructive uninstall ran).
+add_filter('bcc_developer_panels', function (array $panels): array {
+    $panels['bcc-search:index'] = [
+        'title' => 'Search Index (bcc-search)',
+        'sort'  => 20,
+        'render' => function (): void {
+            $installed = (bool) get_option('bcc_ft_index_v2_installed');
+            $color     = $installed ? '#46b450' : '#dba617';
+            $label     = $installed ? 'installed' : 'not installed';
+
+            echo '<table class="widefat striped" style="max-width:760px;"><tbody>';
+            printf(
+                '<tr><th style="width:280px;">FT index v2</th><td><span style="display:inline-block;padding:2px 10px;background:%1$s;color:#fff;border-radius:3px;font-weight:bold;font-size:12px;">%2$s</span></td></tr>',
+                esc_attr($color),
+                esc_html($label)
+            );
+            printf(
+                '<tr><th>Option flag (<code>bcc_ft_index_v2_installed</code>)</th><td><code>%s</code></td></tr>',
+                esc_html((string) get_option('bcc_ft_index_v2_installed', '(unset)'))
+            );
+            echo '</tbody></table>';
+
+            if (!$installed) {
+                echo '<p style="color:#666;margin-top:8px;">'
+                    . 'The <code>bcc_search_ensure_ft_index</code> hourly self-heal cron will keep retrying until the option flag is set. '
+                    . 'Press Rebuild to force an immediate attempt.</p>';
+            }
+
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:8px;">';
+            echo '<input type="hidden" name="action" value="bcc_dev_rebuild_ft_index">';
+            wp_nonce_field('bcc_dev_rebuild_ft_index');
+            echo '<button type="submit" class="button" '
+                . 'onclick="return confirm(\'Run SearchRepository::ensureFulltextIndex() now? Idempotent — already-installed indexes are a no-op.\');">'
+                . 'Rebuild FT index</button>';
+            echo '</form>';
+        },
+    ];
+    return $panels;
+});
+
+add_action('admin_post_bcc_dev_rebuild_ft_index', function (): void {
+    if (!current_user_can('manage_options')) {
+        wp_die(esc_html__('Unauthorized.'));
+    }
+    check_admin_referer('bcc_dev_rebuild_ft_index');
+
+    $args = ['page' => 'bcc-developer'];
+    try {
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+        $args['rebuilt'] = '1';
+        \BCC\Core\Log\Logger::info('[bcc-search] FT index rebuild triggered from Developer page', [
+            'operator' => get_current_user_id(),
+        ]);
+    } catch (\Throwable $e) {
+        $args['rebuild_failed'] = $e->getMessage();
+        \BCC\Core\Log\Logger::warning('[bcc-search] FT index rebuild threw', [
+            'operator' => get_current_user_id(),
+            'error'    => $e->getMessage(),
+        ]);
+    }
+
+    wp_safe_redirect(add_query_arg($args, admin_url('admin.php')));
+    exit;
+});
+
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
