@@ -75,7 +75,7 @@ final class UserSearchController
         // bucket name so the two verticals don't share quota.
         if (!Throttle::allow('search_users', self::RATE_LIMIT, self::RATE_WINDOW)) {
             return new \WP_REST_Response([
-                'code'    => 'rate_limit_exceeded',
+                'code'    => 'bcc_rate_limited',
                 'message' => 'Too many requests. Please wait a few seconds.',
                 'data'    => ['status' => 429],
             ], 429);
@@ -119,7 +119,7 @@ final class UserSearchController
             }
             return new \WP_REST_Response(
                 [
-                    'code'    => 'user_search_unavailable',
+                    'code'    => 'bcc_upstream_unavailable',
                     'message' => 'User search is temporarily unavailable. Please retry shortly.',
                     'data'    => ['status' => 503],
                 ],
@@ -136,7 +136,7 @@ final class UserSearchController
             }
             return new \WP_REST_Response(
                 [
-                    'code'    => 'user_search_unavailable',
+                    'code'    => 'bcc_upstream_unavailable',
                     'message' => 'User search is temporarily unavailable. Please retry shortly.',
                     'data'    => ['status' => 503],
                 ],

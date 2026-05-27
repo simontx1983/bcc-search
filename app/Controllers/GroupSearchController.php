@@ -61,7 +61,7 @@ final class GroupSearchController
     {
         if (!Throttle::allow('search_groups', self::RATE_LIMIT, self::RATE_WINDOW)) {
             return new \WP_REST_Response([
-                'code'    => 'rate_limit_exceeded',
+                'code'    => 'bcc_rate_limited',
                 'message' => 'Too many requests. Please wait a few seconds.',
                 'data'    => ['status' => 429],
             ], 429);
@@ -100,7 +100,7 @@ final class GroupSearchController
             }
             return new \WP_REST_Response(
                 [
-                    'code'    => 'group_search_unavailable',
+                    'code'    => 'bcc_upstream_unavailable',
                     'message' => 'Group search is temporarily unavailable. Please retry shortly.',
                     'data'    => ['status' => 503],
                 ],
@@ -115,7 +115,7 @@ final class GroupSearchController
             }
             return new \WP_REST_Response(
                 [
-                    'code'    => 'group_search_unavailable',
+                    'code'    => 'bcc_upstream_unavailable',
                     'message' => 'Group search is temporarily unavailable. Please retry shortly.',
                     'data'    => ['status' => 503],
                 ],

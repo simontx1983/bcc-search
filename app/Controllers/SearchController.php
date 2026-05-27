@@ -253,7 +253,7 @@ class SearchController
             // rate-limit responses. Return WP_REST_Response (not WP_Error) so the
             // controller has a single narrow return type.
             return new \WP_REST_Response([
-                'code'    => 'rate_limit_exceeded',
+                'code'    => 'bcc_rate_limited',
                 'message' => 'Too many requests. Please wait a few seconds.',
                 'data'    => ['status' => 429],
             ], 429);
@@ -291,7 +291,7 @@ class SearchController
             }
             return new \WP_REST_Response(
                 [
-                    'code'    => 'categories_unavailable',
+                    'code'    => 'bcc_upstream_unavailable',
                     'message' => 'Search is temporarily unavailable. Please retry shortly.',
                     'data'    => ['status' => 503],
                 ],
@@ -402,7 +402,7 @@ class SearchController
                 }
                 return new \WP_REST_Response(
                     [
-                        'code'    => 'rebuild_in_progress',
+                        'code'    => 'bcc_upstream_unavailable',
                         'message' => 'Search is warming up. Please retry shortly.',
                         'data'    => ['status' => 503],
                     ],
@@ -481,9 +481,8 @@ class SearchController
             arsort($text_scores);
             $prerank_ids = array_slice(array_keys($text_scores), 0, self::PRERANK_TOP_K);
 
-            // Use enriched scores (same composite ranking the directory uses
-            // via /cards) so search and browse produce consistent trust-based
-            // ordering.
+            // Use enriched scores (same composite ranking as /discover) so
+            // search and discovery produce consistent trust-based ordering.
             $enrich_failed = false;
             $scores_by_id  = self::enrichScoresIfAvailable($prerank_ids, $enrich_failed);
 
@@ -503,7 +502,7 @@ class SearchController
                 }
                 return new \WP_REST_Response(
                     [
-                        'code'    => 'score_enrichment_failed',
+                        'code'    => 'bcc_internal',
                         'message' => 'Temporarily unavailable. Please retry shortly.',
                         'data'    => ['status' => 503],
                     ],
@@ -689,8 +688,9 @@ class SearchController
      *
      * $textScore is the [0,1] output of computeTextScore().
      * $compositeScore is ranking_score from the trust engine read model
-     * (same formula the /cards directory ranks by). Unbounded (typically
-     * 0–80); normalised via soft cap at 80 before blending.
+     * (same composite formula PageDiscoveryService uses for the /cards
+     * listing). Unbounded (typically 0–80); normalised via soft cap at
+     * 80 before blending.
      *
      * Output weighting is 60% trust / 40% text relevance.
      */
@@ -703,8 +703,8 @@ class SearchController
     /**
      * Format hydrated DB rows into API response items.
      *
-     * Field names are aligned with the /cards directory item shape so the
-     * frontend can consume search and browse with the same component logic.
+     * Field names are aligned with the /cards listing shape so the
+     * frontend can consume both endpoints with the same component logic.
      *
      * @param int[] $winnerIds
      * @param array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}> $scoresById
@@ -947,7 +947,7 @@ class SearchController
                 }
                 return new \WP_REST_Response(
                     [
-                        'code'    => 'rebuild_in_progress',
+                        'code'    => 'bcc_upstream_unavailable',
                         'message' => 'Trending is warming up. Please retry shortly.',
                         'data'    => ['status' => 503],
                     ],
@@ -1439,7 +1439,7 @@ class SearchController
         \BCC\Core\Observability\DegradationMetrics::record('search_lkg', 'unavailable_503');
         return new \WP_REST_Response(
             [
-                'code'    => 'temporarily_overloaded',
+                'code'    => 'bcc_upstream_unavailable',
                 'message' => 'Search is temporarily rate-limited. Please retry shortly.',
                 'data'    => ['status' => 503],
             ],
