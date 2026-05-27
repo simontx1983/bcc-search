@@ -143,6 +143,23 @@ add_filter('bcc_system_health', function (array $health): array {
     return $health;
 });
 
+// ── Cron-page filter contribution ───────────────────────────────────────────
+// Operator OS v1 Phase 2: contribute the bcc-search canonical hook to the
+// CronPage drift-detector. Conditional: bcc_search_ensure_ft_index self-
+// deschedules once bcc_ft_index_v2_installed is set, so it should only
+// appear as "expected" while the install is pending. Once installed,
+// drift is the EXPECTED state.
+add_filter('bcc_expected_cron_hooks', function (array $hooks): array {
+    if (!get_option('bcc_ft_index_v2_installed')) {
+        $hooks['bcc_search_ensure_ft_index'] = [
+            'interval'    => 'hourly',
+            'source'      => 'bcc-search',
+            'description' => 'FT-index install self-heal (auto-retires once installed)',
+        ];
+    }
+    return $hooks;
+});
+
 // ── REST route registration ─────────────────────────────────────────────────
 add_action('rest_api_init', function () {
     (new \BCC\Search\Controllers\SearchController())->register_routes();
