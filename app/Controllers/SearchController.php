@@ -518,6 +518,40 @@ class SearchController
                 $rank_scores[$id]   = $this->blendRankScore($text, $ranking);
             }
 
+            // §J anti-impersonation guarantee: when a claim-verified canonical
+            // page shares its (normalised) name with one or more unverified
+            // look-alikes, every same-name look-alike MUST sort strictly BELOW
+            // the verified page(s). Without this, a high-text-relevance
+            // impostor could outrank the real verified page for its own name.
+            // Demote-only — no candidate is removed and cross-name ordering is
+            // disturbed only minimally (an epsilon clamp). Bounded O(n) over the
+            // ≤ PRERANK_TOP_K candidates; uses the already-enriched score map so
+            // there are no new DB calls.
+            $verified_min_by_name = [];   // normalised name => min verified rank
+            $unverified_by_name   = [];   // normalised name => list<int> ids
+            foreach ($prerank_ids as $id) {
+                $name = $titles_by_id[$id] ?? '';
+                $key  = strtolower(trim((string) preg_replace('/\s+/', ' ', $name)));
+                $is_claim_verified = (bool) ($scores_by_id[$id]['is_claim_verified'] ?? false);
+                if ($is_claim_verified) {
+                    $verified_min_by_name[$key] = isset($verified_min_by_name[$key])
+                        ? min($verified_min_by_name[$key], $rank_scores[$id])
+                        : $rank_scores[$id];
+                } else {
+                    $unverified_by_name[$key][] = $id;
+                }
+            }
+            $epsilon = 1e-6;
+            foreach ($unverified_by_name as $key => $ids) {
+                if (!isset($verified_min_by_name[$key])) {
+                    continue;
+                }
+                $ceiling = $verified_min_by_name[$key] - $epsilon;
+                foreach ($ids as $id) {
+                    $rank_scores[$id] = min($rank_scores[$id], $ceiling);
+                }
+            }
+
             usort($prerank_ids, static function (int $a, int $b) use ($rank_scores): int {
                 return ($rank_scores[$b] <=> $rank_scores[$a]) ?: ($a <=> $b);
             });
@@ -707,8 +741,8 @@ class SearchController
      * frontend can consume both endpoints with the same component logic.
      *
      * @param int[] $winnerIds
-     * @param array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}> $scoresById
-     * @return list<array{page_id: int, page_name: string, page_url: string, avatar_url: string, trust_score: int|null, tier: string|null, endorsements: int, verified: bool, followers: int, category: string|null, category_slug: string|null}>
+     * @param array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, is_claim_verified?: bool, follower_count: int}> $scoresById
+     * @return list<array{page_id: int, page_name: string, page_url: string, avatar_url: string, trust_score: int|null, tier: string|null, endorsements: int, verified: bool, is_claim_verified: bool, followers: int, category: string|null, category_slug: string|null}>
      */
     private function hydrateAndFormat(
         array $winnerIds,
@@ -743,6 +777,7 @@ class SearchController
                 'tier'          => $tier,
                 'endorsements'  => is_array($score) ? (int) $score['endorsement_count'] : 0,
                 'verified'      => is_array($score) ? (bool) $score['is_verified'] : false,
+                'is_claim_verified' => is_array($score) ? (bool) ($score['is_claim_verified'] ?? false) : false,
                 'followers'     => is_array($score) ? (int) $score['follower_count'] : 0,
                 'category'      => $filteredCatName ?? $row->categoryName ?? null,
                 'category_slug' => $filteredCatSlug ?? $row->categorySlug ?? null,
@@ -766,7 +801,7 @@ class SearchController
      *
      * @param int[] $pageIds
      * @param-out bool $failed
-     * @return array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, follower_count: int}>
+     * @return array<int, array{total_score: float, reputation_tier: string, ranking_score: float, endorsement_count: int, is_verified: bool, is_claim_verified?: bool, follower_count: int}>
      */
     private static function enrichScoresIfAvailable(array $pageIds, ?bool &$failed = null): array
     {
@@ -1013,6 +1048,7 @@ class SearchController
                             'ranking_score'     => 0.0,
                             'endorsement_count' => 0,
                             'is_verified'       => false,
+                            'is_claim_verified' => false,
                             'follower_count'    => 0,
                         ];
                     }
