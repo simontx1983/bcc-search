@@ -40,6 +40,16 @@ final class GroupSearchRepository
     private const DEFAULT_LIMIT = 20;
     private const MAX_LIMIT     = 50;
 
+    // PeepSo `peepso_group_privacy` post-meta: 0 = public (open),
+    // 1 = closed (discoverable by name, join-by-request), 2 = secret
+    // (invisible to non-members). Search is a discovery surface, so we
+    // exclude SECRET only and keep CLOSED groups findable — the same
+    // browse/discovery semantics as
+    // bcc-core PeepSoGroupRepository::listBrowsableGroupIds(). (The
+    // stricter closed+secret exclusion, getNonOpenGroupIds(), is for the
+    // main-feed author gate, not name discovery.)
+    private const PRIVACY_SECRET = 2;
+
     /**
      * Throw on DB error. Immediate-check contract: call on the line
      * following the wpdb accessor, nothing else between.
@@ -64,8 +74,13 @@ final class GroupSearchRepository
      *     LEFT JOIN wp_postmeta pm_av
      *              ON pm_av.post_id = p.ID
      *             AND pm_av.meta_key = 'peepso_group_avatar_hash'
+     *     LEFT JOIN wp_postmeta pm_priv
+     *              ON pm_priv.post_id = p.ID
+     *             AND pm_priv.meta_key = 'peepso_group_privacy'
      *     WHERE  p.post_type   = 'peepso-group'
      *       AND  p.post_status = 'publish'
+     *       AND  (pm_priv.meta_value IS NULL
+     *             OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)  -- hide secret
      *       AND  p.post_title LIKE 'q%'
      *     ORDER BY p.post_title ASC
      *     LIMIT %d
@@ -91,14 +106,21 @@ final class GroupSearchRepository
              LEFT JOIN ' . $wpdb->postmeta . ' pm_av
                     ON pm_av.post_id = p.ID
                    AND pm_av.meta_key = %s
+             LEFT JOIN ' . $wpdb->postmeta . ' pm_priv
+                    ON pm_priv.post_id = p.ID
+                   AND pm_priv.meta_key = %s
              WHERE p.post_type = %s
                AND p.post_status = %s
+               AND (pm_priv.meta_value IS NULL
+                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> %d)
                AND p.post_title LIKE %s
              ORDER BY p.post_title ASC
              LIMIT %d',
             'peepso_group_avatar_hash',
+            'peepso_group_privacy',
             self::GROUP_POST_TYPE,
             'publish',
+            self::PRIVACY_SECRET,
             $prefix,
             $limit
         );
