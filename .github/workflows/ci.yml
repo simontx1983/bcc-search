@@ -1,0 +1,60 @@
+name: CI
+
+# First real CI gate for bcc-search (2026-07-06 audit: every merge here was
+# fully ungated — no syntax check, no PHPStan, nothing). Tests don't exist
+# yet in this plugin; when they land, add a PHPUnit step mirroring
+# bcc-trust's ci.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  php:
+    name: PHP — syntax · PHPStan L8
+    runs-on: ubuntu-latest
+    # Checked out INTO the WordPress plugins layout so phpstan.neon's
+    # scanDirectories (../bcc-core/src) resolves.
+    defaults:
+      run:
+        working-directory: app/public/wp-content/plugins/bcc-search
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: app/public/wp-content/plugins/bcc-search
+
+      # phpstan.neon scans ../bcc-core/src for cross-plugin type resolution
+      # (ServiceLocator, Logger). Check out the sibling into the WP layout.
+      - uses: actions/checkout@v4
+        with:
+          repository: simontx1983/bcc-core
+          path: app/public/wp-content/plugins/bcc-core
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring
+          tools: composer:v2
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: PHP syntax check
+        run: |
+          set -e
+          find app -name '*.php' -print0 | xargs -0 -n1 -P4 php -l > /dev/null
+          php -l bcc-search.php > /dev/null
+          php -l uninstall.php > /dev/null
+          echo "All PHP files parse cleanly."
+
+      - name: PHPStan (level 8)
+        run: vendor/bin/phpstan analyse --no-progress

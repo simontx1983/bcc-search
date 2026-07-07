@@ -57,7 +57,13 @@ final class UserSearchService
         foreach ($users as $u) {
             $results[] = [
                 'id'           => $u->id,
-                'username'     => $u->userLogin,
+                // user_nicename, NOT user_login: this endpoint is public
+                // (anonymous callers allowed) and user_login is the actual
+                // credential name — returning it hands credential-stuffing
+                // lists to anyone who iterates the endpoint. The nicename
+                // is the URL-safe public handle and renders identically in
+                // the FE's "@{username}" display.
+                'username'     => $u->userNicename,
                 'display_name' => $u->displayName,
                 'avatar_url'   => $this->resolveAvatarUrl($u->id),
                 'profile_url'  => $this->resolveProfileUrl($u),
