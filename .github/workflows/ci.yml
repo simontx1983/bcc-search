@@ -1,9 +1,8 @@
 name: CI
 
-# First real CI gate for bcc-search (2026-07-06 audit: every merge here was
-# fully ungated — no syntax check, no PHPStan, nothing). Tests don't exist
-# yet in this plugin; when they land, add a PHPUnit step mirroring
-# bcc-trust's ci.yml.
+# CI gate for bcc-search (introduced by the 2026-07-06 audit: every merge
+# here used to be fully ungated — no syntax check, no PHPStan, nothing).
+# Now: syntax + PHPStan L8 + PHPUnit unit tests (mirrors bcc-trust's ci.yml).
 
 on:
   push:
@@ -19,7 +18,7 @@ concurrency:
 
 jobs:
   php:
-    name: PHP — syntax · PHPStan L8
+    name: PHP — syntax · PHPStan L8 · PHPUnit
     runs-on: ubuntu-latest
     # Checked out INTO the WordPress plugins layout so phpstan.neon's
     # scanDirectories (../bcc-core/src) resolves.
@@ -58,3 +57,6 @@ jobs:
 
       - name: PHPStan (level 8)
         run: vendor/bin/phpstan analyse --no-progress
+
+      - name: Unit tests
+        run: composer test

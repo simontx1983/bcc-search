@@ -6,15 +6,24 @@ Thumbs.db
 # Composer — production vendor/ IS committed for GitHub-based deploys
 # (Deployer for Git ships the zip from the repo, doesn't run composer
 # server-side). Dev-only paths below are gitignored so running
-# `composer install` locally to restore phpstan doesn't dirty git status.
+# `composer install` locally to restore phpstan/phpunit doesn't dirty git
+# status. composer.lock IS tracked (CI's `composer install` needs it).
 /vendor/bin/
 /vendor/phpstan/
 /vendor/php-stubs/
 /vendor/szepeviktor/
-/composer.lock
+# PHPUnit + its transitive dev tree (all dev-only; never shipped).
+/vendor/phpunit/
+/vendor/sebastian/
+/vendor/phar-io/
+/vendor/myclabs/
+/vendor/nikic/
+/vendor/theseer/
+/vendor/staabm/
 
 # PHPUnit
 /phpunit.xml
+/.phpunit.cache/
 /.phpunit.result.cache
 
 # PHPStan
@@ -23,6 +32,3 @@ Thumbs.db
 /phpstan/
 /php-stubs/
 /szepeviktor/
-
-# Tests
-/tests/
