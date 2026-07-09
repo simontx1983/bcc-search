@@ -285,7 +285,20 @@ final class SearchRepository
             $cat_where = $wpdb->prepare("AND cat.post_name = %s", $type);
         }
 
-        $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish'";
+        // Exclude SECRET pages (peepso_page_privacy = 2 → "non-members can't
+        // see the page at all"). Privacy is a post-meta, NOT a post_status, so
+        // secret pages are still post_status='publish' and the status filter
+        // alone leaks them. Because these are raw $wpdb queries (not WP_Query),
+        // PeepSo's own posts_clauses privacy filter never runs — we must
+        // enforce it here. Mirrors the secret-group exclusion in
+        // GroupSearchRepository; CLOSED (1) pages stay findable. [audit H3]
+        $privacy_join = "LEFT JOIN {$wpdb->postmeta} pm_priv
+                                ON pm_priv.post_id = p.ID
+                               AND pm_priv.meta_key = 'peepso_page_privacy'";
+        $privacy_where = "AND (pm_priv.meta_value IS NULL
+                               OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)";
+
+        $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish' {$privacy_where}";
 
         // ── FULLTEXT path ────────────────────────────────────────────────
         // Gated on BOTH length and index presence. When the v2 index has
@@ -340,6 +353,7 @@ final class SearchRepository
                 $sql = $wpdb->prepare(
                     "SELECT {$distinct} p.ID, p.post_title
                      FROM {$posts_table} p
+                     {$privacy_join}
                      {$cat_join}
                      WHERE {$base_where}
                        AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
@@ -393,6 +407,7 @@ final class SearchRepository
         $sql = $wpdb->prepare(
             "SELECT {$distinct} p.ID, p.post_title
              FROM {$posts_table} p
+             {$privacy_join}
              {$cat_join}
              WHERE {$base_where}
                AND p.post_title LIKE %s
@@ -489,7 +504,11 @@ final class SearchRepository
              FROM {$posts_table} p
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
+             LEFT JOIN {$wpdb->postmeta}  pm_priv ON pm_priv.post_id = p.ID
+                                                  AND pm_priv.meta_key = 'peepso_page_privacy'
              WHERE p.ID IN ({$id_placeholders})
+               AND (pm_priv.meta_value IS NULL
+                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
             ...array_merge($ids, $ids, [count($ids)])
@@ -632,8 +651,13 @@ final class SearchRepository
         $col = $wpdb->get_col($wpdb->prepare(
             "SELECT p.ID
              FROM {$posts_table} p
+             LEFT JOIN {$wpdb->postmeta} pm_priv
+                    ON pm_priv.post_id = p.ID
+                   AND pm_priv.meta_key = 'peepso_page_privacy'
              WHERE p.post_type = 'peepso-page'
                AND p.post_status = 'publish'
+               AND (pm_priv.meta_value IS NULL
+                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)
              ORDER BY p.ID DESC
              LIMIT %d",
             $limit
