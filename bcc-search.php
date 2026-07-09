@@ -27,14 +27,22 @@
  *   identifiers.
  *
  *   Routes exposed by this plugin:
- *     GET /bcc/v1/search          — pages search (consumed via wrapper)
- *     GET /bcc/v1/search/users    — DORMANT (Phase 2 multi-vertical)
- *     GET /bcc/v1/search/groups   — DORMANT (Phase 2 multi-vertical)
+ *     GET /bcc/v1/search          — pages search. Consumed two ways: the nav
+ *                                   autocomplete (GlobalSearch) via the §A2
+ *                                   CardsSearchEndpoint wrapper, and the full
+ *                                   results page.
+ *     GET /bcc/v1/search/users    — LIVE. Member vertical; called DIRECTLY by
+ *                                   the results page (useSearchUsers), raw / no envelope.
+ *     GET /bcc/v1/search/groups   — LIVE. Community vertical; called DIRECTLY by
+ *                                   the results page (useSearchGroups), raw / no envelope.
  *
- *   When the multi-vertical UX lands, fan out INTERNALLY from
- *   `/bcc/v1/search` to the user / group services — keep the
- *   frontend on one contract. Do not have the frontend call the
- *   three endpoints in parallel.
+ *   NOTE (2026-07-09, corrected from the original docstring): the earlier
+ *   "these are DORMANT; when multi-vertical lands, fan out INTERNALLY from
+ *   /bcc/v1/search and keep the frontend on one contract" plan did NOT ship.
+ *   SearchResultsPage already calls /search/users and /search/groups directly
+ *   and in parallel; only the pages route goes through the wrapper. The
+ *   "MUST NOT call directly" rule above therefore holds for the pages route
+ *   only. Revisit if the internal-fanout design is ever revived.
  */
 
 if (!defined('ABSPATH')) {
