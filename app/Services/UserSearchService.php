@@ -46,12 +46,14 @@ final class UserSearchService
      *   meta: array{count:int, query:string}
      * }
      */
-    public function search(string $query, int $limit = self::DEFAULT_LIMIT): array
+    public function search(string $query, int $limit = self::DEFAULT_LIMIT, int $viewerId = 0): array
     {
         $query = trim($query);
         $limit = max(1, min(self::MAX_LIMIT, $limit));
 
-        $users = UserSearchRepository::search($query, $limit);
+        // $viewerId is forwarded so the repository's PeepSoUserSearch pass
+        // can apply the viewer-scoped block filter (0 = anonymous).
+        $users = UserSearchRepository::search($query, $limit, $viewerId);
 
         $results = [];
         foreach ($users as $u) {

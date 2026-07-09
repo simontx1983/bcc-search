@@ -103,14 +103,19 @@ final class UserSearchController
             ]);
         }
 
-        $cache_key = 'user_search_' . md5(mb_strtolower($q) . '|' . $limit);
+        // Viewer is folded into the cache key: results are privacy-filtered
+        // per viewer (the block filter is viewer-scoped), so an anonymous
+        // (v0) bucket must never be served to a signed-in viewer or vice
+        // versa. Anonymous callers all share the v0 bucket.
+        $viewerId  = get_current_user_id();
+        $cache_key = 'user_search_' . md5(mb_strtolower($q) . '|' . $limit . '|v' . $viewerId);
         $cached    = wp_cache_get($cache_key, self::CACHE_GROUP);
         if (is_array($cached)) {
             return new \WP_REST_Response($cached);
         }
 
         try {
-            $response = (new UserSearchService())->search($q, $limit);
+            $response = (new UserSearchService())->search($q, $limit, $viewerId);
         } catch (\RuntimeException $e) {
             if (class_exists('\\BCC\\Core\\Log\\Logger')) {
                 \BCC\Core\Log\Logger::error('[bcc-search] user search failed', [

@@ -11,68 +11,47 @@ if (!defined('ABSPATH')) {
 /**
  * User Search Repository
  *
- * All DB access for the user-search vertical lives here. Controllers
- * and services must not use $wpdb directly.
+ * All data access for the user-search vertical lives here.
  *
- * **Index discipline.** WordPress creates indexes on wp_users for:
- *   - ID (PRIMARY)
- *   - user_login (UNIQUE)
- *   - user_nicename (INDEX)
- *   - user_email (INDEX)
+ * ## Privacy is not optional on this endpoint
  *
- * display_name is NOT indexed. A LIKE on display_name is therefore a
- * full-table scan and is deliberately NOT used — we match on the two
- * indexed name columns (user_login, user_nicename), which covers the
- * vast majority of identity searches because user_nicename is
- * generated from display_name at registration. display_name is still
- * returned in the projection so the UI can render it as the label.
+ * `GET /bcc/v1/search/users` is anonymous (permission_callback =>
+ * '__return_true'). A previous implementation ran a raw `wp_users` LIKE
+ * filtered only by `user_status = 0`, which bypassed the entire PeepSo/BCC
+ * privacy filter set — users who hid themselves / opted out of discovery,
+ * banned / suspended users, and users who blocked the viewer were all
+ * enumerable by iterating the prefix. That turned the endpoint into an
+ * anonymous member-directory scrape.
  *
- * Email is never matched and never returned — PII by policy.
+ * This repository now resolves candidate ids through **PeepSoUserSearch** —
+ * the same privacy-aware WP_User_Query wrapper `/users/mention-search` uses
+ * (`BCC\Trust\Core\Services\Mentions\MentionSearchService`). Its
+ * `pre_user_query` callback applies: ban filter, `profile_acc != PRIVATE`,
+ * members-only-when-anon, `peepso_user_blocked` (both directions when a
+ * viewer is known), `allow_hide_user_from_user_listing`, and the
+ * `bcc_privacy_discovery_optout` hook. If PeepSo is not loaded we fail
+ * closed (empty result) rather than fall back to the privacy-blind query.
+ *
+ * Email is never matched and never returned — PII by policy. `user_login`
+ * is carried on the DTO but the service projects `user_nicename`, never the
+ * login (see UserSearchService + UserSearchServiceTest).
  */
 final class UserSearchRepository
 {
-    private const COLUMNS = 'ID, user_login, user_nicename, display_name';
-
     // Default LIMIT enforced at the repository boundary; callers can
     // request smaller but not larger batches.
     private const DEFAULT_LIMIT = 20;
     private const MAX_LIMIT     = 50;
 
     /**
-     * Throw on DB error. Immediate-check contract: call on the line
-     * following the wpdb accessor, nothing else between.
-     */
-    private static function throwOnDbError(string $context): void
-    {
-        global $wpdb;
-        $err = (string) $wpdb->last_error;
-        if ($err !== '') {
-            throw new \RuntimeException("{$context}: {$err}");
-        }
-    }
-
-    /**
-     * Prefix-match search over indexed name columns.
+     * Privacy-filtered prefix search over the PeepSo user directory.
      *
-     * Query shape:
-     *
-     *     SELECT ID, user_login, user_nicename, display_name
-     *     FROM wp_users
-     *     WHERE user_status = 0
-     *       AND (user_login     LIKE 'q%'
-     *         OR user_nicename  LIKE 'q%')
-     *     ORDER BY user_login ASC
-     *     LIMIT %d
-     *
-     * - user_status = 0 excludes deactivated accounts (MU usage).
-     * - Two LIKE 'prefix%' conditions both hit indexes; the optimizer
-     *   resolves via index_merge(union) or sequential use.
-     * - ORDER BY user_login ASC is cheap — user_login has a UNIQUE
-     *   index so no filesort for small LIMIT.
-     *
+     * @param int $viewerId Authenticated viewer id, or 0 for anonymous. A
+     *                      known viewer additionally activates the
+     *                      block-both-directions filter inside PeepSoUserSearch.
      * @return list<UserDTO>
      */
-    public static function search(string $query, int $limit = self::DEFAULT_LIMIT): array
+    public static function search(string $query, int $limit = self::DEFAULT_LIMIT, int $viewerId = 0): array
     {
         $query = trim($query);
         if ($query === '') {
@@ -81,46 +60,57 @@ final class UserSearchRepository
 
         $limit = max(1, min(self::MAX_LIMIT, $limit));
 
-        global $wpdb;
-
-        // Prefix LIKE — index-eligible on both user_login and user_nicename.
-        // esc_like escapes %, _, \ so user-supplied literals like 'a_b'
-        // can't produce a multi-row match via LIKE semantics.
-        $prefix = $wpdb->esc_like($query) . '%';
-
-        $sql = $wpdb->prepare(
-            'SELECT ' . self::COLUMNS . '
-             FROM ' . $wpdb->users . '
-             WHERE user_status = 0
-               AND (user_login LIKE %s OR user_nicename LIKE %s)
-             ORDER BY user_login ASC
-             LIMIT %d',
-            $prefix,
-            $prefix,
-            $limit
-        );
-
-        $rows = $wpdb->get_results($sql, ARRAY_A);
-        self::throwOnDbError('UserSearchRepository::search query failed');
-
-        if (!is_array($rows)) {
+        // Fail closed when PeepSo (and therefore the privacy filter set) is
+        // unavailable — never fall back to a privacy-blind wp_users scan.
+        if (!class_exists('PeepSoUserSearch')) {
             return [];
         }
 
-        $dtos = [];
-        foreach ($rows as $row) {
-            $id = $row['ID'] ?? null;
-            if (!is_numeric($id)) {
-                throw new \LogicException('UserSearchRepository::search: missing/invalid ID');
+        // PeepSoUserSearch force-sets fields=ID and applies the privacy
+        // filter set in its pre_user_query callback. It escapes the needle
+        // via $wpdb->esc_like internally; we trim upstream. Passing a
+        // resolved viewer id (not null) additionally enables the
+        // block-both-directions filter for signed-in callers.
+        $search = new \PeepSoUserSearch(
+            [
+                'number'  => $limit,
+                'orderby' => 'username',
+                'order'   => 'ASC',
+            ],
+            $viewerId > 0 ? $viewerId : null,
+            $query
+        );
+
+        /** @var mixed $rawResults */
+        $rawResults = $search->results;
+        $rawIds     = is_array($rawResults) ? $rawResults : [];
+
+        $userIds = [];
+        foreach ($rawIds as $id) {
+            $idInt = (int) $id;
+            if ($idInt > 0) {
+                $userIds[] = $idInt;
             }
-            if (!isset($row['user_login'], $row['user_nicename'], $row['display_name'])) {
-                throw new \LogicException('UserSearchRepository::search: missing projected column');
+        }
+        if ($userIds === []) {
+            return [];
+        }
+
+        // Prime the WP user cache once so the per-id get_userdata() below is
+        // a single query rather than N. Order is preserved from the search.
+        cache_users($userIds);
+
+        $dtos = [];
+        foreach ($userIds as $userId) {
+            $user = get_userdata($userId);
+            if (!$user instanceof \WP_User) {
+                continue;
             }
             $dtos[] = new UserDTO(
-                id:           (int) $id,
-                userLogin:    (string) $row['user_login'],
-                userNicename: (string) $row['user_nicename'],
-                displayName:  (string) $row['display_name'],
+                id:           $userId,
+                userLogin:    (string) $user->user_login,
+                userNicename: (string) $user->user_nicename,
+                displayName:  (string) $user->display_name,
             );
         }
         return $dtos;
