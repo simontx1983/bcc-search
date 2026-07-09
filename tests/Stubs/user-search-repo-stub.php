@@ -27,20 +27,23 @@ namespace BCC\Search\Repositories {
 
             public static ?string $lastQuery = null;
             public static ?int $lastLimit = null;
+            public static ?int $lastViewerId = null;
 
             /** @return list<\BCC\Search\DTO\UserDTO> */
-            public static function search(string $query, int $limit): array
+            public static function search(string $query, int $limit, int $viewerId = 0): array
             {
-                self::$lastQuery = $query;
-                self::$lastLimit = $limit;
+                self::$lastQuery    = $query;
+                self::$lastLimit    = $limit;
+                self::$lastViewerId = $viewerId;
                 return self::$return;
             }
 
             public static function reset(): void
             {
-                self::$return    = [];
-                self::$lastQuery = null;
-                self::$lastLimit = null;
+                self::$return       = [];
+                self::$lastQuery    = null;
+                self::$lastLimit    = null;
+                self::$lastViewerId = null;
             }
         }
     }
