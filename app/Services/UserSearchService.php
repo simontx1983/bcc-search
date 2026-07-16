@@ -117,15 +117,22 @@ final class UserSearchService
     /**
      * Avatar URL resolution.
      *
-     * get_avatar_url() is the WordPress canonical entrypoint and is
-     * already filtered by PeepSo when the plugin is active, so a
-     * single call produces the right image on both PeepSo and
-     * non-PeepSo installs.
+     * Routes through bcc-core's PeepSoMediaCache — the canonical cached
+     * seam for PeepSo-resolved media URLs (§11; feed, card, and profile
+     * view-models already resolve through it). The previous per-row
+     * get_avatar_url() call went through PeepSo's filter, which
+     * constructs a PeepSoUser per result (raw `SELECT * FROM
+     * peepso_users` + file stat + possible lazy meta write); the cache
+     * removes that on warm hits and is busted on the avatar user-meta
+     * keys with a 1h TTL backstop. PeepSoMediaCache resolves PeepSo's
+     * 'full' variant rather than a sized WP avatar — identical asset on
+     * PeepSo installs (the frontend sizes via CSS) — and falls back to
+     * get_avatar_url() internally when PeepSo is absent.
      */
     private function resolveAvatarUrl(int $userId): ?string
     {
-        $url = get_avatar_url($userId, ['size' => 96]);
-        if (!is_string($url) || $url === '') {
+        $url = \BCC\Core\PeepSo\PeepSoMediaCache::avatarUrl($userId);
+        if ($url === '') {
             return null;
         }
         return esc_url_raw($url);
