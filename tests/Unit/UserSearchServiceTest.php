@@ -28,10 +28,12 @@ use PHPUnit\Framework\TestCase;
  * ## Isolation strategy
  *
  * Each test runs in its own subprocess. setUp() pulls in
+ * tests/Stubs/peepso-media-cache-stub.php (fake bcc-core
+ * PeepSoMediaCache — the avatar seam the service resolves through) and
  * tests/Stubs/user-search-repo-stub.php which defines a fake
  * UserSearchRepository at the production FQN, then requires the real
  * UserSearchService — so the service reads fixture rows whose userLogin
- * differs from userNicename without touching the DB. The stub file is
+ * differs from userNicename without touching the DB. The stub files are
  * never loaded in the main process, so other tests see the real classes.
  */
 #[CoversClass(UserSearchService::class)]
@@ -42,6 +44,7 @@ final class UserSearchServiceTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        require_once __DIR__ . '/../Stubs/peepso-media-cache-stub.php';
         require_once __DIR__ . '/../Stubs/user-search-repo-stub.php';
         \BCC\Search\Repositories\UserSearchRepository::reset();
     }
@@ -103,8 +106,9 @@ final class UserSearchServiceTest extends TestCase
         $row = (new UserSearchService())->search('c', 20)['results'][0];
 
         // No PeepSo loaded → WP author-archive fallback, keyed on nicename
-        // (not login), per resolveProfileUrl(). Values come from the
-        // deterministic wp-stubs shims.
+        // (not login), per resolveProfileUrl(). profile_url comes from the
+        // deterministic wp-stubs shims; avatar_url from the
+        // PeepSoMediaCache stub (same URL scheme).
         self::assertSame('https://site.test/author/charlie', $row['profile_url']);
         self::assertSame('https://avatars.test/42', $row['avatar_url']);
     }
