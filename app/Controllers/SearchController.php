@@ -9,6 +9,7 @@ if (!defined('ABSPATH')) {
 use BCC\Core\Security\Throttle;
 use BCC\Core\ServiceLocator;
 use BCC\Search\Repositories\SearchRepository;
+use BCC\Search\Support\QueryQualityGate;
 
 class SearchController
 {
@@ -302,31 +303,37 @@ class SearchController
 
         // Validate $type against known category slugs to prevent wasted
         // DB queries on nonexistent categories and limit the SQL surface.
+        // Empty-result short-circuits below return `categories: []` rather
+        // than the full list — autocomplete fires these per keystroke and
+        // nothing in the frontend reads categories off an empty response
+        // (contract v1.46). Real result responses keep the full list.
         if ($type !== '') {
             $validSlugs = array_column($categories, 'slug');
             if (!in_array($type, $validSlugs, true)) {
-                return new \WP_REST_Response(['results' => [], 'categories' => $categories]);
+                return new \WP_REST_Response(['results' => [], 'categories' => []]);
             }
         }
 
         // Require 2–100 chars to search
         $qLen = mb_strlen($q);
         if ($qLen < 2 || $qLen > 100) {
-            return new \WP_REST_Response(['results' => [], 'categories' => $categories]);
+            return new \WP_REST_Response(['results' => [], 'categories' => []]);
         }
 
-        // Query-quality gate. Runs BEFORE the version-scoped cache lookup
-        // so junk never hits wp_cache OR the DB: at 500 req/s of "aaaa",
-        // even a cache-hit path is wasted work. Junk gets a dedicated
-        // short-TTL cache under its own key (not version-scoped — so a
-        // page-save bust doesn't evict it and force re-evaluation).
-        if (!$this->isQuerySearchable($q)) {
+        // Query-quality gate (shared QueryQualityGate — single source of
+        // truth across verticals; the private copy this controller carried
+        // through Phase 1 is gone). Runs BEFORE the version-scoped cache
+        // lookup so junk never hits wp_cache OR the DB: at 500 req/s of
+        // "aaaa", even a cache-hit path is wasted work. Junk gets a
+        // dedicated short-TTL cache under its own key (not version-scoped
+        // — so a page-save bust doesn't evict it and force re-evaluation).
+        if (!QueryQualityGate::isSearchable($q)) {
             $junk_key = 'search_junk_' . md5(mb_strtolower($q) . '|' . mb_strtolower($type));
             $junk_cached = wp_cache_get($junk_key, self::CACHE_GROUP);
             if (is_array($junk_cached)) {
                 return new \WP_REST_Response($junk_cached);
             }
-            $response = ['results' => [], 'categories' => $categories];
+            $response = ['results' => [], 'categories' => []];
             wp_cache_set($junk_key, $response, self::CACHE_GROUP, self::JUNK_CACHE_TTL);
             return new \WP_REST_Response($response);
         }
@@ -840,80 +847,6 @@ class SearchController
      *
      * @return array<string,bool>
      */
-    private static function stopwordSet(): array
-    {
-        static $set = null;
-        if ($set !== null) {
-            return $set;
-        }
-        $words = [
-            'a','about','an','and','are','as','at','be','but','by','com','de',
-            'en','for','from','how','i','in','is','it','la','of','on','or',
-            'so','that','the','this','to','was','we','what','when','where',
-            'who','will','with','und','www',
-        ];
-        $set = array_fill_keys($words, true);
-        return $set;
-    }
-
-    /**
-     * Query-quality gate.
-     *
-     * Returns false when the query is low-entropy junk that MUST NOT
-     * reach the DB (aaaa, 1111, ----, stopword-only, non-alphanumeric
-     * sludge). The caller short-circuits to an empty response cached
-     * for JUNK_CACHE_TTL. This is the last line of defence behind the
-     * rate limiter — a multi-subnet attacker can bypass the per-subnet
-     * bucket, but even if they reach the rebuild path, junk queries
-     * don't cause any DB work.
-     */
-    private function isQuerySearchable(string $q): bool
-    {
-        // Trimmed by the controller before we're called; still defend
-        // against stray whitespace.
-        $q = trim($q);
-        $len = mb_strlen($q);
-        if ($len < 2) {
-            return false;
-        }
-
-        // No alphanumeric at all: "----", "****", unicode punctuation
-        // spam. Rejected regardless of length.
-        if (!preg_match('/[\p{L}\p{N}]/u', $q)) {
-            return false;
-        }
-
-        // All one character (aaaa, 1111, .....). Cheap low-entropy
-        // signal; attackers often generate junk this way.
-        $first = mb_substr($q, 0, 1);
-        if ($first !== '' && mb_str_split($q) === array_fill(0, $len, $first)) {
-            return false;
-        }
-
-        // Stopword-only: every whitespace-separated token is a known
-        // stopword. "the", "the and", "will of the", etc. A legitimate
-        // user query always has at least one content word; if there
-        // isn't one, the FT path can't match (stopwords stripped) and
-        // the LIKE fallback is busywork across every hot-word page.
-        $lowered = mb_strtolower($q);
-        $tokens  = preg_split('/\s+/u', $lowered, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-        if ($tokens !== []) {
-            $stopwords = self::stopwordSet();
-            $allStop = true;
-            foreach ($tokens as $t) {
-                if (!isset($stopwords[$t])) {
-                    $allStop = false;
-                    break;
-                }
-            }
-            if ($allStop) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
     /**
      * Dynamic candidate cap — shorter queries cast a wider net.
      */

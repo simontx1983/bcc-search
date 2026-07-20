@@ -19,11 +19,14 @@ use PHPUnit\Framework\TestCase;
  * /search/users is a genuinely anonymous endpoint
  * (permission_callback => '__return_true'). UserSearchService::search()
  * is the single seam that projects each UserDTO into the public response.
- * The 2026-07-06 audit fix (commit a99857c) changed that projection to
- * emit `user_nicename` as `username` instead of `user_login` — the login
- * is the actual credential name, and handing it to anonymous callers who
- * iterate the endpoint gifts them a credential-stuffing list. These tests
- * pin that guarantee so a future refactor can't silently re-expose it.
+ * The 2026-07-06 audit fix (commit a99857c) stopped emitting `user_login`
+ * as `username`; the 2026-07-19 conformance fix (contract v1.46) went
+ * further — BCC signup derives login (`u_<handle>`) AND nicename from the
+ * credential name, so the projection now emits the §B6 canonical
+ * `bcc_handle` (nicename fallback for handle-less legacy accounts) and a
+ * relative `/u/{handle}` route as profile_url. These tests pin both
+ * guarantees so a future refactor can't silently re-expose the login or
+ * send users off-app.
  *
  * ## Isolation strategy
  *
@@ -49,11 +52,11 @@ final class UserSearchServiceTest extends TestCase
         \BCC\Search\Repositories\UserSearchRepository::reset();
     }
 
-    public function testUsernameIsNicenameAndLoginNeverAppears(): void
+    public function testUsernameIsCanonicalHandleAndLoginNeverAppears(): void
     {
         \BCC\Search\Repositories\UserSearchRepository::$return = [
-            new UserDTO(7, 'secret_admin_login', 'alice', 'Alice A'),
-            new UserDTO(9, 'bob.credential', 'bob', 'Bob B'),
+            new UserDTO(7, 'u_alice', 'u_alice', 'Alice A', 'alice'),
+            new UserDTO(9, 'u_bob', 'u_bob', 'Bob B', 'bob'),
         ];
 
         $out = (new UserSearchService())->search('a', 20);
@@ -62,11 +65,27 @@ final class UserSearchServiceTest extends TestCase
         self::assertSame('alice', $out['results'][0]['username']);
         self::assertSame('bob', $out['results'][1]['username']);
 
-        // Hard regression guard: no login string survives anywhere in the payload.
+        // Hard regression guard: the login-derived `u_` names survive
+        // NOWHERE in the payload — BCC signup derives login AND nicename
+        // from the credential name, so projecting either re-exposes it
+        // (that's the bug contract v1.46 fixed).
         $flat = json_encode($out);
         self::assertIsString($flat);
-        self::assertStringNotContainsString('secret_admin_login', $flat);
-        self::assertStringNotContainsString('bob.credential', $flat);
+        self::assertStringNotContainsString('u_alice', $flat);
+        self::assertStringNotContainsString('u_bob', $flat);
+    }
+
+    public function testHandleLessAccountFallsBackToNicenameNeverLogin(): void
+    {
+        \BCC\Search\Repositories\UserSearchRepository::$return = [
+            new UserDTO(7, 'secret_admin_login', 'legacy-nicename', 'Legacy L'),
+        ];
+
+        $row = (new UserSearchService())->search('l', 20)['results'][0];
+
+        self::assertSame('legacy-nicename', $row['username']);
+        self::assertSame('/u/legacy-nicename', $row['profile_url']);
+        self::assertStringNotContainsString('secret_admin_login', (string) json_encode($row));
     }
 
     public function testResultKeysAreExactlyThePublicShape(): void
@@ -97,19 +116,19 @@ final class UserSearchServiceTest extends TestCase
         self::assertSame('hello', $out['meta']['query']);
     }
 
-    public function testProfileUrlFallsBackToAuthorArchiveKeyedOnNicename(): void
+    public function testProfileUrlIsRelativeMemberRouteFromHandle(): void
     {
         \BCC\Search\Repositories\UserSearchRepository::$return = [
-            new UserDTO(42, 'login42', 'charlie', 'Charlie'),
+            new UserDTO(42, 'u_charlie', 'u_charlie', 'Charlie', 'charlie'),
         ];
 
         $row = (new UserSearchService())->search('c', 20)['results'][0];
 
-        // No PeepSo loaded → WP author-archive fallback, keyed on nicename
-        // (not login), per resolveProfileUrl(). profile_url comes from the
-        // deterministic wp-stubs shims; avatar_url from the
-        // PeepSoMediaCache stub (same URL scheme).
-        self::assertSame('https://site.test/author/charlie', $row['profile_url']);
+        // Contract §4: profile_url is the RELATIVE Next.js member route
+        // (/u/{handle}), never a WP-origin permalink — an absolute URL
+        // here navigates users off the headless frontend. avatar_url
+        // still resolves through the PeepSoMediaCache stub.
+        self::assertSame('/u/charlie', $row['profile_url']);
         self::assertSame('https://avatars.test/42', $row['avatar_url']);
     }
 }
