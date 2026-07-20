@@ -234,10 +234,13 @@ namespace BCC\Search\Repositories {
                 return [];
             }
 
+            /** @var int[] Configurable trending-fallback candidate ids. */
+            public static array $fallbackIds = [];
+
             /** @return int[] */
             public static function getFallbackPageIds(int $limit): array
             {
-                return [];
+                return array_slice(self::$fallbackIds, 0, $limit);
             }
 
             public static function bustCategoryCache(): void
@@ -253,6 +256,7 @@ namespace BCC\Search\Repositories {
                 self::$lastSearchArgs  = null;
                 self::$pagesById       = [];
                 self::$hydrateCalls    = [];
+                self::$fallbackIds     = [];
             }
         }
     }

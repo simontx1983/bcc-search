@@ -16,9 +16,43 @@ class SearchController
     const NAMESPACE    = 'bcc/v1';
     const ROUTE        = '/search';
     const LIMIT            = 12;
+
+    /**
+     * `_bcc_page_type` meta value → frontend card-route prefix. The
+     * result `page_url` MUST be the relative Next.js route the headless
+     * frontend links to (`/v/{slug}` etc.), never a WP-origin permalink —
+     * an absolute WP URL navigates the user off the app (the same defect
+     * fixed for the users vertical in v1.46).
+     *
+     * This mirrors bcc-trust's canonical mapping — `PageTypeMap`
+     * (PAGE_TYPE_TO_KIND: validator→validator, builder→project, nft→creator)
+     * composed with `CardsSearchEndpoint::KIND_TO_ROUTE_PREFIX`
+     * (validator→/v/, project→/p/, creator→/c/). bcc-search can't import
+     * those (it depends only on bcc-core), so the collapsed page_type→prefix
+     * map is duplicated here. Adding a card kind means updating this map in
+     * lockstep with those two constants.
+     *
+     * @var array<string, string>
+     */
+    private const PAGE_TYPE_ROUTE_PREFIX = [
+        'validator' => '/v/',
+        'builder'   => '/p/',
+        'nft'       => '/c/',
+    ];
+
     const SEARCH_CACHE_TTL    = 60;    // seconds
     const TRENDING_CACHE_TTL  = 300;   // 5 minutes
     const SEARCH_VERSION_KEY = 'bcc_search_cache_version';
+    // LKG generation. Unlike SEARCH_VERSION_KEY, the LKG mirror is
+    // deliberately NOT version-scoped (it must survive version bumps to
+    // serve cold-miss losers). That makes it blind to a page becoming
+    // invisible: a normal version bump can't reach it. This generation is
+    // folded into every LKG key and bumped ONLY when page visibility
+    // changes (peepso_page_privacy), so an ordinary content edit leaves
+    // LKG intact while a privacy flip makes every prior LKG entry
+    // unreachable — closing the "secret page served from LKG for up to
+    // an hour on a degraded path" gap without weakening LKG otherwise.
+    const SEARCH_LKG_GEN_KEY = 'bcc_search_lkg_generation';
     const CACHE_GROUP        = 'bcc_search';
     const RATE_LIMIT         = 10;  // max requests
     const RATE_WINDOW        = 5;   // seconds
@@ -190,8 +224,18 @@ class SearchController
      * rebuild and turning the stampede-lock loser branch into a 503
      * retry storm. SEARCH_CACHE_TTL (60s) is the freshness budget for
      * trust-score drift in search results. Only events that change
-     * which pages EXIST or what category they belong to bust the cache:
-     * page save/delete and category save/delete.
+     * which pages EXIST, what category they belong to, or whether a page
+     * is VISIBLE bust the cache: page save/delete, category save/delete,
+     * and page-privacy changes.
+     *
+     * Privacy is load-bearing here: `peepso_page_privacy = 2` (secret)
+     * is excluded from every read query, but PeepSo flips that value via
+     * `update_post_meta` — which does NOT fire `save_post`. Without the
+     * meta hooks below, a page flipped to secret kept serving from the
+     * version-scoped cache until its soft TTL (~90s) AND from the
+     * non-version-scoped LKG mirror for up to LKG_CACHE_TTL (1h) on any
+     * degraded-path serve. Privacy is a binary invisibility guarantee,
+     * not a freshness budget, so the change must bust immediately.
      */
     public static function register_cache_hooks(): void
     {
@@ -208,6 +252,21 @@ class SearchController
                 self::bust_search_cache();
             }
         });
+
+        // Page-privacy meta changes (add/update/delete) bust immediately —
+        // the meta hooks carry the key, so we bust only on the one key
+        // that changes page visibility. Over-busting on an unrelated key
+        // never happens (guarded on meta_key); a genuine privacy flip
+        // costs one rebuild, which is the correct price for a visibility
+        // change. Also busts LKG (see bust_search_cache).
+        $bustOnPrivacyMeta = static function ($meta_id, $post_id, string $meta_key): void {
+            if ($meta_key === 'peepso_page_privacy') {
+                self::bust_search_privacy();
+            }
+        };
+        add_action('added_post_meta', $bustOnPrivacyMeta, 10, 3);
+        add_action('updated_post_meta', $bustOnPrivacyMeta, 10, 3);
+        add_action('deleted_post_meta', $bustOnPrivacyMeta, 10, 3);
     }
 
     public function register_routes(): void
@@ -219,11 +278,21 @@ class SearchController
             'args'                => [
                 'q' => [
                     'type'              => 'string',
+                    // Reject oversized queries at the REST validation layer
+                    // (400) before sanitize/handler work runs. maxLength is
+                    // only enforced when validate_callback is set explicitly
+                    // (WP does not auto-validate manually-registered args).
+                    // The handler still enforces the 2..100 window as
+                    // defense-in-depth.
+                    'maxLength'         => 100,
+                    'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'sanitize_text_field',
                     'default'           => '',
                 ],
                 'type' => [
                     'type'              => 'string',
+                    'maxLength'         => 64,
+                    'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'sanitize_text_field',
                     'default'           => '',
                 ],
@@ -354,11 +423,12 @@ class SearchController
         $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
         $key_fingerprint   = mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $visibility_bucket;
         $cache_key         = 'search_' . md5($key_fingerprint . '|' . $cache_version);
-        // LKG: identical fingerprint, version omitted. Survives version
-        // bumps so cold-miss losers and enrichment failures can serve a
-        // 200 instead of a 503 even when the active cache_key has just
-        // been version-rotated to a key that nobody has populated yet.
-        $lkg_key           = 'search_lkg_' . md5($key_fingerprint);
+        // LKG: identical fingerprint, content version omitted so it
+        // survives version bumps (cold-miss losers / enrichment failures
+        // serve a 200 instead of a 503). It IS scoped by the LKG
+        // generation, which advances only on a visibility change, so a
+        // page flipped to secret can't be served from a stale LKG entry.
+        $lkg_key           = 'search_lkg_' . self::getLkgGeneration() . '_' . md5($key_fingerprint);
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key = 'bcc_search_lock_' . md5($cache_key);
@@ -771,9 +841,22 @@ class SearchController
                 ? esc_url_raw($ps['uri'] . 'pages/' . $pid . '/' . $hash . '-avatar-full.jpg')
                 : $ps['default_avatar'];
 
-            $url = $ps['url_base']
-                ? $ps['url_base'] . $row->slug . '/'
-                : home_url('/pages/' . $row->slug . '/');
+            // Relative Next.js card route (/v//p//c/{slug}) resolved from
+            // the page's _bcc_page_type. The headless frontend links to
+            // this verbatim; a WP-origin permalink here would navigate the
+            // user off the app. Defensive fallback to the PeepSo permalink
+            // only for a page whose type is missing/unmapped (none in the
+            // current catalogue — every peepso-page carries a type).
+            $routePrefix = ($row->pageType !== null && $row->pageType !== '')
+                ? (self::PAGE_TYPE_ROUTE_PREFIX[$row->pageType] ?? null)
+                : null;
+            if ($routePrefix !== null) {
+                $url = $routePrefix . $row->slug;
+            } else {
+                $url = $ps['url_base']
+                    ? $ps['url_base'] . $row->slug . '/'
+                    : home_url('/pages/' . $row->slug . '/');
+            }
 
             $results[] = [
                 'page_id'       => $pid,
@@ -881,7 +964,10 @@ class SearchController
         // must not leak member-only pages to a non-member (or vice versa).
         $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
         $cache_key         = 'trending_' . $visibility_bucket . '_' . $cache_version;
-        $lkg_key           = 'trending_lkg_' . $visibility_bucket;
+        // LKG generation-scoped so a page flipped to secret can't linger
+        // in the trending LKG mirror across a visibility change (mirrors
+        // the search path).
+        $lkg_key           = 'trending_lkg_' . self::getLkgGeneration() . '_' . $visibility_bucket;
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key = 'bcc_trending_lock_' . md5($cache_key);
@@ -969,7 +1055,17 @@ class SearchController
                 $trending_ids = array_map(static fn($r) => $r->id, $rows);
                 // Use enriched scores so trending response includes the same
                 // fields as search results (endorsements, verified, followers).
-                $scores_by_id = self::enrichScoresIfAvailable($trending_ids);
+                // A THROWING trust engine (vs. one that isn't installed) must
+                // not be papered over with zeroed display fields and then
+                // cached into LKG for an hour — mirror handle_search and
+                // serve stale/LKG/503 instead. `enrich_failed` stays false
+                // when there simply is no trust engine (text/read-model data
+                // is a legitimate answer then).
+                $trending_enrich_failed = false;
+                $scores_by_id = self::enrichScoresIfAvailable($trending_ids, $trending_enrich_failed);
+                if ($trending_enrich_failed) {
+                    return $this->degradedEnrichResponse($cached, $lkg_key);
+                }
                 // Fall back to basic data from the read-model rows if enriched failed.
                 foreach ($rows as $row) {
                     $pid = $row->id;
@@ -1006,7 +1102,16 @@ class SearchController
                 }
 
                 if (!empty($candidate_ids)) {
-                    $scores_by_id = self::enrichScoresIfAvailable($candidate_ids);
+                    // Same rule as the read-model path: a throwing engine
+                    // here would collapse every ranking_score to 0.0 and the
+                    // usort tie-break would reorder the recency-sorted pool
+                    // into ascending-id (oldest-first) order — then cache
+                    // that into LKG. Serve degraded instead.
+                    $fallback_enrich_failed = false;
+                    $scores_by_id = self::enrichScoresIfAvailable($candidate_ids, $fallback_enrich_failed);
+                    if ($fallback_enrich_failed) {
+                        return $this->degradedEnrichResponse($cached, $lkg_key);
+                    }
 
                     usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
                         $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
@@ -1418,12 +1523,50 @@ class SearchController
     }
 
     /**
+     * Degraded response for a trust-engine enrichment FAILURE (the engine
+     * is installed but threw). Mirrors the handle_search enrich-fail block
+     * so trending degrades identically: a score-less/mis-ordered ranking
+     * must never be hydrated, returned, or cached (it would poison LKG for
+     * an hour AND let low-trust content surface). Prefer the same-
+     * fingerprint stale cache, then LKG, then 503 — never fresh bad data.
+     *
+     * @param mixed $cached the version-scoped cache wrapper read earlier
+     *                      this request (may be a stale-but-valid entry).
+     */
+    private function degradedEnrichResponse(mixed $cached, string $lkg_key): \WP_REST_Response
+    {
+        if (is_array($cached) && isset($cached['data']) && is_array($cached['data'])) {
+            return new \WP_REST_Response($cached['data']);
+        }
+        $lkg = wp_cache_get($lkg_key, self::CACHE_GROUP);
+        if (is_array($lkg)) {
+            $lkg['stale']           = true;
+            $lkg['system_degraded'] = true;
+            \BCC\Core\Observability\DegradationMetrics::record('search_lkg', 'served');
+            return new \WP_REST_Response($lkg);
+        }
+        \BCC\Core\Observability\DegradationMetrics::record('search_lkg', 'unavailable_503');
+        return new \WP_REST_Response(
+            [
+                'code'    => 'bcc_internal',
+                'message' => 'Temporarily unavailable. Please retry shortly.',
+                'data'    => ['status' => 503],
+            ],
+            503,
+            ['Retry-After' => '5']
+        );
+    }
+
+    /**
      * Per-request flag: a bust has been requested but the actual write is
      * deferred to 'shutdown'. Coalesces multiple hooks (e.g. save_post +
      * delete_post + meta updates within one request) into a single
      * update_option() + wp_cache_set() pair.
      */
     private static bool $bustQueued = false;
+
+    /** Same one-write-per-request coalescing as $bustQueued, for the LKG generation. */
+    private static bool $privacyBustQueued = false;
 
     public static function bust_search_cache(): void
     {
@@ -1454,5 +1597,53 @@ class SearchController
         // Uniform TTL with the heal path — no "forever" keys in multi-node
         // setups that would defeat getCacheVersion()'s damping window.
         wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+    }
+
+    /**
+     * Visibility-change bust: flush the version-scoped cache (via the
+     * normal version bump) AND advance the LKG generation so no prior
+     * LKG entry — which the version bump alone can't reach — can serve a
+     * now-secret page on a degraded path. Bumps both in one shutdown
+     * write path via the same queue as bust_search_cache().
+     */
+    public static function bust_search_privacy(): void
+    {
+        if (!self::$privacyBustQueued) {
+            self::$privacyBustQueued = true;
+            add_action('shutdown', [__CLASS__, 'flushPrivacyBustIfQueued'], 0);
+        }
+        // Also bump the content version so the hot (version-scoped) cache
+        // drops the stale-visibility entry immediately, not after its TTL.
+        self::bust_search_cache();
+    }
+
+    /** Shutdown handler: advance the LKG generation if a privacy bust was queued. */
+    public static function flushPrivacyBustIfQueued(): void
+    {
+        if (!self::$privacyBustQueued) {
+            return;
+        }
+        self::$privacyBustQueued = false;
+        $gen = time();
+        update_option(self::SEARCH_LKG_GEN_KEY, $gen, false);
+        wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+    }
+
+    /**
+     * Current LKG generation. Read the same way as the cache version —
+     * cache first, option fallback, safe floor of 1 — but with no heal
+     * race: LKG-gen changes are rare (privacy flips only), so a plain
+     * cache-miss option read is fine.
+     */
+    private static function getLkgGeneration(): int
+    {
+        $cached = wp_cache_get(self::SEARCH_LKG_GEN_KEY, self::CACHE_GROUP);
+        if (self::isValidVersionValue($cached)) {
+            return (int) $cached;
+        }
+        $opt = get_option(self::SEARCH_LKG_GEN_KEY, 1);
+        $gen = self::isValidVersionValue($opt) ? max(1, (int) $opt) : 1;
+        wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+        return $gen;
     }
 }

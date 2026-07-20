@@ -14,6 +14,10 @@ if (!defined('ABSPATH')) {
  *   - categoryName / categorySlug: LEFT JOIN on peepso_page_categories —
  *     null when a page has no category linked
  *   - avatarHash: LEFT JOIN on postmeta — null when no avatar set
+ *   - pageType: LEFT JOIN on postmeta `_bcc_page_type` — the BCC card
+ *     kind discriminator (`validator` / `builder` / `nft`); null when a
+ *     page predates the type meta. Drives the relative card route
+ *     (`/v//p//c/`) the frontend links to — see SearchController.
  */
 final class PageHydratedDTO
 {
@@ -24,6 +28,7 @@ final class PageHydratedDTO
         public readonly ?string $categoryName,
         public readonly ?string $categorySlug,
         public readonly ?string $avatarHash,
+        public readonly ?string $pageType = null,
     ) {
     }
 }

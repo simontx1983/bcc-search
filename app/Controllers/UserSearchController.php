@@ -57,6 +57,12 @@ final class UserSearchController
             'args'                => [
                 'q' => [
                     'type'              => 'string',
+                    // Reject oversized queries at the REST layer (400)
+                    // before handler work; QueryQualityGate still enforces
+                    // the searchable window as defense-in-depth. maxLength
+                    // needs the explicit validate_callback to be enforced.
+                    'maxLength'         => 100,
+                    'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'sanitize_text_field',
                     'default'           => '',
                 ],
