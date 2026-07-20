@@ -511,10 +511,13 @@ final class SearchRepository
                 p.ID,
                 p.post_title,
                 p.post_name,
-                pm_av.meta_value AS avatar_hash
+                pm_av.meta_value   AS avatar_hash,
+                pm_type.meta_value AS page_type
              FROM {$posts_table} p
              LEFT JOIN {$wpdb->postmeta}  pm_av ON pm_av.post_id = p.ID
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
+             LEFT JOIN {$wpdb->postmeta}  pm_type ON pm_type.post_id = p.ID
+                                                  AND pm_type.meta_key = '_bcc_page_type'
              LEFT JOIN {$wpdb->postmeta}  pm_priv ON pm_priv.post_id = p.ID
                                                   AND pm_priv.meta_key = 'peepso_page_privacy'
              WHERE p.ID IN ({$id_placeholders})
@@ -593,6 +596,9 @@ final class SearchRepository
                 categoryName: ($cat && $cat['name'] !== null) ? $cat['name'] : null,
                 categorySlug: ($cat && $cat['slug'] !== null) ? $cat['slug'] : null,
                 avatarHash:   isset($row['avatar_hash']) ? (string) $row['avatar_hash'] : null,
+                pageType:     isset($row['page_type']) && $row['page_type'] !== ''
+                    ? (string) $row['page_type']
+                    : null,
             );
         }
         return $dtos;

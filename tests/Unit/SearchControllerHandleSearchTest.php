@@ -80,7 +80,7 @@ final class SearchControllerHandleSearchTest extends TestCase
     /**
      * Seed one page into both the candidate pool and the hydration map.
      */
-    private function seedPage(int $id, string $title): void
+    private function seedPage(int $id, string $title, ?string $pageType = null): void
     {
         SearchRepository::$candidates[]   = new PageCandidateDTO($id, $title);
         SearchRepository::$pagesById[$id] = new PageHydratedDTO(
@@ -90,7 +90,20 @@ final class SearchControllerHandleSearchTest extends TestCase
             categoryName: null,
             categorySlug: null,
             avatarHash:   null,
+            pageType:     $pageType,
         );
+    }
+
+    /** @return array<int, string> page_id => page_url */
+    private static function urlByPageId(\WP_REST_Response $response): array
+    {
+        $data = $response->get_data();
+        self::assertIsArray($data);
+        $out = [];
+        foreach ($data['results'] as $row) {
+            $out[(int) $row['page_id']] = $row['page_url'];
+        }
+        return $out;
     }
 
     /**
@@ -255,6 +268,38 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertNotEmpty($this->cacheEntriesWithPrefix('search_lkg_'));
     }
 
+    // ── page_url is the relative Next.js card route (v1.46) ────────────
+
+    public function testPageUrlIsRelativeCardRouteResolvedFromPageType(): void
+    {
+        // Every peepso-page carries a _bcc_page_type; the response must
+        // link to the in-app route (/v//p//c/{slug}), never a WP-origin
+        // permalink that would navigate the user off the headless app.
+        $this->seedPage(20, 'zeda', 'validator');
+        $this->seedPage(21, 'zedb', 'builder');
+        $this->seedPage(22, 'zedc', 'nft');
+
+        $urls = self::urlByPageId($this->dispatch('zed'));
+
+        self::assertSame('/v/page-20', $urls[20]);
+        self::assertSame('/p/page-21', $urls[21]);
+        self::assertSame('/c/page-22', $urls[22]);
+    }
+
+    public function testPageUrlFallsBackToPermalinkForUnmappedType(): void
+    {
+        // Defensive: a page with a missing/unrecognised type keeps the
+        // PeepSo permalink rather than an invalid relative route (dead in
+        // the current catalogue, but must not emit a broken /X/ route).
+        $this->seedPage(30, 'zeta', null);
+        $this->seedPage(31, 'zetb', 'dao'); // real page_type, no card route
+
+        $urls = self::urlByPageId($this->dispatch('zet'));
+
+        self::assertSame('https://site.test/pages/page-30/', $urls[30]);
+        self::assertSame('https://site.test/pages/page-31/', $urls[31]);
+    }
+
     // ── §J anti-impersonation demotion ─────────────────────────────────
 
     public function testClaimVerifiedPageOutranksSameNameLookalikeWithHigherTrust(): void
@@ -327,5 +372,33 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertIsArray($data);
         self::assertSame('bcc_internal', $data['code']);
         self::assertSame([], $this->cacheEntriesWithPrefix('search_'));
+    }
+
+    // ── Trending: enrichment failure is fail-closed, same as search ────
+
+    public function testTrendingEnrichFailureYields503AndPoisonsNoCache(): void
+    {
+        // Regression for the trending path silently proceeding on a
+        // throwing trust engine: a score-less/mis-ordered ranking must
+        // never be hydrated, returned, or written to the trending cache
+        // (it would poison LKG for an hour). With no stale/LKG entry the
+        // honest answer is a retryable 503.
+        SearchRepository::$fallbackIds = [1, 2, 3];
+        $this->seedPage(1, 'Alpha');
+        $this->seedPage(2, 'Beta');
+        $this->seedPage(3, 'Gamma');
+        FakeScoreReadService::$throw = true;
+
+        $response = (new SearchController())->handle_search(
+            new \WP_REST_Request(['trending' => '1'])
+        );
+
+        self::assertSame(503, $response->get_status());
+        $data = $response->get_data();
+        self::assertIsArray($data);
+        self::assertSame('bcc_internal', $data['code']);
+        // No trending entry written — the degraded response returns before
+        // cacheTrendingResult, so LKG is never poisoned with bad data.
+        self::assertSame([], $this->cacheEntriesWithPrefix('trending_'));
     }
 }
