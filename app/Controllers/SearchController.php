@@ -40,6 +40,15 @@ class SearchController
         'nft'       => '/c/',
     ];
 
+    /**
+     * Default card type for a peepso-page whose `_bcc_page_type` meta is
+     * empty/missing. Mirrors bcc-trust's canonical `?: 'builder'` default
+     * so an untyped page still resolves to an in-app route rather than a
+     * WP permalink. Keep in lockstep with PageReadModelRepository /
+     * PageCardPrefetcher / CardViewService.
+     */
+    private const PAGE_TYPE_DEFAULT = 'builder';
+
     const SEARCH_CACHE_TTL    = 60;    // seconds
     const TRENDING_CACHE_TTL  = 300;   // 5 minutes
     const SEARCH_VERSION_KEY = 'bcc_search_cache_version';
@@ -428,7 +437,15 @@ class SearchController
         // serve a 200 instead of a 503). It IS scoped by the LKG
         // generation, which advances only on a visibility change, so a
         // page flipped to secret can't be served from a stale LKG entry.
-        $lkg_key           = 'search_lkg_' . self::getLkgGeneration() . '_' . md5($key_fingerprint);
+        //
+        // The generation read is a non-autoloaded option (a DB SELECT on a
+        // non-persistent cache), so the full lkg_key is built LAZILY — only
+        // on the paths that actually touch LKG (stale-lock-winner rebuild
+        // and the cold branch). Warm hits and stale-lock losers return
+        // without ever reading the generation. The fingerprint half is
+        // cheap and precomputed here.
+        $lkg_fingerprint   = md5($key_fingerprint);
+        $lkg_key           = '';
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key = 'bcc_search_lock_' . md5($cache_key);
@@ -437,7 +454,7 @@ class SearchController
             $isFresh = isset($cached['expires_at']) && time() < $cached['expires_at'];
 
             if ($isFresh) {
-                // Cache is fresh — serve immediately.
+                // Cache is fresh — serve immediately (no LKG read).
                 return new \WP_REST_Response($cached['data']);
             }
 
@@ -446,11 +463,16 @@ class SearchController
             // If another worker is already rebuilding, serve stale data
             // instead of blocking.
             if (!\BCC\Core\DB\AdvisoryLock::acquire($lock_key, 0)) {
-                // Another worker is rebuilding — serve stale data.
+                // Another worker is rebuilding — serve stale data (no LKG read).
                 return new \WP_REST_Response($cached['data']);
             }
-            // We won the lock — fall through to rebuild below.
+            // We won the lock — build the LKG key now (the rebuild path uses it).
+            $lkg_key = 'search_lkg_' . self::getLkgGeneration() . '_' . $lkg_fingerprint;
+            // Fall through to rebuild below.
         } else {
+            // Cold branch: every sub-path (loser serves LKG, winner rebuilds
+            // and writes it) needs the LKG key.
+            $lkg_key = 'search_lkg_' . self::getLkgGeneration() . '_' . $lkg_fingerprint;
             // ── Stampede protection for cold cache (no stale entry to serve) ──
             //
             // Previous implementation busy-waited up to 1.5s for the winner,
@@ -844,12 +866,20 @@ class SearchController
             // Relative Next.js card route (/v//p//c/{slug}) resolved from
             // the page's _bcc_page_type. The headless frontend links to
             // this verbatim; a WP-origin permalink here would navigate the
-            // user off the app. Defensive fallback to the PeepSo permalink
-            // only for a page whose type is missing/unmapped (none in the
-            // current catalogue — every peepso-page carries a type).
-            $routePrefix = ($row->pageType !== null && $row->pageType !== '')
-                ? (self::PAGE_TYPE_ROUTE_PREFIX[$row->pageType] ?? null)
-                : null;
+            // user off the app (the very bug this composition closes).
+            //
+            // An empty/missing type defaults to 'builder' → /p/, mirroring
+            // bcc-trust's canonical `_bcc_page_type ?: 'builder'` default
+            // (PageReadModelRepository / PageCardPrefetcher / CardViewService)
+            // — a legacy or externally-minted page without the meta must
+            // still get an IN-APP route, not fall off to a WP permalink.
+            // The permalink branch survives only for a type that is set but
+            // genuinely outside the card taxonomy (none in the current
+            // catalogue — every peepso-page is validator/builder/nft).
+            $effectiveType = ($row->pageType !== null && $row->pageType !== '')
+                ? $row->pageType
+                : self::PAGE_TYPE_DEFAULT;
+            $routePrefix = self::PAGE_TYPE_ROUTE_PREFIX[$effectiveType] ?? null;
             if ($routePrefix !== null) {
                 $url = $routePrefix . $row->slug;
             } else {
@@ -966,8 +996,10 @@ class SearchController
         $cache_key         = 'trending_' . $visibility_bucket . '_' . $cache_version;
         // LKG generation-scoped so a page flipped to secret can't linger
         // in the trending LKG mirror across a visibility change (mirrors
-        // the search path).
-        $lkg_key           = 'trending_lkg_' . self::getLkgGeneration() . '_' . $visibility_bucket;
+        // the search path). Built LAZILY — the generation read is a
+        // non-autoloaded option, so warm hits and stale-lock losers (the
+        // common case on a 5-min trending cache) return without paying it.
+        $lkg_key           = '';
         $cached            = wp_cache_get($cache_key, self::CACHE_GROUP);
 
         $lock_key = 'bcc_trending_lock_' . md5($cache_key);
@@ -984,7 +1016,11 @@ class SearchController
                 // Another worker is rebuilding — serve stale data.
                 return new \WP_REST_Response($cached['data']);
             }
+            // Won the lock — rebuild path uses the LKG key.
+            $lkg_key = 'trending_lkg_' . self::getLkgGeneration() . '_' . $visibility_bucket;
         } else {
+            // Cold branch: loser serves LKG, winner rebuilds and writes it.
+            $lkg_key = 'trending_lkg_' . self::getLkgGeneration() . '_' . $visibility_bucket;
             // Cold miss — try to acquire lock.
             //
             // Previous behaviour was to return `['results' => [], 'categories' => []]`

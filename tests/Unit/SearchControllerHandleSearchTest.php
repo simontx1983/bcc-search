@@ -260,7 +260,8 @@ final class SearchControllerHandleSearchTest extends TestCase
         );
         self::assertSame(20, $row['page_id']);
         self::assertSame('acme', $row['page_name']);
-        self::assertSame('https://site.test/pages/page-20/', $row['page_url']);
+        // Untyped seed page → 'builder' default → in-app /p/ route.
+        self::assertSame('/p/page-20', $row['page_url']);
         self::assertNull($row['trust_score']);
         self::assertFalse($row['verified']);
 
@@ -286,17 +287,29 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertSame('/c/page-22', $urls[22]);
     }
 
-    public function testPageUrlFallsBackToPermalinkForUnmappedType(): void
+    public function testMissingPageTypeDefaultsToBuilderRouteNotOffAppPermalink(): void
     {
-        // Defensive: a page with a missing/unrecognised type keeps the
-        // PeepSo permalink rather than an invalid relative route (dead in
-        // the current catalogue, but must not emit a broken /X/ route).
+        // A page with EMPTY/missing `_bcc_page_type` must still get an
+        // in-app route — it defaults to 'builder' → /p/, mirroring
+        // bcc-trust's `?: 'builder'` convention. Falling to the WP
+        // permalink here would re-open the off-app-navigation bug for
+        // any legacy / externally-minted untyped page.
         $this->seedPage(30, 'zeta', null);
-        $this->seedPage(31, 'zetb', 'dao'); // real page_type, no card route
 
         $urls = self::urlByPageId($this->dispatch('zet'));
 
-        self::assertSame('https://site.test/pages/page-30/', $urls[30]);
+        self::assertSame('/p/page-30', $urls[30]);
+    }
+
+    public function testSetButUnmappedTypeKeepsPermalinkFallback(): void
+    {
+        // Only a type that is SET but outside the card taxonomy (none in
+        // the current catalogue) keeps the defensive permalink — it has
+        // no valid /v//p//c/ route to compose.
+        $this->seedPage(31, 'zetb', 'dao');
+
+        $urls = self::urlByPageId($this->dispatch('zet'));
+
         self::assertSame('https://site.test/pages/page-31/', $urls[31]);
     }
 

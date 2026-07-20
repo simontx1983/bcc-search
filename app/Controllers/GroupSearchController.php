@@ -36,6 +36,69 @@ final class GroupSearchController
     private const RATE_LIMIT     = 10;
     private const RATE_WINDOW    = 5;
 
+    /**
+     * Generation counter folded into the cache key. Bumped only on a
+     * group-visibility change (peepso_group_privacy) so a group flipped
+     * to secret can't be served from a pre-flip cache entry. The group
+     * vertical has no version key / LKG of its own, so this is the whole
+     * invalidation mechanism (beyond the 45s TTL).
+     */
+    private const GEN_KEY = 'bcc_group_search_generation';
+
+    /**
+     * Register the privacy-driven cache-bust hooks. Wired on `init` from
+     * bcc-search.php (like SearchController's) so it fires on admin/AJAX
+     * saves, not only REST requests. Guarded on the one meta key that
+     * changes a group's visibility.
+     */
+    public static function register_cache_hooks(): void
+    {
+        $bump = static function ($meta_id, $post_id, string $meta_key): void {
+            if ($meta_key === 'peepso_group_privacy') {
+                self::bustGeneration();
+            }
+        };
+        add_action('added_post_meta', $bump, 10, 3);
+        add_action('updated_post_meta', $bump, 10, 3);
+        add_action('deleted_post_meta', $bump, 10, 3);
+    }
+
+    /** Advance the generation (coalesced to one write per request via shutdown). */
+    private static bool $genBumpQueued = false;
+
+    public static function bustGeneration(): void
+    {
+        if (self::$genBumpQueued) {
+            return;
+        }
+        self::$genBumpQueued = true;
+        add_action('shutdown', [__CLASS__, 'flushGenBumpIfQueued'], 0);
+    }
+
+    public static function flushGenBumpIfQueued(): void
+    {
+        if (!self::$genBumpQueued) {
+            return;
+        }
+        self::$genBumpQueued = false;
+        $gen = time();
+        update_option(self::GEN_KEY, $gen, false);
+        wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+    }
+
+    /** Current generation: cache first, option fallback, safe floor of 1. */
+    private static function getGeneration(): int
+    {
+        $cached = wp_cache_get(self::GEN_KEY, self::CACHE_GROUP);
+        if (is_int($cached) || (is_string($cached) && ctype_digit($cached))) {
+            return max(1, (int) $cached);
+        }
+        $opt = get_option(self::GEN_KEY, 1);
+        $gen = (is_int($opt) || (is_string($opt) && ctype_digit($opt))) ? max(1, (int) $opt) : 1;
+        wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+        return $gen;
+    }
+
     public function register_routes(): void
     {
         register_rest_route(self::NAMESPACE, self::ROUTE, [
@@ -90,7 +153,14 @@ final class GroupSearchController
             ]);
         }
 
-        $cache_key = 'group_search_' . md5(mb_strtolower($q) . '|' . $limit);
+        // Generation-scoped so a group flipped to secret can't linger in
+        // a warm cache entry (populated pre-flip) for the 45s TTL. Secret
+        // groups are excluded at query time, but that only helps on a
+        // miss; the generation bumps on any peepso_group_privacy change
+        // (register_cache_hooks), making prior entries unreachable at once
+        // — "privacy is a binary invisibility guarantee, not a freshness
+        // budget," same principle the pages vertical applies.
+        $cache_key = 'group_search_' . self::getGeneration() . '_' . md5(mb_strtolower($q) . '|' . $limit);
         $cached    = wp_cache_get($cache_key, self::CACHE_GROUP);
         if (is_array($cached)) {
             return new \WP_REST_Response($cached);

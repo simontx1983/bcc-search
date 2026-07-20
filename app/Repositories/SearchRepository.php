@@ -190,23 +190,45 @@ final class SearchRepository
                 'bcc_ft_post_search'
             ));
 
+            // Whether the v2 index is confirmed present after this block:
+            // true if it already existed, or if our ADD succeeded. Only
+            // then may we set the installed flag — otherwise a failed
+            // ALTER (lock-wait timeout on the hot wp_posts table, missing
+            // ALTER privilege on shared hosting, disk-full, …) would
+            // FALSELY mark the index installed, permanently degrading
+            // every FT-eligible search to the title-prefix fallback: the
+            // hourly self-heal cron deschedules on the truthy flag and the
+            // manual rebuild button short-circuits on it too, so nothing
+            // ever retries. Check last_error IMMEDIATELY after the ALTER
+            // (the next $wpdb call — update_option — would reset it).
+            $indexReady = true;
             if (!$v2Exists) {
                 $wpdb->query(
                     "ALTER TABLE {$wpdb->posts} ADD FULLTEXT INDEX bcc_ft_post_search (post_title, post_content)"
                 );
+                if ($wpdb->last_error !== '') {
+                    $indexReady = false;
+                    if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                        \BCC\Core\Log\Logger::error('[bcc-search] FULLTEXT v2 index ALTER failed — leaving installed flag unset so the self-heal cron retries', [
+                            'error' => $wpdb->last_error,
+                        ]);
+                    }
+                }
             }
 
-            update_option('bcc_ft_index_v2_installed', 1, false);
+            if ($indexReady) {
+                update_option('bcc_ft_index_v2_installed', 1, false);
 
-            // Ranking quality changes when FULLTEXT becomes available (MATCH
-            // AGAINST replaces title-prefix fallback), so any cached results
-            // built pre-install would now rank differently. Bust the search
-            // cache version so stale entries are not served alongside fresh
-            // ones. Runs inside the GET_LOCK region so only the installing
-            // worker does this work; subsequent callers short-circuit on the
-            // v2_installed option and never enter this branch.
-            if (class_exists('\\BCC\\Search\\Controllers\\SearchController')) {
-                \BCC\Search\Controllers\SearchController::bust_search_cache();
+                // Ranking quality changes when FULLTEXT becomes available (MATCH
+                // AGAINST replaces title-prefix fallback), so any cached results
+                // built pre-install would now rank differently. Bust the search
+                // cache version so stale entries are not served alongside fresh
+                // ones. Runs inside the GET_LOCK region so only the installing
+                // worker does this work; subsequent callers short-circuit on the
+                // v2_installed option and never enter this branch.
+                if (class_exists('\\BCC\\Search\\Controllers\\SearchController')) {
+                    \BCC\Search\Controllers\SearchController::bust_search_cache();
+                }
             }
         } finally {
             $released = $wpdb->get_var("SELECT RELEASE_LOCK('bcc_ft_index')");

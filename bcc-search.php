@@ -125,6 +125,8 @@ add_action('bcc_search_ensure_ft_index', function (): void {
 
 // ── Cache invalidation (must run on every request, not just REST) ────────────
 add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_cache_hooks']);
+// Groups vertical: privacy-driven cache-bust (peepso_group_privacy → secret).
+add_action('init', [\BCC\Search\Controllers\GroupSearchController::class, 'register_cache_hooks']);
 
 // ── System-health filter contribution ────────────────────────────────────────
 // Phase 3 of the post-stabilization observability initiative (2026-05-09).
