@@ -66,4 +66,22 @@ namespace {
             return $map[(int) $userId] ?? false;
         }
     }
+
+    if (!function_exists('get_user_meta')) {
+        /**
+         * Reads from $GLOBALS['__bcc_usermeta'][$userId][$key] — used by the
+         * repository's bcc_handle projection. Empty string (single) / empty
+         * array mirrors WP's missing-meta return shape.
+         *
+         * @return mixed
+         */
+        function get_user_meta(int $userId, string $key = '', bool $single = false)
+        {
+            $map = $GLOBALS['__bcc_usermeta'] ?? [];
+            if (isset($map[$userId][$key])) {
+                return $map[$userId][$key];
+            }
+            return $single ? '' : [];
+        }
+    }
 }

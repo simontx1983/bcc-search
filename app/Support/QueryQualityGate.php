@@ -9,12 +9,12 @@ if (!defined('ABSPATH')) {
 /**
  * Query quality gate — shared junk / low-entropy filter.
  *
- * Extracted so the Users vertical (and any future vertical) applies the
- * exact same rejection rules as the Projects vertical. The existing
- * SearchController keeps its own private copy of this logic untouched
- * per Phase-1 hard requirement ("DO NOT refactor existing project
- * search"); a future consolidation pass can have SearchController
- * delegate here so there is a single source of truth.
+ * Extracted so every vertical applies the exact same rejection rules.
+ * SearchController's Phase-1 private copy was consolidated into this
+ * class (2026-07-19) — this is the single source of truth; do not
+ * reintroduce per-controller gates. Note the controllers also enforce
+ * their own 2..100 length window at the call site (contract §4), so the
+ * length check here is belt-and-braces for direct callers.
  *
  * Rejection rules:
  *   - length < 2 or > 100 chars

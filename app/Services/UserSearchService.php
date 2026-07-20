@@ -2,7 +2,6 @@
 
 namespace BCC\Search\Services;
 
-use BCC\Search\DTO\UserDTO;
 use BCC\Search\Repositories\UserSearchRepository;
 
 if (!defined('ABSPATH')) {
@@ -14,18 +13,18 @@ if (!defined('ABSPATH')) {
  *
  * Orchestrates UserSearchRepository and projects each UserDTO into the
  * public response shape. Lives between repository and controller so
- * URL/avatar resolution (which depends on PeepSo/WP APIs, not DB) is
- * kept out of both layers.
+ * avatar resolution (which depends on PeepSo/WP APIs, not DB) is kept
+ * out of both layers.
  *
  * Response shape returned by search():
  *   [
  *     'results' => [
  *       [
  *         'id' => int,
- *         'username' => string,
+ *         'username' => string,        // §B6 canonical handle
  *         'display_name' => string,
  *         'avatar_url' => string|null,
- *         'profile_url' => string,
+ *         'profile_url' => string,     // relative Next.js route, /u/{handle}
  *       ],
  *       ...
  *     ],
@@ -57,18 +56,24 @@ final class UserSearchService
 
         $results = [];
         foreach ($users as $u) {
+            // §B6 canonical handle, NOT user_login and NOT user_nicename:
+            // this endpoint is public (anonymous callers allowed) and BCC
+            // signup derives both login (`u_<handle>`) and nicename from
+            // the credential name — returning either hands out
+            // credential-stuffing lists AND renders as "@u_<handle>" in
+            // the FE. Nicename remains the fallback for accounts that
+            // predate handles (never the login).
+            $handle = $u->handle !== '' ? $u->handle : $u->userNicename;
             $results[] = [
                 'id'           => $u->id,
-                // user_nicename, NOT user_login: this endpoint is public
-                // (anonymous callers allowed) and user_login is the actual
-                // credential name — returning it hands credential-stuffing
-                // lists to anyone who iterates the endpoint. The nicename
-                // is the URL-safe public handle and renders identically in
-                // the FE's "@{username}" display.
-                'username'     => $u->userNicename,
+                'username'     => $handle,
                 'display_name' => $u->displayName,
                 'avatar_url'   => $this->resolveAvatarUrl($u->id),
-                'profile_url'  => $this->resolveProfileUrl($u),
+                // Relative Next.js member route per contract §4
+                // (`/u/{handle}`) — the previous PeepSoUser-resolved WP
+                // permalink navigated users OFF the headless frontend and
+                // cost a PeepSoUser instantiation per row.
+                'profile_url'  => '/u/' . rawurlencode($handle),
             ];
         }
 
@@ -79,39 +84,6 @@ final class UserSearchService
                 'query' => $query,
             ],
         ];
-    }
-
-    /**
-     * Profile URL resolution, PeepSo-aware.
-     *
-     * Prefers PeepSoUser::get_profileurl() when PeepSo is available
-     * (that's where members actually live on this site). Falls back to
-     * the WP author archive so an install without PeepSo still returns
-     * a functional URL.
-     */
-    private function resolveProfileUrl(UserDTO $u): string
-    {
-        if (class_exists('PeepSoUser')) {
-            try {
-                $pu = \PeepSoUser::get_instance($u->id);
-                // get_instance() is documented to return an instance of
-                // PeepSoUser but older versions have signatures that
-                // PHPStan infers as "class-string|object". Guard with
-                // is_object() so only a genuine instance calls the
-                // method — defeats both the static-analysis complaint
-                // and any real-world oddity where the factory returns
-                // something non-instantiable under a failed lookup.
-                if (is_object($pu) && method_exists($pu, 'get_profileurl')) {
-                    $url = (string) $pu->get_profileurl();
-                    if ($url !== '') {
-                        return esc_url_raw($url);
-                    }
-                }
-            } catch (\Throwable $e) {
-                // Fall through to WP author archive.
-            }
-        }
-        return esc_url_raw(get_author_posts_url($u->id, $u->userNicename));
     }
 
     /**

@@ -98,6 +98,8 @@ final class UserSearchRepository
 
         // Prime the WP user cache once so the per-id get_userdata() below is
         // a single query rather than N. Order is preserved from the search.
+        // cache_users() also primes the usermeta cache, so the per-id
+        // bcc_handle read below is cache-served, not a query.
         cache_users($userIds);
 
         $dtos = [];
@@ -106,11 +108,13 @@ final class UserSearchRepository
             if (!$user instanceof \WP_User) {
                 continue;
             }
+            $handleRaw = get_user_meta($userId, 'bcc_handle', true);
             $dtos[] = new UserDTO(
                 id:           $userId,
                 userLogin:    (string) $user->user_login,
                 userNicename: (string) $user->user_nicename,
                 displayName:  (string) $user->display_name,
+                handle:       is_string($handleRaw) ? $handleRaw : '',
             );
         }
         return $dtos;

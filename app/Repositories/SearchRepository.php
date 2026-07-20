@@ -306,7 +306,18 @@ final class SearchRepository
         // title-prefix LIKE — a MATCH AGAINST without the index is a hard
         // error from MySQL, not a silent scan, but belt-and-braces here
         // keeps the degraded path single-purpose and easy to audit.
-        if (mb_strlen($query) >= 3 && self::isFulltextIndexInstalled()) {
+        //
+        // An FT-eligible query landing on the fallback because the index
+        // is MISSING is a silent quality degradation (title-prefix only,
+        // no content/category-name matching) — surface it as a
+        // DegradationMetric so it shows up in /system/health instead of
+        // only on the wp-admin developer page. Short queries (<3 chars)
+        // legitimately use the fallback and are not recorded.
+        $ftEligible = mb_strlen($query) >= 3;
+        if ($ftEligible && !self::isFulltextIndexInstalled()) {
+            \BCC\Core\Observability\DegradationMetrics::record('search_ft_index', 'title_only_fallback');
+        }
+        if ($ftEligible && self::isFulltextIndexInstalled()) {
             // Strip FULLTEXT boolean operators and keywords to prevent
             // query-semantics injection / relevance manipulation.
             // preg_replace returns null only on regex compile failure, which
