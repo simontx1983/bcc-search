@@ -200,6 +200,13 @@ final class GroupSearchController
             );
         }
 
+        // Analytics: miss-path only (a cache hit returned above).
+        \BCC\Search\Repositories\SearchTermsRepository::record(
+            'groups',
+            mb_strtolower($q),
+            (int) ($response['meta']['count'] ?? 0)
+        );
+
         wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::CACHE_TTL);
 
         return new \WP_REST_Response($response);

@@ -9,6 +9,7 @@ if (!defined('ABSPATH')) {
 use BCC\Core\Security\Throttle;
 use BCC\Core\ServiceLocator;
 use BCC\Search\Repositories\SearchRepository;
+use BCC\Search\Repositories\SearchTermsRepository;
 use BCC\Search\Support\QueryQualityGate;
 
 class SearchController
@@ -557,6 +558,8 @@ class SearchController
 
             if (empty($candidate_rows)) {
                 $response = ['results' => [], 'categories' => $categories];
+                // Zero-result sample — the content-gap signal we most want.
+                SearchTermsRepository::record('projects', mb_strtolower($q), 0);
                 $this->cacheSearchResult($cache_key, $lkg_key, $response);
                 return new \WP_REST_Response($response);
             }
@@ -689,6 +692,12 @@ class SearchController
                 'results'    => $results,
                 'categories' => $categories,
             ];
+
+            // Analytics: rebuild-path only (every cache-serving branch returns
+            // above), so this samples once per (term, type) per cache window —
+            // never on a hot cache hit. Term is the same normalization the
+            // cache fingerprint uses.
+            SearchTermsRepository::record('projects', mb_strtolower($q), count($results));
 
             $this->cacheSearchResult($cache_key, $lkg_key, $response);
 

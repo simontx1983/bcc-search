@@ -72,6 +72,7 @@ register_activation_hook( __FILE__, function () {
     if ( file_exists( $autoloader ) ) {
         require_once $autoloader;
         \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+        \BCC\Search\Repositories\SearchTermsRepository::ensureTable();
     }
 } );
 
@@ -121,6 +122,33 @@ add_action('bcc_search_ensure_ft_index', function (): void {
         return;
     }
     \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+});
+
+// ── Search-analytics table self-heal ────────────────────────────────────────
+// Same activation-bypass recovery as the FT index. ensureTable() is
+// option-guarded + request-memoized, so calling it on init/admin_init is a
+// cheap no-op once the table exists — no dedicated cron needed for install.
+add_action('init', function (): void {
+    \BCC\Search\Repositories\SearchTermsRepository::ensureTable();
+});
+
+// ── Search-analytics retention: daily prune of rows past the window ─────────
+add_action('init', function (): void {
+    if (!wp_next_scheduled('bcc_search_terms_prune')) {
+        // Off-peak-ish, and never on the :00 boundary every install shares.
+        wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', 'bcc_search_terms_prune');
+    }
+});
+add_action('bcc_search_terms_prune', function (): void {
+    \BCC\Search\Repositories\SearchTermsRepository::prune();
+});
+add_filter('bcc_expected_cron_hooks', function (array $hooks): array {
+    $hooks['bcc_search_terms_prune'] = [
+        'interval'    => 'daily',
+        'source'      => 'bcc-search',
+        'description' => 'Search-analytics retention prune (rows older than the retention window)',
+    ];
+    return $hooks;
 });
 
 // ── Cache invalidation (must run on every request, not just REST) ────────────
@@ -236,6 +264,85 @@ add_action('admin_post_bcc_dev_rebuild_ft_index', function (): void {
     }
 
     wp_safe_redirect(add_query_arg($args, admin_url('admin.php')));
+    exit;
+});
+
+// ── Developer panel: search analytics (top terms + zero-result terms) ────────
+// Diagnostic data-inspection for relevance tuning — a developer/config
+// activity, so it lives in wp-admin per the admin-split rule (an operational
+// Next.js /admin view is a future graduation, not v1). Aggregate-only rows,
+// no user linkage.
+add_filter('bcc_developer_panels', function (array $panels): array {
+    $panels['bcc-search:analytics'] = [
+        'title' => 'Search Analytics (bcc-search)',
+        'sort'  => 21,
+        'render' => function (): void {
+            $installed = (bool) get_option('bcc_search_terms_installed');
+            if (!$installed) {
+                echo '<p style="color:#666;">The search-analytics table is not installed yet '
+                    . '(installs on the next front-end/admin request via the self-heal on <code>init</code>).</p>';
+                return;
+            }
+
+            $days = 30;
+            $top  = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, false);
+            $zero = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, true);
+
+            $render_table = static function (string $heading, array $rows, bool $zeroCol): void {
+                printf('<h3 style="margin:14px 0 6px;">%s</h3>', esc_html($heading));
+                if ($rows === []) {
+                    echo '<p style="color:#666;">No rows in the window yet.</p>';
+                    return;
+                }
+                echo '<table class="widefat striped" style="max-width:760px;"><thead><tr>'
+                    . '<th>Term</th><th style="width:110px;">Vertical</th>'
+                    . '<th style="width:90px;">Hits</th>'
+                    . '<th style="width:120px;">' . ($zeroCol ? 'Result count' : 'Max results') . '</th>'
+                    . '<th style="width:170px;">Last seen (UTC)</th></tr></thead><tbody>';
+                foreach ($rows as $r) {
+                    printf(
+                        '<tr><td><code>%s</code></td><td>%s</td><td>%d</td><td>%d</td><td>%s</td></tr>',
+                        esc_html((string) $r['term']),
+                        esc_html((string) $r['vertical']),
+                        (int) $r['hits'],
+                        (int) $r['max_results'],
+                        esc_html((string) $r['last_seen'])
+                    );
+                }
+                echo '</tbody></table>';
+            };
+
+            printf('<p style="color:#666;">Aggregate search samples over the last %d days (sampled on cache rebuilds; no user linkage).</p>', (int) $days);
+            $render_table('Zero-result terms (content gaps)', $zero, true);
+            $render_table('Top terms', $top, false);
+
+            echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:12px;">';
+            echo '<input type="hidden" name="action" value="bcc_dev_prune_search_terms">';
+            wp_nonce_field('bcc_dev_prune_search_terms');
+            echo '<button type="submit" class="button" '
+                . 'onclick="return confirm(\'Prune search-analytics rows past the retention window now?\');">'
+                . 'Prune old rows now</button>';
+            echo '</form>';
+        },
+    ];
+    return $panels;
+});
+
+add_action('admin_post_bcc_dev_prune_search_terms', function (): void {
+    if (!current_user_can('manage_options')) {
+        wp_die(esc_html__('Unauthorized.'));
+    }
+    check_admin_referer('bcc_dev_prune_search_terms');
+
+    $deleted = \BCC\Search\Repositories\SearchTermsRepository::prune();
+    \BCC\Core\Log\Logger::info('[bcc-search] search-analytics prune triggered from Developer page', [
+        'operator' => get_current_user_id(),
+        'deleted'  => $deleted,
+    ]);
+    wp_safe_redirect(add_query_arg(
+        ['page' => 'bcc-developer', 'pruned' => (string) $deleted],
+        admin_url('admin.php')
+    ));
     exit;
 });
 

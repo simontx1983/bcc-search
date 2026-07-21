@@ -156,6 +156,15 @@ final class UserSearchController
             );
         }
 
+        // Analytics: miss-path only (a cache hit returned above), so the
+        // sample rate matches the cache window. Count comes from the service
+        // meta; term uses the same normalization as the cache key.
+        \BCC\Search\Repositories\SearchTermsRepository::record(
+            'users',
+            mb_strtolower($q),
+            (int) ($response['meta']['count'] ?? 0)
+        );
+
         wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::CACHE_TTL);
 
         return new \WP_REST_Response($response);
