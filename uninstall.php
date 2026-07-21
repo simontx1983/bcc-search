@@ -15,6 +15,13 @@ if (!defined('WP_UNINSTALL_PLUGIN')) {
 delete_option('bcc_search_cache_version');
 // Must match the option flag set in SearchRepository::ensureFulltextIndex()
 delete_option('bcc_ft_index_v2_installed');
+// Must match SearchTermsRepository::INSTALLED_OPTION
+delete_option('bcc_search_terms_installed');
+
+// Search-analytics: drop the aggregate table + retire its prune cron.
+// (Autoloader is not loaded during uninstall, so this is inline rather than
+// via SearchTermsRepository::dropTable().)
+wp_clear_scheduled_hook('bcc_search_terms_prune');
 
 // Remove FULLTEXT indexes from wp_posts if they exist.
 // Uses information_schema check instead of DROP INDEX IF EXISTS for MySQL 5.7 compat.
