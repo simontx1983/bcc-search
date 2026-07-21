@@ -54,6 +54,15 @@ final class UserSearchService
         // can apply the viewer-scoped block filter (0 = anonymous).
         $users = UserSearchRepository::search($query, $limit, $viewerId);
 
+        // Resolve every row's avatar in ONE bulk pass rather than per row.
+        // avatarUrl() constructs a PeepSoUser per call on a cache miss (raw
+        // `SELECT * FROM peepso_users` + a file stat); on a cold cache that
+        // was up to `limit` such round trips per keystroke. avatarUrlBulk()
+        // does one wp_cache_get_multiple for the cached entries and only
+        // computes the misses.
+        $userIds = array_map(static fn($u): int => $u->id, $users);
+        $avatars = \BCC\Core\PeepSo\PeepSoMediaCache::avatarUrlBulk($userIds);
+
         $results = [];
         foreach ($users as $u) {
             // §B6 canonical handle, NOT user_login and NOT user_nicename:
@@ -63,12 +72,13 @@ final class UserSearchService
             // credential-stuffing lists AND renders as "@u_<handle>" in
             // the FE. Nicename remains the fallback for accounts that
             // predate handles (never the login).
-            $handle = $u->handle !== '' ? $u->handle : $u->userNicename;
+            $handle    = $u->handle !== '' ? $u->handle : $u->userNicename;
+            $avatarUrl = $avatars[$u->id] ?? '';
             $results[] = [
                 'id'           => $u->id,
                 'username'     => $handle,
                 'display_name' => $u->displayName,
-                'avatar_url'   => $this->resolveAvatarUrl($u->id),
+                'avatar_url'   => $avatarUrl !== '' ? esc_url_raw($avatarUrl) : null,
                 // Relative Next.js member route per contract §4
                 // (`/u/{handle}`) — the previous PeepSoUser-resolved WP
                 // permalink navigated users OFF the headless frontend and
@@ -84,29 +94,5 @@ final class UserSearchService
                 'query' => $query,
             ],
         ];
-    }
-
-    /**
-     * Avatar URL resolution.
-     *
-     * Routes through bcc-core's PeepSoMediaCache — the canonical cached
-     * seam for PeepSo-resolved media URLs (§11; feed, card, and profile
-     * view-models already resolve through it). The previous per-row
-     * get_avatar_url() call went through PeepSo's filter, which
-     * constructs a PeepSoUser per result (raw `SELECT * FROM
-     * peepso_users` + file stat + possible lazy meta write); the cache
-     * removes that on warm hits and is busted on the avatar user-meta
-     * keys with a 1h TTL backstop. PeepSoMediaCache resolves PeepSo's
-     * 'full' variant rather than a sized WP avatar — identical asset on
-     * PeepSo installs (the frontend sizes via CSS) — and falls back to
-     * get_avatar_url() internally when PeepSo is absent.
-     */
-    private function resolveAvatarUrl(int $userId): ?string
-    {
-        $url = \BCC\Core\PeepSo\PeepSoMediaCache::avatarUrl($userId);
-        if ($url === '') {
-            return null;
-        }
-        return esc_url_raw($url);
     }
 }
