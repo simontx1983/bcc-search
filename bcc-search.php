@@ -284,9 +284,9 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 return;
             }
 
-            $days   = 30;
-            $top    = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, false);
-            $zero   = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, true);
+            $top30  = \BCC\Search\Repositories\SearchTermsRepository::topTerms(30, 25, false);
+            $top90  = \BCC\Search\Repositories\SearchTermsRepository::topTerms(90, 25, false);
+            $zero90 = \BCC\Search\Repositories\SearchTermsRepository::topTerms(90, 25, true);
             $rising = \BCC\Search\Repositories\SearchTermsRepository::risingTerms(25);
 
             $render_table = static function (string $heading, array $rows, bool $zeroCol): void {
@@ -337,10 +337,12 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 echo '</tbody></table>';
             };
 
-            printf('<p style="color:#666;">Aggregate search samples over the last %d days (sampled on cache rebuilds; no user linkage).</p>', (int) $days);
+            echo '<p style="color:#666;">Aggregate search samples (sampled on cache rebuilds; no user linkage). '
+                . 'Compare the 30-day and 90-day tables to see short-term shifts against the longer-run picture.</p>';
             $render_rising($rising);
-            $render_table('Zero-result terms (content gaps)', $zero, true);
-            $render_table('Top terms', $top, false);
+            $render_table('Zero-result terms — last 90 days (content gaps)', $zero90, true);
+            $render_table('Top terms — last 30 days', $top30, false);
+            $render_table('Top terms — last 90 days', $top90, false);
 
             echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:12px;">';
             echo '<input type="hidden" name="action" value="bcc_dev_prune_search_terms">';

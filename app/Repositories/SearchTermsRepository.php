@@ -38,8 +38,14 @@ final class SearchTermsRepository
     /** Terms are truncated to this width (matches the column). */
     public const TERM_MAXLEN = 100;
 
-    /** Rows older than this many days are pruned. */
-    public const RETENTION_DAYS = 60;
+    /**
+     * Rows older than this many days are pruned. Kept at 120 so the
+     * 90-day trend view in the admin panel is always backed by a full
+     * window (with ~30 days of headroom before a row ages out). Aggregate
+     * rows are tiny (one per term/vertical/day), so the extra retention is
+     * negligible.
+     */
+    public const RETENTION_DAYS = 120;
 
     /** Prune batch size + per-tick iteration cap (mirrors bcc_core_rl_cleanup). */
     private const PRUNE_BATCH      = 1000;
