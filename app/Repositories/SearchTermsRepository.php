@@ -45,6 +45,11 @@ final class SearchTermsRepository
     private const PRUNE_BATCH      = 1000;
     private const PRUNE_MAX_ITERS  = 10;
 
+    /** "Rising" comparison window (recent vs the immediately prior window). */
+    private const RISING_WINDOW_DAYS = 7;
+    /** Floor on recent hits so week-over-week noise (1→2) can't surface. */
+    private const RISING_MIN_HITS    = 3;
+
     /** Request-scoped memo so a hot path can't re-probe the install each call. */
     private static bool $installChecked = false;
 
@@ -219,6 +224,70 @@ final class SearchTermsRepository
                 'hits'        => (int) ($r['hits'] ?? 0),
                 'max_results' => (int) ($r['max_results'] ?? 0),
                 'last_seen'   => (string) ($r['last_seen'] ?? ''),
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Rising terms — biggest week-over-week increase in hits.
+     *
+     * Compares the most recent RISING_WINDOW_DAYS against the window
+     * immediately before it and ranks by the absolute delta, so a genuine
+     * spike (2 → 90) and a brand-new term (0 → 30) both surface while a
+     * perennial term with only week-over-week jitter (400 → 410) sinks.
+     * Floored at RISING_MIN_HITS recent hits so a 1 → 2 blip can't rank.
+     * The columns (recent / prior / delta) let an operator see WHY a term
+     * is here rather than trusting an opaque score.
+     *
+     * @return list<array{term: string, vertical: string, recent: int, prior: int, delta: int}>
+     */
+    public static function risingTerms(int $limit = 25): array
+    {
+        if (!get_option(self::INSTALLED_OPTION)) {
+            return [];
+        }
+        $limit = max(1, min(200, $limit));
+
+        global $wpdb;
+        $table = self::table();
+
+        $recentStart = gmdate('Y-m-d', time() - (self::RISING_WINDOW_DAYS * DAY_IN_SECONDS));
+        $priorStart  = gmdate('Y-m-d', time() - (2 * self::RISING_WINDOW_DAYS * DAY_IN_SECONDS));
+
+        /** @var list<array<string, string|null>>|null $rows */
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT norm_term, vertical,
+                    SUM(CASE WHEN day >= %s THEN hits ELSE 0 END)                       AS recent,
+                    SUM(CASE WHEN day >= %s AND day < %s THEN hits ELSE 0 END)           AS prior
+               FROM {$table}
+              WHERE day >= %s
+              GROUP BY norm_term, vertical
+             HAVING recent >= %d AND recent > prior
+              ORDER BY (recent - prior) DESC, recent DESC
+              LIMIT %d",
+            $recentStart,
+            $priorStart,
+            $recentStart,
+            $priorStart,
+            self::RISING_MIN_HITS,
+            $limit
+        ), ARRAY_A);
+
+        if (!is_array($rows)) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($rows as $r) {
+            $recent = (int) ($r['recent'] ?? 0);
+            $prior  = (int) ($r['prior'] ?? 0);
+            $out[] = [
+                'term'     => (string) ($r['norm_term'] ?? ''),
+                'vertical' => (string) ($r['vertical'] ?? ''),
+                'recent'   => $recent,
+                'prior'    => $prior,
+                'delta'    => $recent - $prior,
             ];
         }
         return $out;

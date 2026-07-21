@@ -284,9 +284,10 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 return;
             }
 
-            $days = 30;
-            $top  = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, false);
-            $zero = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, true);
+            $days   = 30;
+            $top    = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, false);
+            $zero   = \BCC\Search\Repositories\SearchTermsRepository::topTerms($days, 25, true);
+            $rising = \BCC\Search\Repositories\SearchTermsRepository::risingTerms(25);
 
             $render_table = static function (string $heading, array $rows, bool $zeroCol): void {
                 printf('<h3 style="margin:14px 0 6px;">%s</h3>', esc_html($heading));
@@ -312,7 +313,32 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 echo '</tbody></table>';
             };
 
+            $render_rising = static function (array $rows): void {
+                echo '<h3 style="margin:14px 0 6px;">Rising terms (this week vs last)</h3>';
+                if ($rows === []) {
+                    echo '<p style="color:#666;">Nothing rising yet — needs at least two weeks of samples.</p>';
+                    return;
+                }
+                echo '<table class="widefat striped" style="max-width:760px;"><thead><tr>'
+                    . '<th>Term</th><th style="width:110px;">Vertical</th>'
+                    . '<th style="width:110px;">This week</th>'
+                    . '<th style="width:110px;">Last week</th>'
+                    . '<th style="width:80px;">&Delta;</th></tr></thead><tbody>';
+                foreach ($rows as $r) {
+                    printf(
+                        '<tr><td><code>%s</code></td><td>%s</td><td>%d</td><td>%d</td><td><strong>+%d</strong></td></tr>',
+                        esc_html((string) $r['term']),
+                        esc_html((string) $r['vertical']),
+                        (int) $r['recent'],
+                        (int) $r['prior'],
+                        (int) $r['delta']
+                    );
+                }
+                echo '</tbody></table>';
+            };
+
             printf('<p style="color:#666;">Aggregate search samples over the last %d days (sampled on cache rebuilds; no user linkage).</p>', (int) $days);
+            $render_rising($rising);
             $render_table('Zero-result terms (content gaps)', $zero, true);
             $render_table('Top terms', $top, false);
 

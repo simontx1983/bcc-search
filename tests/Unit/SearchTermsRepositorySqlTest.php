@@ -100,6 +100,27 @@ final class SearchTermsRepositorySqlTest extends TestCase
         self::assertStringContainsString('ORDER BY SUM(hits) DESC', $p['sql']);
     }
 
+    public function testRisingTermsComparesRecentVsPriorWindowAndFiltersNoise(): void
+    {
+        SearchTermsRepository::risingTerms(25);
+
+        $p = $this->lastPrepared();
+        // Two windowed sums (recent vs prior) drive the delta.
+        self::assertStringContainsString('CASE WHEN day >= %s THEN hits', $p['sql']);
+        self::assertStringContainsString('AND day < %s THEN hits', $p['sql']);
+        // Only genuine risers: a recent-hits floor AND recent > prior.
+        self::assertStringContainsString('HAVING recent >= %d AND recent > prior', $p['sql']);
+        // Ranked by the week-over-week increase.
+        self::assertStringContainsString('ORDER BY (recent - prior) DESC', $p['sql']);
+    }
+
+    public function testRisingTermsIsNoOpWhenTableNotInstalled(): void
+    {
+        $GLOBALS['__bcc_terms_opts'] = [];
+        self::assertSame([], SearchTermsRepository::risingTerms(25));
+        self::assertSame([], $this->wpdb->prepared);
+    }
+
     public function testPruneBoundsByRetentionWindowAndBatchLimit(): void
     {
         SearchTermsRepository::prune();
