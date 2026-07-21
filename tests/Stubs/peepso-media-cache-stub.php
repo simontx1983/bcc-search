@@ -24,5 +24,21 @@ if (!class_exists(__NAMESPACE__ . '\\PeepSoMediaCache', false)) {
         {
             return 'https://avatars.test/' . $userId;
         }
+
+        /**
+         * @param list<int> $userIds
+         * @return array<int, string>
+         */
+        public static function avatarUrlBulk(array $userIds): array
+        {
+            $out = [];
+            foreach ($userIds as $id) {
+                $id = (int) $id;
+                if ($id > 0) {
+                    $out[$id] = 'https://avatars.test/' . $id;
+                }
+            }
+            return $out;
+        }
     }
 }
