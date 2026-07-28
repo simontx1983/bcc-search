@@ -21,7 +21,7 @@
  *   (`BCC\Trust\Core\REST\CardsSearchEndpoint`), which is a thin §A2
  *   view-model adapter that calls back into this plugin via
  *   `rest_do_request('/bcc/v1/search')`. That wrapper translates
- *   `category_slug` → `card_kind`, `reputation_tier` → `card_tier`,
+ *   `category_slug` → `card_kind`, tier labels resolved server-side,
  *   and the WordPress permalink → the headless route prefix
  *   (`/v/`, `/p/`, `/c/`) so the frontend never sees ineligible
  *   identifiers.
