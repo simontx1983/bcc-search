@@ -6,12 +6,11 @@
  * GroupSearchServiceTest) so the main PHPUnit process never sees this
  * fake definition of GroupSearchRepository.
  *
- * The fake is defined at the exact production FQN with a class_exists()
- * guard, so when the real GroupSearchService is required below its
- * `use BCC\Search\Repositories\GroupSearchRepository` binds to this fake
- * (the autoloader never loads the real repository in the subprocess).
- * This lets us drive GroupSearchService::search() with fixture GroupDTOs
- * and assert the projected group_url shape without touching the DB.
+ * Same isolation pattern as user-search-repo-stub.php: the fake is
+ * defined at the exact production FQN with a class_exists() guard, so
+ * when the real GroupSearchService is required below its
+ * `use BCC\Search\Repositories\GroupSearchRepository` binds to this
+ * fake and the service projects fixture DTOs without touching the DB.
  */
 
 declare(strict_types=1);
@@ -28,7 +27,7 @@ namespace BCC\Search\Repositories {
             public static ?int $lastLimit = null;
 
             /** @return list<\BCC\Search\DTO\GroupDTO> */
-            public static function search(string $query, int $limit = 20): array
+            public static function search(string $query, int $limit): array
             {
                 self::$lastQuery = $query;
                 self::$lastLimit = $limit;

@@ -100,8 +100,45 @@ final class GroupSearchRepositorySqlTest extends TestCase
         // to a no-op that returns every secret group.
         self::assertContains(2, $this->wpdb->lastArgs, 'PRIVACY_SECRET (2) must be a bound arg');
         self::assertContains('peepso_group_privacy', $this->wpdb->lastArgs);
+        self::assertContains('_bcc_group_kind', $this->wpdb->lastArgs);
         self::assertContains('peepso-group', $this->wpdb->lastArgs);
         self::assertContains('publish', $this->wpdb->lastArgs);
+    }
+
+    public function testSubstringMatchWithPrefixFirstRankingAndKindJoin(): void
+    {
+        $this->wpdb->rows = [];
+
+        GroupSearchRepository::search('dev', 20);
+
+        $sql = (string) $this->wpdb->lastQuery;
+
+        // v1.70: substring WHERE + prefix-first ORDER BY (two separate
+        // LIKE bindings) — prefix-only matching made "hall" unable to
+        // find "Cosmos Hall".
+        self::assertStringContainsString('AND p.post_title LIKE %s', $sql);
+        self::assertStringContainsString(
+            'ORDER BY (p.post_title LIKE %s) DESC, p.post_title ASC',
+            $sql,
+        );
+        self::assertContains('%dev%', $this->wpdb->lastArgs, 'substring pattern must be bound');
+        self::assertContains('dev%', $this->wpdb->lastArgs, 'prefix pattern must be bound for ranking');
+
+        // v1.70: kind arrives batched through the third LEFT JOIN — the
+        // service must never fall back to per-row get_post_meta.
+        self::assertStringContainsString('pm_kind.meta_value AS group_kind_raw', $sql);
+    }
+
+    public function testEscLikeNeutralizesWildcardsBeforeWrapping(): void
+    {
+        $this->wpdb->rows = [];
+
+        GroupSearchRepository::search('50%_x', 20);
+
+        // addcslashes('50%_x', '_%\\') === '50\%\_x' — a literal % or _
+        // in the query must match itself, never widen the scan.
+        self::assertContains('%50\\%\\_x%', $this->wpdb->lastArgs);
+        self::assertContains('50\\%\\_x%', $this->wpdb->lastArgs);
     }
 
     public function testLimitIsClampedToMax(): void
@@ -125,16 +162,26 @@ final class GroupSearchRepositorySqlTest extends TestCase
     {
         $this->wpdb->rows = [
             [
-                'ID'           => 5,
-                'post_title'   => 'Alpha Crew',
-                'post_name'    => 'alpha-crew',
-                'post_excerpt' => str_repeat('x', 200),
-                'avatar_hash'  => 'abc123',
+                'ID'             => 5,
+                'post_title'     => 'Alpha Crew',
+                'post_name'      => 'alpha-crew',
+                'post_excerpt'   => str_repeat('x', 200),
+                'avatar_hash'    => 'abc123',
+                'group_kind_raw' => 'hall',
             ],
             [
-                'ID'           => 6,
-                'post_title'   => 'Beta Crew',
-                'post_name'    => 'beta-crew',
+                'ID'             => 6,
+                'post_title'     => 'Beta Crew',
+                'post_name'      => 'beta-crew',
+                'post_excerpt'   => '',
+                'avatar_hash'    => '',
+                'group_kind_raw' => '',
+            ],
+            [
+                // No group_kind_raw key at all (meta row absent).
+                'ID'           => 7,
+                'post_title'   => 'Gamma Crew',
+                'post_name'    => 'gamma-crew',
                 'post_excerpt' => '',
                 'avatar_hash'  => '',
             ],
@@ -142,21 +189,25 @@ final class GroupSearchRepositorySqlTest extends TestCase
 
         $dtos = GroupSearchRepository::search('a', 20);
 
-        self::assertCount(2, $dtos);
+        self::assertCount(3, $dtos);
         self::assertInstanceOf(GroupDTO::class, $dtos[0]);
         self::assertSame(5, $dtos[0]->id);
         self::assertSame('Alpha Crew', $dtos[0]->name);
         self::assertSame('alpha-crew', $dtos[0]->slug);
         self::assertSame('abc123', $dtos[0]->avatarHash);
+        self::assertSame('hall', $dtos[0]->kindRaw);
 
         // 160-char clamp: 157 kept + ellipsis = 158 chars.
         self::assertNotNull($dtos[0]->description);
         self::assertSame(158, mb_strlen($dtos[0]->description));
         self::assertStringEndsWith('…', $dtos[0]->description);
 
-        // Empty excerpt → null description; empty avatar hash → null.
+        // Empty excerpt → null description; empty avatar hash → null;
+        // empty or absent kind meta → null kindRaw.
         self::assertNull($dtos[1]->description);
         self::assertNull($dtos[1]->avatarHash);
+        self::assertNull($dtos[1]->kindRaw);
+        self::assertNull($dtos[2]->kindRaw);
     }
 
     public function testThrowsOnRowMissingId(): void
