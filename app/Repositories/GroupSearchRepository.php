@@ -16,21 +16,28 @@ if (!defined('ABSPATH')) {
  *
  * **Performance discipline** — deliberately narrower than the projects
  * search:
- *   - title-prefix LIKE only ('q%'), index-eligible on wp_posts
- *     (post_type, post_status, post_title).
+ *   - title-substring LIKE ('%q%'), prefix matches ranked first
+ *     (v1.70 — prefix-only made "hall" unable to find "Cosmos Hall").
+ *     The leading wildcard is not index-eligible, but the scan is
+ *     bounded by the post_type+post_status filter over a tiny
+ *     cardinality: published peepso-group rows number in the dozens
+ *     (prod is pre-launch). REVISIT if the site ever holds >5k
+ *     groups — at that point this vertical needs a dedicated token
+ *     index, not a wider LIKE.
  *   - NO FULLTEXT path. The projects FT index covers all post types,
  *     so we COULD reuse it with WHERE post_type='peepso-group', but
  *     FT scoring runs on every matching row BEFORE the post_type
  *     filter, which makes group-specific matches expensive when the
- *     site has many non-group posts. Title prefix is the right tool
- *     for group name discovery and stays bounded.
+ *     site has many non-group posts.
  *   - NO content match. The request allowed description "optional,
  *     limited" — we return the post_excerpt (short, already stored)
  *     but don't search against it. Searching post_content for groups
  *     isn't worth the table-scan risk when ft index isn't a good fit.
  *   - Hard LIMIT 20 default, 50 max.
- *   - Avatar hash joined with a single LEFT JOIN on postmeta (same
- *     meta_key pattern as projects).
+ *   - Avatar hash + `_bcc_group_kind` each joined with a single LEFT
+ *     JOIN on postmeta (same meta_key pattern as projects) — kind
+ *     arrives batched in the one query, never via per-row
+ *     get_post_meta.
  */
 final class GroupSearchRepository
 {
@@ -64,12 +71,13 @@ final class GroupSearchRepository
     }
 
     /**
-     * Prefix-match search over published PeepSo groups.
+     * Substring search over published PeepSo groups, prefix-ranked.
      *
      * Query shape:
      *
      *     SELECT p.ID, p.post_title, p.post_name, p.post_excerpt,
-     *            pm_av.meta_value AS avatar_hash
+     *            pm_av.meta_value AS avatar_hash,
+     *            pm_kind.meta_value AS group_kind_raw
      *     FROM   wp_posts p
      *     LEFT JOIN wp_postmeta pm_av
      *              ON pm_av.post_id = p.ID
@@ -77,12 +85,15 @@ final class GroupSearchRepository
      *     LEFT JOIN wp_postmeta pm_priv
      *              ON pm_priv.post_id = p.ID
      *             AND pm_priv.meta_key = 'peepso_group_privacy'
+     *     LEFT JOIN wp_postmeta pm_kind
+     *              ON pm_kind.post_id = p.ID
+     *             AND pm_kind.meta_key = '_bcc_group_kind'
      *     WHERE  p.post_type   = 'peepso-group'
      *       AND  p.post_status = 'publish'
      *       AND  (pm_priv.meta_value IS NULL
      *             OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)  -- hide secret
-     *       AND  p.post_title LIKE 'q%'
-     *     ORDER BY p.post_title ASC
+     *       AND  p.post_title LIKE '%q%'
+     *     ORDER BY (p.post_title LIKE 'q%') DESC, p.post_title ASC
      *     LIMIT %d
      *
      * @return list<GroupDTO>
@@ -98,10 +109,14 @@ final class GroupSearchRepository
 
         global $wpdb;
 
-        $prefix = $wpdb->esc_like($query) . '%';
+        // esc_like BEFORE wrapping in wildcards — a literal % or _ in
+        // the query must match itself, never widen the scan.
+        $substring = '%' . $wpdb->esc_like($query) . '%';
+        $prefix    = $wpdb->esc_like($query) . '%';
 
         $sql = $wpdb->prepare(
-            'SELECT ' . self::COLUMNS . ', pm_av.meta_value AS avatar_hash
+            'SELECT ' . self::COLUMNS . ', pm_av.meta_value AS avatar_hash,
+                    pm_kind.meta_value AS group_kind_raw
              FROM ' . $wpdb->posts . ' p
              LEFT JOIN ' . $wpdb->postmeta . ' pm_av
                     ON pm_av.post_id = p.ID
@@ -109,18 +124,23 @@ final class GroupSearchRepository
              LEFT JOIN ' . $wpdb->postmeta . ' pm_priv
                     ON pm_priv.post_id = p.ID
                    AND pm_priv.meta_key = %s
+             LEFT JOIN ' . $wpdb->postmeta . ' pm_kind
+                    ON pm_kind.post_id = p.ID
+                   AND pm_kind.meta_key = %s
              WHERE p.post_type = %s
                AND p.post_status = %s
                AND (pm_priv.meta_value IS NULL
                     OR CAST(pm_priv.meta_value AS UNSIGNED) <> %d)
                AND p.post_title LIKE %s
-             ORDER BY p.post_title ASC
+             ORDER BY (p.post_title LIKE %s) DESC, p.post_title ASC
              LIMIT %d',
             'peepso_group_avatar_hash',
             'peepso_group_privacy',
+            '_bcc_group_kind',
             self::GROUP_POST_TYPE,
             'publish',
             self::PRIVACY_SECRET,
+            $substring,
             $prefix,
             $limit
         );
@@ -159,12 +179,20 @@ final class GroupSearchRepository
                 ? (string) $row['avatar_hash']
                 : null;
 
+            // Raw `_bcc_group_kind` meta ('hall' / 'holders' /
+            // 'delegators' / 'system'); absent or empty → null, which
+            // the service maps to the public 'user' kind.
+            $kindRaw = isset($row['group_kind_raw']) && $row['group_kind_raw'] !== ''
+                ? (string) $row['group_kind_raw']
+                : null;
+
             $dtos[] = new GroupDTO(
                 id:          (int) $id,
                 name:        (string) $row['post_title'],
                 slug:        (string) $row['post_name'],
                 avatarHash:  $hash,
                 description: $desc,
+                kindRaw:     $kindRaw,
             );
         }
         return $dtos;

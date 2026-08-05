@@ -26,7 +26,9 @@ if (!defined('ABSPATH')) {
  *         'slug' => string,
  *         'description' => string|null,
  *         'avatar_url' => string|null,
- *         'group_url' => string,   // relative Next.js community route: /communities/{slug}
+ *         'group_url' => string,   // relative in-app route (v1.70)
+ *         'kind' => string,        // hall|nft|validator|system|user (v1.70)
+ *         'kind_label' => string,  // pre-rendered §A2 kicker (v1.70)
  *       ],
  *       ...
  *     ],
@@ -39,12 +41,47 @@ final class GroupSearchService
     public const MAX_LIMIT     = 50;
 
     /**
-     * group_url is a RELATIVE Next.js community route (/communities/{slug}) —
-     * never an absolute WP/PeepSo URL. The FE's toInternalHref requires an
-     * in-app path (an absolute URL would navigate users off the headless
-     * app), and /communities/[slug] renders every group kind (halls too),
-     * so search — which projects no type — always uses the community route.
+     * Raw `_bcc_group_kind` post-meta → public community-kind
+     * vocabulary (contract §3.2.4 / §4.9 groups vertical).
      *
+     * DELIBERATE LOCKSTEP DUPLICATE of bcc-trust
+     * `GroupContextResolver::resolveType()` — bcc-search depends only
+     * on bcc-core and can never import bcc-trust, so the map is
+     * duplicated here exactly like the page_type→prefix map in
+     * SearchController (see its header comment). The route the kind
+     * selects mirrors `CardUrlMap::groupUrl` (HALL_URL_PREFIX /
+     * COMMUNITY_URL_PREFIX — the locked owner of group routing since
+     * the v1.68 canonicalization). Changing a kind means updating BOTH
+     * sites in lockstep.
+     *
+     * Absent/unknown raw values resolve to 'user' (member-created
+     * community) — same default as GroupContextResolver.
+     */
+    private const KIND_RAW_TO_PUBLIC = [
+        'hall'       => 'hall',
+        'holders'    => 'nft',
+        'delegators' => 'validator',
+        'system'     => 'system',
+    ];
+
+    /**
+     * Public kind → pre-rendered display label.
+     *
+     * DELIBERATE LOCKSTEP DUPLICATE of bcc-trust
+     * `CardViewService::COMMUNITY_KICKER_BY_TYPE` (the §3.2.4 kicker
+     * vocabulary). Emitted server-side so the frontend renders the
+     * word verbatim and never maps kind→copy itself (§A2) — the same
+     * reason community cards ship `kicker` rather than a type slug.
+     */
+    private const KIND_LABEL = [
+        'hall'      => 'CHAIN HALL',
+        'nft'       => 'HOLDER COMMUNITY',
+        'validator' => 'DELEGATOR COMMUNITY',
+        'system'    => 'SYSTEM COMMUNITY',
+        'user'      => 'COMMUNITY',
+    ];
+
+    /**
      * @return array{
      *   results: list<array{
      *     id:int,
@@ -52,7 +89,9 @@ final class GroupSearchService
      *     slug:string,
      *     description:string|null,
      *     avatar_url:string|null,
-     *     group_url:string
+     *     group_url:string,
+     *     kind:string,
+     *     kind_label:string
      *   }>,
      *   meta: array{count:int, query:string}
      * }
@@ -71,13 +110,18 @@ final class GroupSearchService
 
         $results = [];
         foreach ($groups as $g) {
+            $raw  = $g->kindRaw ?? '';
+            $kind = self::KIND_RAW_TO_PUBLIC[$raw] ?? 'user';
+
             $results[] = [
                 'id'          => $g->id,
                 'name'        => $g->name,
                 'slug'        => $g->slug,
                 'description' => $g->description,
                 'avatar_url'  => $this->resolveAvatarUrl($g, $peepso),
-                'group_url'   => $this->resolveGroupUrl($g),
+                'group_url'   => $this->resolveGroupUrl($g, $kind),
+                'kind'        => $kind,
+                'kind_label'  => self::KIND_LABEL[$kind],
             ];
         }
 
@@ -92,6 +136,10 @@ final class GroupSearchService
 
     /**
      * Resolve the PeepSo group-asset base paths once per request.
+     *
+     * Avatar-only since v1.70 — group_url no longer touches PeepSo
+     * (the old `url_base` member fed the retired absolute-permalink
+     * URL path).
      *
      * @return array{uri: string, default_avatar: string|null}
      */
@@ -122,15 +170,37 @@ final class GroupSearchService
         return $out;
     }
 
-    private function resolveGroupUrl(GroupDTO $g): string
+    /**
+     * Group URL resolution — relative in-app route, kind-aware (v1.70).
+     *
+     * `hall` → /halls/{slug} (the hall-flavored surface); every other
+     * kind → /communities/{slug} (the canonical cross-kind detail).
+     * This is `CardUrlMap::groupUrl`'s exact mapping (bcc-trust — the
+     * locked owner of group routing since the v1.68 canonicalization),
+     * mirrored here in lockstep because bcc-search cannot import
+     * bcc-trust. It supersedes the v1.68-era flat '/communities/{slug}'
+     * this method briefly emitted — that shape existed only because the
+     * vertical projected no kind; it now does.
+     *
+     * RELATIVE by contract — the previous absolute WP-origin permalink
+     * implementation (PeepSo page-root / get_permalink / home_url) was
+     * the THIRD occurrence of the off-app-navigation defect class
+     * (v1.46 users, v1.47 projects). Do not reintroduce an absolute
+     * branch here.
+     *
+     * Empty slug (shouldn't occur on published posts) → the
+     * /communities list route rather than a broken detail link.
+     */
+    private function resolveGroupUrl(GroupDTO $g, string $publicKind): string
     {
-        // Canonical Next.js community route. RELATIVE by contract — the FE's
-        // toInternalHref requires an in-app path (an absolute WP/PeepSo URL
-        // would navigate off the headless app). Cross-kind: /communities/[slug]
-        // renders every group kind, halls included, so search — which has no
-        // type projected — always uses the community route (not /halls/).
-        // Mirrors bcc-trust CardUrlMap::COMMUNITY_URL_PREFIX (cross-plugin).
-        return '/communities/' . ltrim($g->slug, '/');
+        $slug = ltrim($g->slug, '/');
+        if ($slug === '') {
+            return '/communities';
+        }
+        $slug = rawurlencode($slug);
+        return $publicKind === 'hall'
+            ? '/halls/' . $slug
+            : '/communities/' . $slug;
     }
 
     /**

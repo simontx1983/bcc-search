@@ -37,30 +37,54 @@ final class GroupSearchController
     private const RATE_WINDOW    = 5;
 
     /**
-     * Generation counter folded into the cache key. Bumped only on a
-     * group-visibility change (peepso_group_privacy) so a group flipped
-     * to secret can't be served from a pre-flip cache entry. The group
-     * vertical has no version key / LKG of its own, so this is the whole
-     * invalidation mechanism (beyond the 45s TTL).
+     * Generation counter folded into the cache key. Bumped on any
+     * change that alters what this vertical serves: group visibility
+     * (peepso_group_privacy), group kind (_bcc_group_kind — v1.70, it
+     * now determines the emitted route + label), and group create /
+     * rename / trash / delete (save_post — v1.70; previously a renamed
+     * or new community lagged behind the 45s TTL, an asymmetry vs the
+     * pages vertical which busts on save). The group vertical has no
+     * version key / LKG of its own, so this is the whole invalidation
+     * mechanism (beyond the 45s TTL).
      */
     private const GEN_KEY = 'bcc_group_search_generation';
 
     /**
-     * Register the privacy-driven cache-bust hooks. Wired on `init` from
-     * bcc-search.php (like SearchController's) so it fires on admin/AJAX
-     * saves, not only REST requests. Guarded on the one meta key that
-     * changes a group's visibility.
+     * Meta keys that change what the groups vertical serves. Privacy
+     * flips visibility; kind (v1.70) flips the emitted group_url +
+     * kind_label.
+     */
+    private const BUST_META_KEYS = ['peepso_group_privacy', '_bcc_group_kind'];
+
+    /**
+     * Register the cache-bust hooks. Wired on `init` from
+     * bcc-search.php (like SearchController's) so it fires on
+     * admin/AJAX saves, not only REST requests. Guarded on the meta
+     * keys / post type that affect this vertical.
      */
     public static function register_cache_hooks(): void
     {
         $bump = static function ($meta_id, $post_id, string $meta_key): void {
-            if ($meta_key === 'peepso_group_privacy') {
+            if (in_array($meta_key, self::BUST_META_KEYS, true)) {
                 self::bustGeneration();
             }
         };
         add_action('added_post_meta', $bump, 10, 3);
         add_action('updated_post_meta', $bump, 10, 3);
         add_action('deleted_post_meta', $bump, 10, 3);
+
+        // Create / rename land here (post-type-specific save hook needs
+        // no guard); trash / delete fire for every post type, so guard.
+        add_action('save_post_peepso-group', static function (): void {
+            self::bustGeneration();
+        });
+        $bumpOnGone = static function (int $post_id): void {
+            if (get_post_type($post_id) === 'peepso-group') {
+                self::bustGeneration();
+            }
+        };
+        add_action('trashed_post', $bumpOnGone);
+        add_action('deleted_post', $bumpOnGone);
     }
 
     /** Advance the generation (coalesced to one write per request via shutdown). */
