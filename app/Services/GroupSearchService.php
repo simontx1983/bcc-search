@@ -26,7 +26,7 @@ if (!defined('ABSPATH')) {
  *         'slug' => string,
  *         'description' => string|null,
  *         'avatar_url' => string|null,
- *         'group_url' => string,
+ *         'group_url' => string,   // relative Next.js community route: /communities/{slug}
  *       ],
  *       ...
  *     ],
@@ -39,6 +39,12 @@ final class GroupSearchService
     public const MAX_LIMIT     = 50;
 
     /**
+     * group_url is a RELATIVE Next.js community route (/communities/{slug}) —
+     * never an absolute WP/PeepSo URL. The FE's toInternalHref requires an
+     * in-app path (an absolute URL would navigate users off the headless
+     * app), and /communities/[slug] renders every group kind (halls too),
+     * so search — which projects no type — always uses the community route.
+     *
      * @return array{
      *   results: list<array{
      *     id:int,
@@ -71,7 +77,7 @@ final class GroupSearchService
                 'slug'        => $g->slug,
                 'description' => $g->description,
                 'avatar_url'  => $this->resolveAvatarUrl($g, $peepso),
-                'group_url'   => $this->resolveGroupUrl($g, $peepso),
+                'group_url'   => $this->resolveGroupUrl($g),
             ];
         }
 
@@ -87,20 +93,17 @@ final class GroupSearchService
     /**
      * Resolve the PeepSo group-asset base paths once per request.
      *
-     * @return array{url_base: string|null, uri: string, default_avatar: string|null}
+     * @return array{uri: string, default_avatar: string|null}
      */
     private function peepsoGroupAssets(): array
     {
-        $out = ['url_base' => null, 'uri' => '', 'default_avatar' => null];
+        $out = ['uri' => '', 'default_avatar' => null];
 
         if (!class_exists('PeepSo')) {
             return $out;
         }
 
         try {
-            $base = \PeepSo::get_page('groups');
-            $out['url_base'] = is_string($base) && $base !== '' ? trailingslashit($base) : null;
-
             $uri = \PeepSo::get_peepso_uri();
             $out['uri'] = is_string($uri) ? $uri : '';
 
@@ -119,26 +122,15 @@ final class GroupSearchService
         return $out;
     }
 
-    /**
-     * Group URL resolution, PeepSo-aware.
-     *
-     * Prefers the PeepSo groups page-root + slug pattern (matches
-     * where members actually live on this site). Falls back to WP
-     * get_permalink for installs without PeepSo, or when the groups
-     * page-root isn't configured.
-     *
-     * @param array{url_base: string|null, uri: string, default_avatar: string|null} $peepso
-     */
-    private function resolveGroupUrl(GroupDTO $g, array $peepso): string
+    private function resolveGroupUrl(GroupDTO $g): string
     {
-        if ($peepso['url_base'] !== null && $g->slug !== '') {
-            return esc_url_raw($peepso['url_base'] . $g->slug . '/');
-        }
-        $permalink = get_permalink($g->id);
-        if (is_string($permalink) && $permalink !== '') {
-            return esc_url_raw($permalink);
-        }
-        return esc_url_raw(home_url('/groups/' . $g->slug . '/'));
+        // Canonical Next.js community route. RELATIVE by contract — the FE's
+        // toInternalHref requires an in-app path (an absolute WP/PeepSo URL
+        // would navigate off the headless app). Cross-kind: /communities/[slug]
+        // renders every group kind, halls included, so search — which has no
+        // type projected — always uses the community route (not /halls/).
+        // Mirrors bcc-trust CardUrlMap::COMMUNITY_URL_PREFIX (cross-plugin).
+        return '/communities/' . ltrim($g->slug, '/');
     }
 
     /**
@@ -149,7 +141,7 @@ final class GroupSearchService
      * available). Returns null when no avatar can be resolved — the
      * frontend shows the empty-avatar placeholder for null.
      *
-     * @param array{url_base: string|null, uri: string, default_avatar: string|null} $peepso
+     * @param array{uri: string, default_avatar: string|null} $peepso
      */
     private function resolveAvatarUrl(GroupDTO $g, array $peepso): ?string
     {
