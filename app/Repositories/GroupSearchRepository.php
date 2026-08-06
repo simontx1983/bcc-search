@@ -153,11 +153,23 @@ final class GroupSearchRepository
         }
 
         $dtos = [];
+        $seen = [];
         foreach ($rows as $row) {
             $id = $row['ID'] ?? null;
             if (!is_numeric($id)) {
                 throw new \LogicException('GroupSearchRepository::search: missing/invalid ID');
             }
+
+            // De-dup: the three LEFT JOINs fan out to N rows per group
+            // if any joined meta key ever holds multiple rows (importer
+            // artifacts, add_post_meta non-unique). The pages vertical
+            // guards the same hazard with DISTINCT; duplicate DTOs here
+            // become duplicate React keys and wasted quota slots
+            // downstream.
+            if (isset($seen[(int) $id])) {
+                continue;
+            }
+            $seen[(int) $id] = true;
             if (!isset($row['post_title'], $row['post_name'])) {
                 throw new \LogicException('GroupSearchRepository::search: missing projected column');
             }
