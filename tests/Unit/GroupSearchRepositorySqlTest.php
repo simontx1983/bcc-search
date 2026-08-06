@@ -210,6 +210,48 @@ final class GroupSearchRepositorySqlTest extends TestCase
         self::assertNull($dtos[2]->kindRaw);
     }
 
+    public function testDuplicateJoinFanoutRowsCollapseToOneDto(): void
+    {
+        // Postmeta LEFT-JOIN fan-out: a group with two rows of any
+        // joined meta key produces N result rows for one ID — the
+        // hydration loop must collapse them (first row wins) so
+        // duplicate DTOs never become duplicate React keys downstream.
+        $this->wpdb->rows = [
+            [
+                'ID'             => 5,
+                'post_title'     => 'Alpha Crew',
+                'post_name'      => 'alpha-crew',
+                'post_excerpt'   => '',
+                'avatar_hash'    => 'hash-a',
+                'group_kind_raw' => 'hall',
+            ],
+            [
+                'ID'             => 5,
+                'post_title'     => 'Alpha Crew',
+                'post_name'      => 'alpha-crew',
+                'post_excerpt'   => '',
+                'avatar_hash'    => 'hash-b',
+                'group_kind_raw' => 'hall',
+            ],
+            [
+                'ID'             => 6,
+                'post_title'     => 'Beta Crew',
+                'post_name'      => 'beta-crew',
+                'post_excerpt'   => '',
+                'avatar_hash'    => '',
+                'group_kind_raw' => '',
+            ],
+        ];
+
+        $dtos = GroupSearchRepository::search('a', 20);
+
+        self::assertCount(2, $dtos);
+        self::assertSame(5, $dtos[0]->id);
+        self::assertSame('hash-a', $dtos[0]->avatarHash, 'first row wins');
+        self::assertSame('hall', $dtos[0]->kindRaw);
+        self::assertSame(6, $dtos[1]->id);
+    }
+
     public function testThrowsOnRowMissingId(): void
     {
         $this->wpdb->rows = [
