@@ -31,6 +31,7 @@ class ComposerStaticInit0180abac37f97f9f4f92c3f8cc3b3409
         'BCC\\Search\\DTO\\UserDTO' => __DIR__ . '/../..' . '/app/DTO/UserDTO.php',
         'BCC\\Search\\Repositories\\GroupSearchRepository' => __DIR__ . '/../..' . '/app/Repositories/GroupSearchRepository.php',
         'BCC\\Search\\Repositories\\SearchRepository' => __DIR__ . '/../..' . '/app/Repositories/SearchRepository.php',
+        'BCC\\Search\\Repositories\\SearchTermsRepository' => __DIR__ . '/../..' . '/app/Repositories/SearchTermsRepository.php',
         'BCC\\Search\\Repositories\\UserSearchRepository' => __DIR__ . '/../..' . '/app/Repositories/UserSearchRepository.php',
         'BCC\\Search\\Services\\GroupSearchService' => __DIR__ . '/../..' . '/app/Services/GroupSearchService.php',
         'BCC\\Search\\Services\\UserSearchService' => __DIR__ . '/../..' . '/app/Services/UserSearchService.php',

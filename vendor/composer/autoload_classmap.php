@@ -16,6 +16,7 @@ return array(
     'BCC\\Search\\DTO\\UserDTO' => $baseDir . '/app/DTO/UserDTO.php',
     'BCC\\Search\\Repositories\\GroupSearchRepository' => $baseDir . '/app/Repositories/GroupSearchRepository.php',
     'BCC\\Search\\Repositories\\SearchRepository' => $baseDir . '/app/Repositories/SearchRepository.php',
+    'BCC\\Search\\Repositories\\SearchTermsRepository' => $baseDir . '/app/Repositories/SearchTermsRepository.php',
     'BCC\\Search\\Repositories\\UserSearchRepository' => $baseDir . '/app/Repositories/UserSearchRepository.php',
     'BCC\\Search\\Services\\GroupSearchService' => $baseDir . '/app/Services/GroupSearchService.php',
     'BCC\\Search\\Services\\UserSearchService' => $baseDir . '/app/Services/UserSearchService.php',
