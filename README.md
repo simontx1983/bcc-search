@@ -1,38 +1,27 @@
 # Blue Collar Crypto – Search
 
-Live search bar for PeepSo project pages, filterable by type (Validators, Builders, NFT Creators). Results show the project avatar, name, category badge, and trust score coloured by reputation tier.
+Headless search engine for the BCC platform: REST-only, no rendered UI. (The
+plugin once shipped a `[bcc_search]` shortcode + frontend assets; those were
+removed in the 2026-05-03 headless cleanup — the Next.js app in
+`bcc-frontend/` is the only renderer.) Serves PeepSo project pages, users,
+and groups, filterable by type, with trust scores coloured by reputation
+tier.
 
-Results are fetched via the REST endpoint `GET /wp-json/bcc/v1/search?q=&type=`.
+Three public routes, all under `/wp-json/bcc/v1` (registered in
+`app/Controllers/{Search,UserSearch,GroupSearch}Controller.php`; response
+shapes in the umbrella `docs/api-contract-v1.md`):
 
----
-
-## Shortcodes
-
-### `[bcc_search]`
-
-Embeds the live search bar with an optional type dropdown. Keyboard navigable — use `↑` `↓` to move through results, `Enter` to navigate, `Escape` to close.
-
-**Attributes**
-
-| Attribute | Default | Description |
+| Route | Purpose | Params |
 |---|---|---|
-| `placeholder` | `Search projects…` | Placeholder text shown inside the input field. |
-| `show_type` | `1` | Set to `0` to hide the type filter dropdown and show a plain text input only. |
-
-**Examples**
-
-```
-[bcc_search]
-[bcc_search placeholder="Find a validator…"]
-[bcc_search show_type="0"]
-[bcc_search placeholder="Search builders…" show_type="1"]
-```
+| `GET /search` | Project/page search (claim-verified ranking, lookalike demotion) | `q` (required), `type` (category slug, optional) |
+| `GET /search/users` | User search — routed through the PeepSo privacy filter set (fail-closed; anonymous privacy leak fixed 2026-07-09, bcc-search #4) | `q` (required), `limit` (optional) |
+| `GET /search/groups` | Group search (secret/closed groups excluded) | `q` (required), `limit` (optional) |
 
 ---
 
-## REST API
+## REST API — `GET /search` detail
 
-The search bar uses a public REST endpoint. You can query it directly:
+You can query it directly:
 
 ```
 GET /wp-json/bcc/v1/search?q=bitcoin&type=validators
