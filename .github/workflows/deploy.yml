@@ -81,6 +81,33 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Deploying $PLUGIN @ $REF → $ENVIRONMENT ($SUBPATH)"
 
+      # The production health probe targets the WORDPRESS host, which is moving
+      # off the apex to cms.bluecollarcrypto.io. Sourcing it from a repository
+      # variable makes that cutover a settings change rather than a merge timed
+      # against DNS across three repos.
+      #
+      # Deliberately NO fallback. The value being replaced was the apex, and
+      # once the apex serves Next.js that default probes the wrong host: every
+      # route 404s, and since 404 is this workflow's "plugin is gone" signal,
+      # it fails the deploy while looking like a plugin fault. A missing
+      # variable must fail as a missing variable.
+      #
+      # Checked HERE — before checkout, ssh, or rsync — so a misconfiguration
+      # costs nothing. The probe is the last step, so validating it there would
+      # mean discovering the problem with the plugin already on the server.
+      - name: Require a production health base
+        if: steps.t.outputs.environment == 'production'
+        env:
+          PROD_HEALTH_BASE: ${{ vars.PROD_HEALTH_BASE }}
+        run: |
+          if [ -z "$(printf '%s' "$PROD_HEALTH_BASE" | tr -d '[:space:]')" ]; then
+            echo "::error::PROD_HEALTH_BASE repository variable is unset or empty."
+            echo "::error::Set it to the WordPress origin (e.g. https://cms.bluecollarcrypto.io)"
+            echo "::error::under Settings → Secrets and variables → Actions → Variables."
+            exit 1
+          fi
+          echo "production health base: $PROD_HEALTH_BASE"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.t.outputs.ref }}
@@ -134,12 +161,28 @@ jobs:
             "grep -m1 'Version:' '${{ secrets.DEPLOY_BASE }}/${{ steps.t.outputs.subpath }}/$PLUGIN.php'"
 
       - name: Health probe (whole plugin trio)
+        env:
+          # Read through env rather than interpolating the variable straight
+          # into the script: the value becomes a shell string either way, and
+          # this keeps its contents data instead of code.
+          PROD_HEALTH_BASE: ${{ vars.PROD_HEALTH_BASE }}
         run: |
           if [ "${{ steps.t.outputs.environment }}" = "production" ]; then
-            BASE="https://bluecollarcrypto.io"
+            # Guaranteed non-empty by the "Require a production health base"
+            # step above; re-checked because that guarantee is a step-ordering
+            # one, and step order is easy to change without noticing.
+            BASE="$PROD_HEALTH_BASE"
+            if [ -z "$BASE" ]; then
+              echo "::error::PROD_HEALTH_BASE is empty at probe time"; exit 1
+            fi
           else
             BASE="https://stage.bluecollarcrypto.io"
           fi
+          # Every probe path below starts with "/", so a configured base with a
+          # trailing slash would build "https://host//wp-json/…" — which some
+          # hosts 301 and others 404, i.e. it would fail as a fake plugin fault.
+          while [ "${BASE%/}" != "$BASE" ]; do BASE="${BASE%/}"; done
+          echo "health base: $BASE"
           # Probes SIBLING plugins too: bcc-search registers under the shared
           # bcc/v1 namespace, so only a plugin-owned ROUTE reveals a
           # deactivated/fataled plugin (404 = route gone, 5xx = fatal). This
