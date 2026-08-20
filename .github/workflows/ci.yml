@@ -60,3 +60,33 @@ jobs:
 
       - name: Unit tests
         run: composer test
+
+  # The deploy workflow's production health probe targets the WORDPRESS host,
+  # which is moving off the apex to cms.bluecollarcrypto.io. bcc-core and
+  # bcc-trust were switched to the PROD_HEALTH_BASE repository variable on
+  # 2026-08-19 and bcc-search was missed — drift that no PHP test can see, and
+  # that would surface after the DNS cutover as a 404 on every production
+  # deploy, i.e. disguised as a dead plugin. Pinned here so it cannot recur.
+  workflow-guard:
+    name: Deploy health-base guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: python -m pip install --quiet --disable-pip-version-check pyyaml
+
+      # --self-test first: it asserts the checker still FAILS on seven
+      # mutations of deploy.yml (apex restored, variable removed, staging
+      # changed, pre-deploy guard removed or defanged, broken shell, broken
+      # YAML). A checker that matches nothing passes just as loudly as one
+      # that works, so the mutations are what make the green meaningful.
+      - name: Guard self-test (must-flag / must-not-flag)
+        run: python .github/scripts/check-deploy-health-base.py --self-test
+
+      - name: Deploy health-base guard
+        run: python .github/scripts/check-deploy-health-base.py
