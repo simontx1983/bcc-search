@@ -28,6 +28,10 @@ on:
         type: choice
         options: [staging, production]
         default: staging
+      expected_sha:
+        description: "REQUIRED for production: the full 40-character commit SHA approved for deploy"
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -112,6 +116,54 @@ jobs:
         with:
           ref: ${{ steps.t.outputs.ref }}
 
+      # ⚠⚠ THE PRODUCTION RACE GUARD — asserts the CHECKED-OUT COMMIT, not
+      # the current value of main.
+      #
+      # A production dispatch resolves REF to `refs/heads/main`; there is no
+      # SHA input upstream of this step. And `concurrency` serialises deploys
+      # with cancel-in-progress: false, so a dispatch can QUEUE behind an
+      # in-flight deploy and check out main at an arbitrary later time. No
+      # out-of-band read of main before dispatching can bound that window —
+      # which is why a procedural re-read is not a substitute for this step.
+      #
+      # Once checkout has run, the bytes that will be rsynced are fixed, so
+      # verifying THOSE is race-free regardless of what main does next.
+      #
+      # Placed immediately after checkout and BEFORE `Set up SSH`, so a
+      # refusal happens with no deploy key written and no connection to the
+      # host. Staging is untouched: the `if` gates on production, and the
+      # workflow_run auto-deploy passes no inputs at all.
+      #
+      # ⚠ expected_sha arrives through `env`, never interpolated into the
+      # script body — a ${{ }} expansion inside `run:` is a shell-injection
+      # seam for anyone who can dispatch the workflow.
+      - name: Refuse unless the checked-out commit is the approved SHA
+        if: steps.t.outputs.environment == 'production'
+        env:
+          EXPECTED_SHA: ${{ github.event.inputs.expected_sha }}
+        run: |
+          EXPECTED="$EXPECTED_SHA"
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::production deploys require expected_sha (the approved full 40-character commit SHA)"
+            exit 1
+          fi
+          if [ ${#EXPECTED} -ne 40 ]; then
+            echo "::error::expected_sha must be a FULL 40-character SHA (got ${#EXPECTED} characters)"
+            exit 1
+          fi
+          case "$EXPECTED" in
+            *[!0-9a-f]*)
+              echo "::error::expected_sha must be 40 lowercase hexadecimal characters"
+              exit 1
+              ;;
+          esac
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::REFUSING TO DEPLOY — checked-out HEAD $ACTUAL does not match the approved $EXPECTED. main moved between approval and dispatch."
+            exit 1
+          fi
+          echo "Approved commit confirmed: $ACTUAL"
+
       - name: Set up SSH
         run: |
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -187,13 +239,23 @@ jobs:
           # bcc/v1 namespace, so only a plugin-owned ROUTE reveals a
           # deactivated/fataled plugin (404 = route gone, 5xx = fatal). This
           # step would have caught the 2026-08-05 bcc-search deactivation in
-          # seconds instead of via user report. 400/401/403 mean the route is
-          # alive and enforcing its own rules — that's healthy here.
+          # seconds instead of via user report.
+          #
+          # 200 ONLY, matching bcc-core and bcc-trust. The old accept list
+          # included 400/401/403 as "route alive, enforcing its own rules". That
+          # was tolerable when a sibling repo's BASE could fall back to the apex,
+          # which 403s every /wp-json request by design — but this workflow
+          # REFUSES an empty PROD_HEALTH_BASE rather than falling back, so BASE is
+          # always the WordPress origin here and a 403 means WP REST is genuinely
+          # broken. Accepting it would let the probe pass through exactly the
+          # outage it exists to catch. All three routes below are public reads and
+          # returned 200 on staging AND production on 2026-10-29; if one ever needs
+          # auth, probe a different public route instead of widening this list.
           probe () {
             code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$BASE$1")
             case "$code" in
-              200|400|401|403) echo "OK   $code $1" ;;
-              *) echo "::error::FAIL $code $1 (404=route gone/plugin deactivated, 5xx=fatal, 000=unreachable)"; exit 1 ;;
+              200) echo "OK   $code $1" ;;
+              *) echo "::error::FAIL $code $1 (403=REST blocked/wrong host, 404=route gone/plugin deactivated, 5xx=fatal, 000=unreachable)"; exit 1 ;;
             esac
           }
           probe "/wp-json/bcc/v1/ranks"
