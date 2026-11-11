@@ -64,6 +64,7 @@ final class SearchControllerHandleSearchTest extends TestCase
         require_once __DIR__ . '/../Stubs/search-controller-env-stub.php';
         TestCacheStore::reset();
         FakeScoreReadService::reset();
+        \BCC\Core\ServiceLocator::$inspectRealResult = 'real';
         SearchRepository::reset();
         Throttle::$allow     = true;
         AdvisoryLock::$acquire = true;
@@ -265,7 +266,42 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertNull($row['trust_score']);
         self::assertFalse($row['verified']);
 
-        // Non-empty result → LKG mirror written.
+        // F-24: no trust scores for a non-empty candidate set means the
+        // ranking is text-only and the impersonation guard had nothing to
+        // compare. Still served, but tagged, and NEVER mirrored to LKG (an
+        // hour of trust-less ranking after recovery) — only a short-lived
+        // version-key entry.
+        self::assertTrue($data['system_degraded'] ?? false);
+        self::assertSame([], $this->cacheEntriesWithPrefix('search_lkg_'));
+        self::assertNotEmpty($this->cacheEntriesWithPrefix('search_'));
+    }
+
+    public function testUnboundTrustEngineIsServedDegradedAndNotMirroredToLkg(): void
+    {
+        // F-24: the NullObject score service (bcc-trust not bound) does not
+        // throw — it just returns nothing.
+        \BCC\Core\ServiceLocator::$inspectRealResult = 'null';
+        $this->seedPage(20, 'acme');
+
+        $data = $this->dispatch('acme')->get_data();
+
+        self::assertIsArray($data);
+        self::assertSame([20], array_column($data['results'], 'page_id'));
+        self::assertTrue($data['system_degraded'] ?? false);
+        self::assertSame([], $this->cacheEntriesWithPrefix('search_lkg_'));
+    }
+
+    public function testHealthyTrustEnrichmentIsMirroredToLkgAndNotTagged(): void
+    {
+        // Control for the two cases above: with real scores the result is a
+        // normal one — no degraded tag, LKG mirror written as before.
+        $this->seedPage(20, 'acme');
+        FakeScoreReadService::$scoresById = [20 => self::score(60.0, false)];
+
+        $data = $this->dispatch('acme')->get_data();
+
+        self::assertIsArray($data);
+        self::assertArrayNotHasKey('system_degraded', $data);
         self::assertNotEmpty($this->cacheEntriesWithPrefix('search_lkg_'));
     }
 
