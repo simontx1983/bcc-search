@@ -588,11 +588,11 @@ class SearchController
             $enrich_failed = false;
             $scores_by_id  = self::enrichScoresIfAvailable($prerank_ids, $enrich_failed);
             // F-24: no exception does NOT mean trust data. A NullObject score
-            // service (bcc-trust unbound) or a failed read model returns []
-            // silently — ranking is then text-only and the impersonation guard
-            // below has nothing to compare. Served (search must not go down
-            // with bcc-trust), but tagged and never cached as normal/LKG.
-            $trust_degraded = !$enrich_failed && self::isTrustDegraded($prerank_ids, $scores_by_id);
+            // service (bcc-trust unbound) returns [] silently — ranking is then
+            // text-only and the impersonation guard below has nothing to
+            // compare. Served (search must not go down with bcc-trust), but
+            // tagged and never cached as normal/LKG.
+            $trust_degraded = !$enrich_failed && self::isTrustDegraded();
 
             if ($enrich_failed) {
                 // Trust-engine is active but threw. Silently returning a
@@ -940,23 +940,20 @@ class SearchController
 
     /**
      * F-24: was this result built WITHOUT trust enrichment, although no
-     * exception said so? True when the score-read service is the NullObject,
-     * or when a non-empty candidate set came back with no scores at all (the
-     * real service returns a row per page, so an empty map means its read
-     * failed silently).
+     * exception said so? True only when the score-read service is the
+     * NullObject (bcc-trust unbound) — that returns nothing silently, so
+     * ranking is text-only and the impersonation guard is inert. A THROWING
+     * service is handled separately (stale/LKG/503 via $enrich_failed).
      *
-     * @param array<int, int>           $pageIds
-     * @param array<int, array<string, mixed>> $scoresById
+     * ⚠ "No scores for a non-empty candidate set" is NOT a degradation
+     * signal: the real service returns rows only for pages already in the
+     * read model, so a query matching only brand-new pages legitimately gets
+     * an empty map while trust is healthy (review of #28).
      */
-    private static function isTrustDegraded(array $pageIds, array $scoresById): bool
+    private static function isTrustDegraded(): bool
     {
-        if (class_exists('\\BCC\\Core\\ServiceLocator')
-            && ServiceLocator::inspectReal(\BCC\Core\Contracts\ScoreReadServiceInterface::class) === 'null'
-        ) {
-            return true;
-        }
-
-        return $pageIds !== [] && $scoresById === [];
+        return class_exists('\\BCC\\Core\\ServiceLocator')
+            && ServiceLocator::inspectReal(\BCC\Core\Contracts\ScoreReadServiceInterface::class) === 'null';
     }
 
     private static function recordTrustDegraded(): void
@@ -1180,7 +1177,7 @@ class SearchController
                     return $this->degradedEnrichResponse($cached, $lkg_key);
                 }
                 // F-24: same silent no-trust case as handle_search.
-                $trending_degraded = self::isTrustDegraded($trending_ids, $scores_by_id);
+                $trending_degraded = self::isTrustDegraded();
                 // Fall back to basic data from the read-model rows if enriched failed.
                 foreach ($rows as $row) {
                     $pid = $row->id;
@@ -1227,7 +1224,7 @@ class SearchController
                     if ($fallback_enrich_failed) {
                         return $this->degradedEnrichResponse($cached, $lkg_key);
                     }
-                    $trending_degraded = self::isTrustDegraded($candidate_ids, $scores_by_id);
+                    $trending_degraded = self::isTrustDegraded();
 
                     usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
                         $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;

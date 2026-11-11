@@ -266,14 +266,11 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertNull($row['trust_score']);
         self::assertFalse($row['verified']);
 
-        // F-24: no trust scores for a non-empty candidate set means the
-        // ranking is text-only and the impersonation guard had nothing to
-        // compare. Still served, but tagged, and NEVER mirrored to LKG (an
-        // hour of trust-less ranking after recovery) — only a short-lived
-        // version-key entry.
-        self::assertTrue($data['system_degraded'] ?? false);
-        self::assertSame([], $this->cacheEntriesWithPrefix('search_lkg_'));
-        self::assertNotEmpty($this->cacheEntriesWithPrefix('search_'));
+        // A BOUND trust engine with no rows for these pages (brand-new pages
+        // not yet in the read model) is healthy, not degraded (F-24 review):
+        // no tag, LKG mirror written as normal.
+        self::assertArrayNotHasKey('system_degraded', $data);
+        self::assertNotEmpty($this->cacheEntriesWithPrefix('search_lkg_'));
     }
 
     public function testUnboundTrustEngineIsServedDegradedAndNotMirroredToLkg(): void
