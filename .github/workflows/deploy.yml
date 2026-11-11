@@ -322,7 +322,7 @@ jobs:
           # F-36: the hidden dev-only paths must be gone from the target too —
           # proves the first deploy with the new filters actually removed them.
           LEFT=""
-          for p in tests composer.json composer.lock phpunit.xml.dist phpstan.neon README.md; do
+          for p in tests composer.json composer.lock phpstan.neon phpstan-bootstrap.php phpunit.xml.dist phpunit-integration.xml.dist .gitignore .gitattributes README.md; do
             [ -e "\$T/\$p" ] && LEFT="\$LEFT \$p"
           done
           if [ -n "\$LEFT" ]; then
