@@ -52,9 +52,11 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         $u9->ID = 9;
         $u9->user_login = 'secret_login9';
         $u9->user_nicename = 'bob';
-        $u9->display_name = 'Bob';
+        $u9->display_name = 'Barb';
 
         $GLOBALS['__bcc_userdata'] = [7 => $u7, 9 => $u9];
+        // F-54: only accounts with a public handle are returned.
+        $GLOBALS['__bcc_usermeta'] = [7 => ['bcc_handle' => 'alice'], 9 => ['bcc_handle' => 'barb']];
 
         $dtos = UserSearchRepository::search('a', 20, 555);
 
@@ -70,6 +72,61 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         self::assertSame('secret_login7', $dtos[0]->userLogin);
         self::assertSame(9, $dtos[1]->id);
         self::assertSame('bob', $dtos[1]->userNicename);
+    }
+
+    /**
+     * @param array<string, string> $meta
+     */
+    private static function user(int $id, string $login, string $display, array $meta): void
+    {
+        $u = new \WP_User();
+        $u->ID = $id;
+        $u->user_login = $login;
+        $u->user_nicename = strtolower($login);
+        $u->display_name = $display;
+        $GLOBALS['__bcc_userdata'][$id] = $u;
+        $GLOBALS['__bcc_usermeta'][$id] = $meta;
+    }
+
+    public function testLoginOnlyMatchIsDroppedSoTheEndpointIsNoLoginOracle(): void
+    {
+        // F-54: PeepSo matched 'adm' on user_login; the visible fields of
+        // this user ("Carol" / carol) do not contain it, so the row must drop.
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [21];
+        $GLOBALS['__bcc_userdata'] = [];
+        self::user(21, 'admin_real', 'Carol', ['bcc_handle' => 'carol']);
+
+        self::assertSame([], UserSearchRepository::search('adm', 20, 0));
+    }
+
+    public function testHandlelessAccountIsNotReturned(): void
+    {
+        // F-54: without a handle the only public identifier would be the
+        // login-derived nicename.
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [22];
+        $GLOBALS['__bcc_userdata'] = [];
+        self::user(22, 'legacy_dana', 'Dana', []);
+
+        self::assertSame([], UserSearchRepository::search('dana', 20, 0));
+    }
+
+    public function testLoginShapedDisplayNameIsReplacedByTheHandle(): void
+    {
+        // F-54: a wp-admin-created account defaults display_name to the login.
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [23];
+        $GLOBALS['__bcc_userdata'] = [];
+        self::user(23, 'eve_login', 'eve_login', ['bcc_handle' => 'eve']);
+
+        $dtos = UserSearchRepository::search('eve', 20, 0);
+
+        self::assertCount(1, $dtos);
+        self::assertSame('eve', $dtos[0]->displayName);
     }
 
     public function testAnonymousViewerPassesNullToWrapper(): void

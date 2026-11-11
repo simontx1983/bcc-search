@@ -75,17 +75,21 @@ final class UserSearchServiceTest extends TestCase
         self::assertStringNotContainsString('u_bob', $flat);
     }
 
-    public function testHandleLessAccountFallsBackToNicenameNeverLogin(): void
+    public function testUsernameIsTheHandleNeverNicenameOrLogin(): void
     {
+        // F-54: handle-less accounts are dropped in the repository, so there
+        // is no nicename fallback; the nicename is login-derived.
         \BCC\Search\Repositories\UserSearchRepository::$return = [
-            new UserDTO(7, 'secret_admin_login', 'legacy-nicename', 'Legacy L'),
+            new UserDTO(7, 'secret_admin_login', 'legacy-nicename', 'Legacy L', 'legacy'),
         ];
 
         $row = (new UserSearchService())->search('l', 20)['results'][0];
 
-        self::assertSame('legacy-nicename', $row['username']);
-        self::assertSame('/u/legacy-nicename', $row['profile_url']);
-        self::assertStringNotContainsString('secret_admin_login', (string) json_encode($row));
+        self::assertSame('legacy', $row['username']);
+        self::assertSame('/u/legacy', $row['profile_url']);
+        $flat = (string) json_encode($row);
+        self::assertStringNotContainsString('secret_admin_login', $flat);
+        self::assertStringNotContainsString('legacy-nicename', $flat);
     }
 
     public function testResultKeysAreExactlyThePublicShape(): void

@@ -363,6 +363,40 @@ final class SearchControllerHandleSearchTest extends TestCase
         self::assertSame([2, 1], self::resultPageIds($this->dispatch('acme')));
     }
 
+    /**
+     * F-54: each impostor spelling must land in the canonical page's
+     * same-name bucket.
+     *
+     * @return array<string, array{string, string, string}>
+     */
+    public static function impostorSpellings(): array
+    {
+        $cases = [
+            'multibyte case' => ["\u{00C9}LITE", "\u{00E9}lite", "\u{00E9}lite"],
+            'zero-width'     => ["Ac\u{200B}me", 'Acme', 'acme'],
+            'soft hyphen'    => ["Ac\u{00AD}me", 'Acme', 'acme'],
+            'nbsp'           => ["Acme\u{00A0}Labs", 'Acme Labs', 'acme'],
+            'html entity'    => ['Acme &amp; Co', 'Acme & Co', 'acme'],
+        ];
+        if (class_exists('\Normalizer')) {
+            $cases['fullwidth (NFKC)'] = ["\u{FF21}\u{FF43}\u{FF4D}\u{FF45}", 'Acme', 'acme'];
+        }
+        return $cases;
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('impostorSpellings')]
+    public function testImpostorSpellingVariantsAreStillDemoted(string $impostor, string $canonical, string $q): void
+    {
+        $this->seedPage(1, $impostor);
+        $this->seedPage(2, $canonical);
+        FakeScoreReadService::$scoresById = [
+            1 => self::score(79.0, false),
+            2 => self::score(10.0, true),
+        ];
+
+        self::assertSame([2, 1], self::resultPageIds($this->dispatch($q)));
+    }
+
     public function testDemotionAppliesOnlyToSameNormalisedName(): void
     {
         // Demote-only guarantee: a strong unverified page with a
