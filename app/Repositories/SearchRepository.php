@@ -145,15 +145,29 @@ final class SearchRepository
      * v2: expanded from title-only to title+content so searches for
      * terms in page descriptions (e.g., "Cosmos validator") also match.
      */
-    public static function ensureFulltextIndex(): void
+    /**
+     * F-50: after a FAILED attempt, automatic callers (admin_init, the hourly
+     * cron, activation) wait this long before the next ALTER instead of
+     * retrying it on every request. The Developer "Rebuild" button passes
+     * $force and ignores the backoff.
+     */
+    public const FT_BACKOFF_TRANSIENT = 'bcc_search_ft_index_backoff';
+
+    public static function ensureFulltextIndex(bool $force = false): void
     {
-        if (self::$ftIndexChecked) {
+        // A forced call (the Rebuild button) must not be swallowed by the
+        // memo: admin-post fires admin_init's unforced attempt first.
+        if (self::$ftIndexChecked && !$force) {
             return;
         }
         self::$ftIndexChecked = true;
 
         // v2 flag — if only v1 (title-only) is installed, upgrade to title+content.
         if (get_option('bcc_ft_index_v2_installed')) {
+            return;
+        }
+
+        if (!$force && get_transient(self::FT_BACKOFF_TRANSIENT)) {
             return;
         }
 
@@ -208,6 +222,8 @@ final class SearchRepository
                 );
                 if ($wpdb->last_error !== '') {
                     $indexReady = false;
+                    // F-50: back off — one failed ALTER per hour, not per request.
+                    set_transient(self::FT_BACKOFF_TRANSIENT, 1, HOUR_IN_SECONDS);
                     if (class_exists('\\BCC\\Core\\Log\\Logger')) {
                         \BCC\Core\Log\Logger::error('[bcc-search] FULLTEXT v2 index ALTER failed — leaving installed flag unset so the self-heal cron retries', [
                             'error' => $wpdb->last_error,
@@ -218,6 +234,7 @@ final class SearchRepository
 
             if ($indexReady) {
                 update_option('bcc_ft_index_v2_installed', 1, false);
+                delete_transient(self::FT_BACKOFF_TRANSIENT);
 
                 // Ranking quality changes when FULLTEXT becomes available (MATCH
                 // AGAINST replaces title-prefix fallback), so any cached results
