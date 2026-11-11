@@ -106,11 +106,22 @@ add_action('init', function (): void {
         wp_schedule_event(time() + 60, 'hourly', 'bcc_search_ensure_ft_index');
     }
 });
-add_action('admin_init', function (): void {
-    if (get_option('bcc_ft_index_v2_installed')) {
+// F-50: admin_init ALSO fires on admin-ajax.php / admin-post.php BEFORE any
+// authentication, so without this gate any anonymous request could start an
+// ALTER TABLE on wp_posts (and retry it on every request while it kept
+// failing). Only a real admin page load by an administrator may run schema
+// work here; anything else waits for the hourly cron below.
+$bccSearchMaySelfHeal = static function (): bool {
+    return !wp_doing_ajax() && current_user_can('manage_options');
+};
+add_action('admin_init', function () use ($bccSearchMaySelfHeal): void {
+    if (!$bccSearchMaySelfHeal()) {
         return;
     }
-    \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+    if (!get_option('bcc_ft_index_v2_installed')) {
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+    }
+    \BCC\Search\Repositories\SearchTermsRepository::ensureTable();
 });
 add_action('bcc_search_ensure_ft_index', function (): void {
     if (get_option('bcc_ft_index_v2_installed')) {
@@ -125,12 +136,11 @@ add_action('bcc_search_ensure_ft_index', function (): void {
 });
 
 // ── Search-analytics table self-heal ────────────────────────────────────────
-// Same activation-bypass recovery as the FT index. ensureTable() is
-// option-guarded + request-memoized, so calling it on init/admin_init is a
-// cheap no-op once the table exists — no dedicated cron needed for install.
-add_action('init', function (): void {
-    \BCC\Search\Repositories\SearchTermsRepository::ensureTable();
-});
+// Same activation-bypass recovery as the FT index. F-50: no longer on `init`
+// (that ran CREATE TABLE on EVERY request, anonymous front-end included, until
+// the flag was set — and on every request while it kept failing). It now runs
+// on activation, on the admin-gated admin_init above, and from the daily prune
+// cron below; ensureTable() also backs off for an hour after a failure.
 
 // ── Search-analytics retention: daily prune of rows past the window ─────────
 add_action('init', function (): void {
@@ -140,6 +150,9 @@ add_action('init', function (): void {
     }
 });
 add_action('bcc_search_terms_prune', function (): void {
+    // F-50: the cron path is also the analytics table's self-heal (it no
+    // longer runs on every request). ensureTable() is a no-op once installed.
+    \BCC\Search\Repositories\SearchTermsRepository::ensureTable();
     \BCC\Search\Repositories\SearchTermsRepository::prune();
 });
 add_filter('bcc_expected_cron_hooks', function (array $hooks): array {
@@ -250,10 +263,11 @@ add_action('admin_post_bcc_dev_rebuild_ft_index', function (): void {
         wp_die(esc_html__('Unauthorized.'));
     }
     check_admin_referer('bcc_dev_rebuild_ft_index');
+    // F-50: an operator's explicit Rebuild ignores the failure backoff.
 
     $args = ['page' => 'bcc-developer'];
     try {
-        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex();
+        \BCC\Search\Repositories\SearchRepository::ensureFulltextIndex(true);
         $args['rebuilt'] = '1';
         \BCC\Core\Log\Logger::info('[bcc-search] FT index rebuild triggered from Developer page', [
             'operator' => get_current_user_id(),

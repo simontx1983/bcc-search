@@ -35,6 +35,9 @@ final class SearchTermsRepository
     private const INSTALLED_OPTION = 'bcc_search_terms_installed';
     private const INSTALL_LOCK     = 'bcc_search_terms_install';
 
+    /** F-50: after a failed install, wait an hour before the next attempt. */
+    public const INSTALL_BACKOFF_TRANSIENT = 'bcc_search_terms_install_backoff';
+
     /** Terms are truncated to this width (matches the column). */
     public const TERM_MAXLEN = 100;
 
@@ -82,6 +85,9 @@ final class SearchTermsRepository
         if (get_option(self::INSTALLED_OPTION)) {
             return;
         }
+        if (get_transient(self::INSTALL_BACKOFF_TRANSIENT)) {
+            return;
+        }
 
         global $wpdb;
 
@@ -120,11 +126,16 @@ final class SearchTermsRepository
             );
             if ($exists === $table) {
                 update_option(self::INSTALLED_OPTION, 1, false);
-            } elseif (class_exists('\\BCC\\Core\\Log\\Logger')) {
-                \BCC\Core\Log\Logger::error(
-                    '[bcc-search] search-terms table install failed — leaving flag unset so it retries',
-                    ['error' => (string) $wpdb->last_error]
-                );
+                delete_transient(self::INSTALL_BACKOFF_TRANSIENT);
+            } else {
+                // F-50: back off — one failed CREATE per hour, not per request.
+                set_transient(self::INSTALL_BACKOFF_TRANSIENT, 1, HOUR_IN_SECONDS);
+                if (class_exists('\\BCC\\Core\\Log\\Logger')) {
+                    \BCC\Core\Log\Logger::error(
+                        '[bcc-search] search-terms table install failed — leaving flag unset; retrying in an hour',
+                        ['error' => (string) $wpdb->last_error]
+                    );
+                }
             }
         } finally {
             $wpdb->get_var(
