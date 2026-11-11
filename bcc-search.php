@@ -301,9 +301,9 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 return;
             }
 
+            // F-53: retention is 30 days, so 30 days is the widest window.
             $top30  = \BCC\Search\Repositories\SearchTermsRepository::topTerms(30, 25, false);
-            $top90  = \BCC\Search\Repositories\SearchTermsRepository::topTerms(90, 25, false);
-            $zero90 = \BCC\Search\Repositories\SearchTermsRepository::topTerms(90, 25, true);
+            $zero30 = \BCC\Search\Repositories\SearchTermsRepository::topTerms(30, 25, true);
             $rising = \BCC\Search\Repositories\SearchTermsRepository::risingTerms(25);
 
             $render_table = static function (string $heading, array $rows, bool $zeroCol): void {
@@ -355,11 +355,11 @@ add_filter('bcc_developer_panels', function (array $panels): array {
             };
 
             echo '<p style="color:var(--bcc-text-secondary);">Aggregate search samples (sampled on cache rebuilds; no user linkage). '
-                . 'Compare the 30-day and 90-day tables to see short-term shifts against the longer-run picture.</p>';
+                . 'Project and group searches only — people searches are never recorded. Kept '
+                . (int) \BCC\Search\Repositories\SearchTermsRepository::RETENTION_DAYS . ' days.</p>';
             $render_rising($rising);
-            $render_table('Zero-result terms — last 90 days (content gaps)', $zero90, true);
+            $render_table('Zero-result terms — last 30 days (content gaps)', $zero30, true);
             $render_table('Top terms — last 30 days', $top30, false);
-            $render_table('Top terms — last 90 days', $top90, false);
 
             echo '<form method="post" action="' . esc_url(admin_url('admin-post.php')) . '" style="margin-top:12px;">';
             echo '<input type="hidden" name="action" value="bcc_dev_prune_search_terms">';
