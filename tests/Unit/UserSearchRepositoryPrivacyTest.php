@@ -129,6 +129,31 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         self::assertSame('eve', $dtos[0]->displayName);
     }
 
+    public function testLoginOnlyHitsDoNotCrowdOutPublicMatches(): void
+    {
+        // F-54 follow-up: the first `limit` SQL hits are login-only matches
+        // (dropped); the public matches behind them must still come back,
+        // trimmed to the requested limit.
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        $GLOBALS['__bcc_userdata'] = [];
+        $ids = [];
+        for ($i = 1; $i <= 2; $i++) {                 // login-only: "adm" not public
+            self::user($i, 'admin' . $i, 'Zed' . $i, ['bcc_handle' => 'zed' . $i]);
+            $ids[] = $i;
+        }
+        for ($i = 11; $i <= 14; $i++) {               // public: display name has "adm"
+            self::user($i, 'u' . $i, 'Adm User ' . $i, ['bcc_handle' => 'h' . $i]);
+            $ids[] = $i;
+        }
+        \PeepSoUserSearch::$nextResults = $ids;
+
+        $dtos = UserSearchRepository::search('adm', 2, 0);
+
+        self::assertSame(6, \PeepSoUserSearch::$lastCtor['args']['number'] ?? null, 'must over-fetch 3x the limit');
+        self::assertSame([11, 12], array_map(static fn ($d) => $d->id, $dtos));
+    }
+
     public function testAnonymousViewerPassesNullToWrapper(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
