@@ -33,8 +33,8 @@ if (!defined('ABSPATH')) {
  * closed (empty result) rather than fall back to the privacy-blind query.
  *
  * Email is never matched and never returned — PII by policy. `user_login`
- * is carried on the DTO but the service projects `user_nicename`, never the
- * login (see UserSearchService + UserSearchServiceTest).
+ * is carried on the DTO but the service projects the `bcc_handle`, never the
+ * login or nicename (see UserSearchService + UserSearchServiceTest).
  */
 final class UserSearchRepository
 {
@@ -42,6 +42,13 @@ final class UserSearchRepository
     // request smaller but not larger batches.
     private const DEFAULT_LIMIT = 20;
     private const MAX_LIMIT     = 50;
+
+    // F-54 follow-up: the public-field filter below drops rows PeepSo matched
+    // on user_login / email only, AFTER the SQL LIMIT. Fetching exactly
+    // $limit let a broad query whose first N hits were login-only matches
+    // return too few rows, or none. Over-fetch, filter, then trim. Bounded:
+    // at most MAX_LIMIT * OVERFETCH_FACTOR ids, one cache_users() batch.
+    private const OVERFETCH_FACTOR = 3;
 
     /**
      * Privacy-filtered prefix search over the PeepSo user directory.
@@ -73,7 +80,7 @@ final class UserSearchRepository
         // block-both-directions filter for signed-in callers.
         $search = new \PeepSoUserSearch(
             [
-                'number'  => $limit,
+                'number'  => $limit * self::OVERFETCH_FACTOR,
                 'orderby' => 'username',
                 'order'   => 'ASC',
             ],
@@ -160,7 +167,7 @@ final class UserSearchRepository
         usort($dtos, static fn (UserDTO $a, UserDTO $b): int =>
             strcmp(mb_strtolower($a->displayName), mb_strtolower($b->displayName)) ?: ($a->id <=> $b->id));
 
-        return $dtos;
+        return array_slice($dtos, 0, $limit);
     }
 
     /**
