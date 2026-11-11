@@ -257,11 +257,23 @@ class SearchController
         });
 
         add_action('save_post_peepso-page', [__CLASS__, 'bust_search_cache']);
+        // F-54: a deleted page, or one leaving `publish` (trash, draft,
+        // private), must also leave the LKG mirror. bust_search_cache() only
+        // bumps the version, so it stayed in search_lkg_* / trending_lkg_*
+        // for up to an hour and was served on every degraded path.
+        // bust_search_privacy() advances the LKG generation too.
         add_action('delete_post', function (int $post_id): void {
             if (get_post_type($post_id) === 'peepso-page') {
-                self::bust_search_cache();
+                self::bust_search_privacy();
             }
         });
+        add_action('transition_post_status', function (string $new, string $old, $post): void {
+            if ($old === 'publish' && $new !== 'publish'
+                && $post instanceof \WP_Post && $post->post_type === 'peepso-page'
+            ) {
+                self::bust_search_privacy();
+            }
+        }, 10, 3);
 
         // Page-privacy meta changes (add/update/delete) bust immediately —
         // the meta hooks carry the key, so we bust only on the one key
@@ -272,6 +284,11 @@ class SearchController
         $bustOnPrivacyMeta = static function ($meta_id, $post_id, string $meta_key): void {
             if ($meta_key === 'peepso_page_privacy') {
                 self::bust_search_privacy();
+            } elseif ($meta_key === '_bcc_page_type' || $meta_key === 'peepso_page_avatar_hash') {
+                // F-54: these change a result's page_url route / avatar_url
+                // without a save_post — refresh the cached results (version
+                // bump only; the LKG keeps serving a still-valid page).
+                self::bust_search_cache();
             }
         };
         add_action('added_post_meta', $bustOnPrivacyMeta, 10, 3);
@@ -639,7 +656,7 @@ class SearchController
             $unverified_by_name   = [];   // normalised name => list<int> ids
             foreach ($prerank_ids as $id) {
                 $name = $titles_by_id[$id] ?? '';
-                $key  = strtolower(trim((string) preg_replace('/\s+/', ' ', $name)));
+                $key  = self::normaliseNameKey((string) $name);
                 $is_claim_verified = (bool) ($scores_by_id[$id]['is_claim_verified'] ?? false);
                 if ($is_claim_verified) {
                     $verified_min_by_name[$key] = isset($verified_min_by_name[$key])
@@ -978,6 +995,32 @@ class SearchController
             self::CACHE_GROUP,
             self::DEGRADED_CACHE_TTL
         );
+    }
+
+    /**
+     * F-54: the key two page names must share to count as "the same name"
+     * for the impersonation demotion. The old key (ASCII strtolower + \s
+     * without /u) let an impostor escape the bucket with "ÉLITE" vs
+     * "élite", a fullwidth or ligature form, an NBSP, a zero-width
+     * character inside the name, or "&amp;" vs "&". Normalises: HTML
+     * entities, Unicode NFKC (when intl is available), zero-width / soft
+     * hyphen removal, Unicode whitespace collapse, multibyte lowercase.
+     * Cross-script confusables (Cyrillic "а" vs Latin "a") are NOT folded —
+     * that needs intl's Spoofchecker, which this stack does not require.
+     */
+    private static function normaliseNameKey(string $name): string
+    {
+        $key = html_entity_decode($name, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if (class_exists('\\Normalizer')) {
+            $normalised = \Normalizer::normalize($key, \Normalizer::FORM_KC);
+            if (is_string($normalised)) {
+                $key = $normalised;
+            }
+        }
+        $key = (string) preg_replace('/[\x{00AD}\x{200B}-\x{200D}\x{2060}\x{FEFF}]/u', '', $key);
+        $key = (string) preg_replace('/\s+/u', ' ', $key);
+
+        return mb_strtolower(trim($key));
     }
 
     /**

@@ -102,6 +102,14 @@ final class UserSearchRepository
         // bcc_handle read below is cache-served, not a query.
         cache_users($userIds);
 
+        // F-54: PeepSoUserSearch matches first/last name OR user_login (and
+        // user_email when PeepSo's members_email_searchable is on). On this
+        // anonymous endpoint that made the search a substring oracle on
+        // login names: probing "adm" and getting back a differently-named
+        // user revealed their login. Keep a row only when the query matches
+        // something PUBLIC about the person; a login-/email-only match drops.
+        $needle = mb_strtolower(trim($query));
+
         $dtos = [];
         foreach ($userIds as $userId) {
             $user = get_userdata($userId);
@@ -109,14 +117,62 @@ final class UserSearchRepository
                 continue;
             }
             $handleRaw = get_user_meta($userId, 'bcc_handle', true);
+            $handle    = is_string($handleRaw) ? trim($handleRaw) : '';
+
+            // F-54: no public handle → no public identity to show. The old
+            // fallback was user_nicename, which BCC signup derives from the
+            // login; and the /u/{handle} profile route needs a handle anyway.
+            if ($handle === '') {
+                continue;
+            }
+
+            $login       = (string) $user->user_login;
+            $nicename    = (string) $user->user_nicename;
+            $displayName = (string) $user->display_name;
+            // A wp-admin-created account defaults display_name to the login.
+            if ($displayName === ''
+                || strcasecmp($displayName, $login) === 0
+                || strcasecmp($displayName, $nicename) === 0
+            ) {
+                $displayName = $handle;
+            }
+
+            if ($needle !== '' && !self::matchesPublicField($needle, [
+                $displayName,
+                $handle,
+                (string) get_user_meta($userId, 'first_name', true),
+                (string) get_user_meta($userId, 'last_name', true),
+            ])) {
+                continue;
+            }
+
             $dtos[] = new UserDTO(
                 id:           $userId,
-                userLogin:    (string) $user->user_login,
-                userNicename: (string) $user->user_nicename,
-                displayName:  (string) $user->display_name,
-                handle:       is_string($handleRaw) ? $handleRaw : '',
+                userLogin:    $login,
+                userNicename: $nicename,
+                displayName:  $displayName,
+                handle:       $handle,
             );
         }
+
+        // F-54: PeepSo orders by user_login; re-order by what is shown so the
+        // order itself does not encode login names.
+        usort($dtos, static fn (UserDTO $a, UserDTO $b): int =>
+            strcmp(mb_strtolower($a->displayName), mb_strtolower($b->displayName)) ?: ($a->id <=> $b->id));
+
         return $dtos;
+    }
+
+    /**
+     * @param list<string> $fields
+     */
+    private static function matchesPublicField(string $needle, array $fields): bool
+    {
+        foreach ($fields as $field) {
+            if ($field !== '' && mb_stripos($field, $needle) !== false) {
+                return true;
+            }
+        }
+        return false;
     }
 }

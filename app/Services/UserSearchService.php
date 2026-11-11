@@ -70,9 +70,10 @@ final class UserSearchService
             // signup derives both login (`u_<handle>`) and nicename from
             // the credential name — returning either hands out
             // credential-stuffing lists AND renders as "@u_<handle>" in
-            // the FE. Nicename remains the fallback for accounts that
-            // predate handles (never the login).
-            $handle    = $u->handle !== '' ? $u->handle : $u->userNicename;
+            // the FE. F-54: handle-less accounts are no longer returned at
+            // all (UserSearchRepository drops them), so there is no
+            // nicename fallback any more.
+            $handle    = $u->handle;
             $avatarUrl = $avatars[$u->id] ?? '';
             $results[] = [
                 'id'           => $u->id,
