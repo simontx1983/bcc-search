@@ -209,14 +209,17 @@ add_filter('bcc_developer_panels', function (array $panels): array {
         'sort'  => 20,
         'render' => function (): void {
             $installed = (bool) get_option('bcc_ft_index_v2_installed');
-            $color     = $installed ? '#46b450' : '#dba617';
             $label     = $installed ? 'installed' : 'not installed';
+            // Shared bcc-core badge (classes, palette in bcc-admin.css);
+            // plain text if an older bcc-core is still deployed.
+            $badge     = class_exists(\BCC\Core\Admin\AdminUi::class)
+                ? \BCC\Core\Admin\AdminUi::badge($label, $installed ? \BCC\Core\Admin\AdminUi::OK : \BCC\Core\Admin\AdminUi::WARN)
+                : esc_html($label);
 
             echo '<table class="widefat striped" style="max-width:760px;"><tbody>';
             printf(
-                '<tr><th style="width:280px;">FT index v2</th><td><span style="display:inline-block;padding:2px 10px;background:%1$s;color:#fff;border-radius:3px;font-weight:bold;font-size:12px;">%2$s</span></td></tr>',
-                esc_attr($color),
-                esc_html($label)
+                '<tr><th style="width:280px;">FT index v2</th><td>%s</td></tr>',
+                $badge // pre-escaped above
             );
             printf(
                 '<tr><th>Option flag (<code>bcc_ft_index_v2_installed</code>)</th><td><code>%s</code></td></tr>',
@@ -225,7 +228,7 @@ add_filter('bcc_developer_panels', function (array $panels): array {
             echo '</tbody></table>';
 
             if (!$installed) {
-                echo '<p style="color:#666;margin-top:8px;">'
+                echo '<p style="color:var(--bcc-text-secondary);margin-top:8px;">'
                     . 'The <code>bcc_search_ensure_ft_index</code> hourly self-heal cron will keep retrying until the option flag is set. '
                     . 'Press Rebuild to force an immediate attempt.</p>';
             }
@@ -279,7 +282,7 @@ add_filter('bcc_developer_panels', function (array $panels): array {
         'render' => function (): void {
             $installed = (bool) get_option('bcc_search_terms_installed');
             if (!$installed) {
-                echo '<p style="color:#666;">The search-analytics table is not installed yet '
+                echo '<p style="color:var(--bcc-text-secondary);">The search-analytics table is not installed yet '
                     . '(installs on the next front-end/admin request via the self-heal on <code>init</code>).</p>';
                 return;
             }
@@ -292,7 +295,7 @@ add_filter('bcc_developer_panels', function (array $panels): array {
             $render_table = static function (string $heading, array $rows, bool $zeroCol): void {
                 printf('<h3 style="margin:14px 0 6px;">%s</h3>', esc_html($heading));
                 if ($rows === []) {
-                    echo '<p style="color:#666;">No rows in the window yet.</p>';
+                    echo '<p style="color:var(--bcc-text-secondary);">No rows in the window yet.</p>';
                     return;
                 }
                 echo '<table class="widefat striped" style="max-width:760px;"><thead><tr>'
@@ -316,7 +319,7 @@ add_filter('bcc_developer_panels', function (array $panels): array {
             $render_rising = static function (array $rows): void {
                 echo '<h3 style="margin:14px 0 6px;">Rising terms (this week vs last)</h3>';
                 if ($rows === []) {
-                    echo '<p style="color:#666;">Nothing rising yet — needs at least two weeks of samples.</p>';
+                    echo '<p style="color:var(--bcc-text-secondary);">Nothing rising yet — needs at least two weeks of samples.</p>';
                     return;
                 }
                 echo '<table class="widefat striped" style="max-width:760px;"><thead><tr>'
@@ -337,7 +340,7 @@ add_filter('bcc_developer_panels', function (array $panels): array {
                 echo '</tbody></table>';
             };
 
-            echo '<p style="color:#666;">Aggregate search samples (sampled on cache rebuilds; no user linkage). '
+            echo '<p style="color:var(--bcc-text-secondary);">Aggregate search samples (sampled on cache rebuilds; no user linkage). '
                 . 'Compare the 30-day and 90-day tables to see short-term shifts against the longer-run picture.</p>';
             $render_rising($rising);
             $render_table('Zero-result terms — last 90 days (content gaps)', $zero90, true);
