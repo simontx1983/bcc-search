@@ -587,6 +587,12 @@ class SearchController
             // search and discovery produce consistent trust-based ordering.
             $enrich_failed = false;
             $scores_by_id  = self::enrichScoresIfAvailable($prerank_ids, $enrich_failed);
+            // F-24: no exception does NOT mean trust data. A NullObject score
+            // service (bcc-trust unbound) returns [] silently — ranking is then
+            // text-only and the impersonation guard below has nothing to
+            // compare. Served (search must not go down with bcc-trust), but
+            // tagged and never cached as normal/LKG.
+            $trust_degraded = !$enrich_failed && self::isTrustDegraded();
 
             if ($enrich_failed) {
                 // Trust-engine is active but threw. Silently returning a
@@ -692,6 +698,10 @@ class SearchController
                 'results'    => $results,
                 'categories' => $categories,
             ];
+            if ($trust_degraded) {
+                $response['system_degraded'] = true;
+                self::recordTrustDegraded();
+            }
 
             // Analytics: rebuild-path only (every cache-serving branch returns
             // above), so this samples once per (term, type) per cache window —
@@ -699,7 +709,7 @@ class SearchController
             // cache fingerprint uses.
             SearchTermsRepository::record('projects', mb_strtolower($q), count($results));
 
-            $this->cacheSearchResult($cache_key, $lkg_key, $response);
+            $this->cacheSearchResult($cache_key, $lkg_key, $response, $trust_degraded);
 
             return new \WP_REST_Response($response);
         } finally {
@@ -762,8 +772,13 @@ class SearchController
      * @param string              $lkg_key
      * @param array<string,mixed> $response
      */
-    private function cacheSearchResult(string $cache_key, string $lkg_key, array $response): void
+    private function cacheSearchResult(string $cache_key, string $lkg_key, array $response, bool $degraded = false): void
     {
+        if ($degraded) {
+            self::cacheDegraded($cache_key, $response);
+            return;
+        }
+
         $jitter    = (int) (self::SEARCH_CACHE_TTL * 0.2);                 // ±20%
         $softTtl   = self::SEARCH_CACHE_TTL + random_int(-$jitter, $jitter); // 48-72s
         $hardTtl   = $softTtl + 30;                                         // stale buffer
@@ -917,6 +932,55 @@ class SearchController
     }
 
     /**
+     * F-24: seconds a trust-less (degraded) result may be served from cache.
+     * Long enough to absorb a burst, short enough that ranking recovers
+     * almost immediately once the trust engine is back. Never mirrored to LKG.
+     */
+    private const DEGRADED_CACHE_TTL = 10;
+
+    /**
+     * F-24: was this result built WITHOUT trust enrichment, although no
+     * exception said so? True only when the score-read service is the
+     * NullObject (bcc-trust unbound) — that returns nothing silently, so
+     * ranking is text-only and the impersonation guard is inert. A THROWING
+     * service is handled separately (stale/LKG/503 via $enrich_failed).
+     *
+     * ⚠ "No scores for a non-empty candidate set" is NOT a degradation
+     * signal: the real service returns rows only for pages already in the
+     * read model, so a query matching only brand-new pages legitimately gets
+     * an empty map while trust is healthy (review of #28).
+     */
+    private static function isTrustDegraded(): bool
+    {
+        return class_exists('\\BCC\\Core\\ServiceLocator')
+            && ServiceLocator::inspectReal(\BCC\Core\Contracts\ScoreReadServiceInterface::class) === 'null';
+    }
+
+    private static function recordTrustDegraded(): void
+    {
+        if (class_exists('\\BCC\\Core\\Observability\\DegradationMetrics')) {
+            \BCC\Core\Observability\DegradationMetrics::record('search_trust', 'enrichment_unavailable');
+        }
+    }
+
+    /**
+     * F-24: cache a degraded result briefly under its version key only — no
+     * stale buffer and NO last-known-good mirror, so a trust-less ranking
+     * can never be served for an hour after the trust engine recovers.
+     *
+     * @param array<string, mixed> $response
+     */
+    private static function cacheDegraded(string $cache_key, array $response): void
+    {
+        wp_cache_set(
+            $cache_key,
+            ['data' => $response, 'expires_at' => time() + self::DEGRADED_CACHE_TTL],
+            self::CACHE_GROUP,
+            self::DEGRADED_CACHE_TTL
+        );
+    }
+
+    /**
      * Resolve enriched trust scores for a set of page IDs.
      *
      * Distinguishes two failure modes:
@@ -991,6 +1055,7 @@ class SearchController
      */
     private function handle_trending()
     {
+        $trending_degraded = false;
         // Same runtime-dependency gate as handle_search — results would
         // emit broken URLs without PeepSo.
         if ($response = $this->peepsoOrFail()) {
@@ -1111,6 +1176,8 @@ class SearchController
                 if ($trending_enrich_failed) {
                     return $this->degradedEnrichResponse($cached, $lkg_key);
                 }
+                // F-24: same silent no-trust case as handle_search.
+                $trending_degraded = self::isTrustDegraded();
                 // Fall back to basic data from the read-model rows if enriched failed.
                 foreach ($rows as $row) {
                     $pid = $row->id;
@@ -1157,6 +1224,7 @@ class SearchController
                     if ($fallback_enrich_failed) {
                         return $this->degradedEnrichResponse($cached, $lkg_key);
                     }
+                    $trending_degraded = self::isTrustDegraded();
 
                     usort($candidate_ids, static function (int $a, int $b) use ($scores_by_id): int {
                         $sa = $scores_by_id[$a]['ranking_score'] ?? 0.0;
@@ -1189,8 +1257,12 @@ class SearchController
                 'results'    => $results,
                 'categories' => $categories,
             ];
+            if ($trending_degraded) {
+                $response['system_degraded'] = true;
+                self::recordTrustDegraded();
+            }
 
-            $this->cacheTrendingResult($cache_key, $lkg_key, $response);
+            $this->cacheTrendingResult($cache_key, $lkg_key, $response, $trending_degraded);
 
             return new \WP_REST_Response($response);
         } finally {
@@ -1211,8 +1283,13 @@ class SearchController
      * @param string              $lkg_key
      * @param array<string,mixed> $response
      */
-    private function cacheTrendingResult(string $cache_key, string $lkg_key, array $response): void
+    private function cacheTrendingResult(string $cache_key, string $lkg_key, array $response, bool $degraded = false): void
     {
+        if ($degraded) {
+            self::cacheDegraded($cache_key, $response);
+            return;
+        }
+
         $jitter  = (int) (self::TRENDING_CACHE_TTL * 0.2);
         $softTtl = self::TRENDING_CACHE_TTL + random_int(-$jitter, $jitter);
         $hardTtl = $softTtl + 30;

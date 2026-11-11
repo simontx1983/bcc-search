@@ -126,6 +126,14 @@ namespace BCC\Core {
             {
                 return new \BCC\Search\Tests\Stubs\FakeScoreReadService();
             }
+
+            /** F-24: 'real' unless a test simulates an unbound trust engine. */
+            public static string $inspectRealResult = 'real';
+
+            public static function inspectReal(string $contract): string
+            {
+                return self::$inspectRealResult;
+            }
         }
     }
 }
