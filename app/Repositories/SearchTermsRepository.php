@@ -220,6 +220,7 @@ final class SearchTermsRepository
                     MAX(updated_at)      AS last_seen
                FROM {$table}
               WHERE day >= %s
+                AND vertical <> 'users'
               GROUP BY norm_term, vertical
               {$having}
               ORDER BY SUM(hits) DESC, MAX(updated_at) DESC
@@ -278,6 +279,7 @@ final class SearchTermsRepository
                     SUM(CASE WHEN day >= %s AND day < %s THEN hits ELSE 0 END)           AS prior
                FROM {$table}
               WHERE day >= %s
+                AND vertical <> 'users'
               GROUP BY norm_term, vertical
              HAVING recent >= %d AND recent > prior
               ORDER BY (recent - prior) DESC, recent DESC
@@ -324,7 +326,11 @@ final class SearchTermsRepository
         $table  = self::table();
         $cutoff = gmdate('Y-m-d', time() - (self::RETENTION_DAYS * DAY_IN_SECONDS));
 
-        $total = 0;
+        // F-53: people-search ('users') rows recorded before that vertical was
+        // switched off are removed on the next run, not left to age out over
+        // 30 days while the panel says they are never recorded. Bounded; a
+        // no-op once they are gone. Fixed literal, no input.
+        $total = (int) $wpdb->query("DELETE FROM {$table} WHERE vertical = 'users' LIMIT 10000");
         for ($i = 0; $i < self::PRUNE_MAX_ITERS; $i++) {
             $deleted = (int) $wpdb->query($wpdb->prepare(
                 "DELETE FROM {$table} WHERE day < %s LIMIT %d",

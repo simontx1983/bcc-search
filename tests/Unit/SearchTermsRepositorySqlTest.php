@@ -139,4 +139,25 @@ final class SearchTermsRepositorySqlTest extends TestCase
         // The batch size is a bound arg (bounded delete, no table lock).
         self::assertContains(1000, $p['args']);
     }
+
+    public function testPrunePurgesPreviouslyRecordedPeopleSearches(): void
+    {
+        // F-53: 'users' rows recorded before the vertical was switched off are
+        // removed on the next run, not left to age out over 30 days.
+        SearchTermsRepository::prune();
+
+        self::assertContains(
+            "DELETE FROM wp_bcc_search_terms WHERE vertical = 'users' LIMIT 10000",
+            $this->wpdb->queries
+        );
+    }
+
+    public function testPanelReadsExcludeThePeopleSearchVertical(): void
+    {
+        SearchTermsRepository::topTerms(30, 25, false);
+        self::assertStringContainsString("AND vertical <> 'users'", $this->lastPrepared()['sql']);
+
+        SearchTermsRepository::risingTerms(25);
+        self::assertStringContainsString("AND vertical <> 'users'", $this->lastPrepared()['sql']);
+    }
 }
