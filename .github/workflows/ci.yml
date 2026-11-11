@@ -56,7 +56,9 @@ jobs:
           echo "All PHP files parse cleanly."
 
       - name: PHPStan (level 8)
-        run: vendor/bin/phpstan analyse --no-progress
+        # Explicit limit: the analysed tree includes ../bcc-core/src for type
+        # resolution, and PHP's default memory_limit can be too small for it.
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=4G
 
       - name: Unit tests
         run: composer test
