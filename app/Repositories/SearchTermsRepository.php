@@ -39,13 +39,19 @@ final class SearchTermsRepository
     public const TERM_MAXLEN = 100;
 
     /**
-     * Rows older than this many days are pruned. Kept at 120 so the
-     * 90-day trend view in the admin panel is always backed by a full
-     * window (with ~30 days of headroom before a row ages out). Aggregate
-     * rows are tiny (one per term/vertical/day), so the extra retention is
-     * negligible.
+     * Rows older than this many days are pruned (F-53: was 120). Raw search
+     * text is kept only as long as the Developer panel needs it: its widest
+     * table is 30 days, and "Rising" needs 2 x RISING_WINDOW_DAYS (14).
      */
-    public const RETENTION_DAYS = 120;
+    public const RETENTION_DAYS = 30;
+
+    /**
+     * F-53: verticals that are NEVER recorded. A users-vertical term is the
+     * name of the PERSON being searched for: third-party personal data with
+     * no content-gap value, so it is refused here at the store, not just
+     * at the one caller.
+     */
+    private const UNRECORDED_VERTICALS = ['users'];
 
     /** Prune batch size + per-tick iteration cap (mirrors bcc_core_rl_cleanup). */
     private const PRUNE_BATCH      = 1000;
@@ -144,6 +150,10 @@ final class SearchTermsRepository
      */
     public static function record(string $vertical, string $normTerm, int $resultCount): void
     {
+        if (in_array($vertical, self::UNRECORDED_VERTICALS, true)) {
+            return;
+        }
+
         // Analytics can NEVER break a search — the whole body is swallow-and-log.
         try {
             $normTerm = trim($normTerm);
@@ -329,7 +339,10 @@ final class SearchTermsRepository
         return $total;
     }
 
-    /** Drop the table + install flag (uninstall path). */
+    /**
+     * Drop the table + install flag. NOT the uninstall path — uninstall.php
+     * runs without the autoloader and drops the table inline (F-53).
+     */
     public static function dropTable(): void
     {
         global $wpdb;

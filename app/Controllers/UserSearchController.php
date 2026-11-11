@@ -156,14 +156,8 @@ final class UserSearchController
             );
         }
 
-        // Analytics: miss-path only (a cache hit returned above), so the
-        // sample rate matches the cache window. Count comes from the service
-        // meta; term uses the same normalization as the cache key.
-        \BCC\Search\Repositories\SearchTermsRepository::record(
-            'users',
-            mb_strtolower($q),
-            (int) ($response['meta']['count'] ?? 0)
-        );
+        // F-53: the users vertical is deliberately NOT recorded in search
+        // analytics — the term is the name of the person being looked up.
 
         wp_cache_set($cache_key, $response, self::CACHE_GROUP, self::CACHE_TTL);
 
