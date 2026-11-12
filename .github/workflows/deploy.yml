@@ -112,7 +112,7 @@ jobs:
           fi
           echo "production health base: $PROD_HEALTH_BASE"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ steps.t.outputs.ref }}
 
