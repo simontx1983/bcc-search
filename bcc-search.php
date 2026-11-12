@@ -6,7 +6,7 @@
  * Author: Blue Collar Labs LLC
  * Text Domain: bcc-search
  * Requires at least: 5.8
- * Requires PHP: 7.4
+ * Requires PHP: 8.1
  * GitHub Plugin URI: https://github.com/simontx1983/bcc-search
  * Primary Branch: main
  *
