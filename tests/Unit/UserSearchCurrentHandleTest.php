@@ -10,18 +10,22 @@ use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
 use PHPUnit\Framework\TestCase;
 
 /**
- * F-302: global search could not find a member by their CURRENT handle.
+ * F-302: global search could not find a member by their CURRENT handle, and
+ * (review) its PeepSo term pass let an anonymous caller confirm logins and
+ * hidden real names.
  *
- * PeepSo's own search matches first/last name and user_login, never the BCC
+ * PeepSo's own search matches user_login and first/last name, never the BCC
  * @handle. The login is u_<the handle a member signed up with> and never
- * changes, so after a rename the member was unfindable by the new handle.
+ * changes. So the repository no longer hands the query to PeepSo at all:
+ * MATCHING is bcc-trust's MemberSearchCandidates (display name or current
+ * @handle, never the login), and the candidates go through PeepSoUserSearch
+ * as `include` with an EMPTY term, so the privacy filter set still decides
+ * who is visible. Without bcc-trust there is no matcher and nothing is
+ * returned.
  *
- * The repository now unions in bcc-trust's shared matcher
- * (MemberSearchCandidates: display name or @handle, never the login), routed
- * back through PeepSoUserSearch as `include` with an EMPTY term, so the
- * privacy filter set still decides who is visible. Each method runs in its
- * own process; the matcher double is declared only where a test needs it, so
- * the "bcc-trust inactive" case sees class_exists() === false.
+ * Each method runs in its own process; the matcher double
+ * (member-search-candidates-stub.php) is loaded only where bcc-trust is
+ * modelled as active.
  */
 #[RunTestsInSeparateProcesses]
 #[PreserveGlobalState(false)]
@@ -44,30 +48,15 @@ final class UserSearchCurrentHandleTest extends TestCase
         $GLOBALS['__bcc_usermeta'][7] = ['bcc_handle' => 'bob'];
     }
 
-    /** @param list<int> $ids */
+    /** bcc-trust active; its matcher answers $ids. */
     private static function matcherReturns(array $ids): void
     {
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         $GLOBALS['__bcc_member_candidates'] = $ids;
-        if (!class_exists('\\BCC\\Trust\\Core\\Support\\MemberSearchCandidates', false)) {
-            eval(<<<'PHP'
-                namespace BCC\Trust\Core\Support;
-                final class MemberSearchCandidates
-                {
-                    /** @return list<int> */
-                    public static function ids(string $needle, int $max = 1000): array
-                    {
-                        $GLOBALS['__bcc_member_candidates_needle'] = $needle;
-                        return $GLOBALS['__bcc_member_candidates'];
-                    }
-                }
-                PHP);
-        }
     }
 
     public function testARenamedMemberIsFoundByTheirCurrentHandle(): void
     {
-        // PeepSo's term search sees only the login (u_alice): no hit for bob.
-        \PeepSoUserSearch::$nextResults = [];
         self::matcherReturns([7]);
 
         $dtos = UserSearchRepository::search('bob', 20, 0);
@@ -80,41 +69,64 @@ final class UserSearchCurrentHandleTest extends TestCase
 
     public function testTheCandidatesGoThroughThePrivacyFilterWithAnEmptyTerm(): void
     {
-        \PeepSoUserSearch::$nextResults = [];
         self::matcherReturns([7]);
 
         UserSearchRepository::search('bob', 20, 555);
 
-        self::assertCount(2, \PeepSoUserSearch::$calls);
-        $scoped = \PeepSoUserSearch::$calls[1];
-        self::assertSame('', $scoped['needle'], 'the raw query must not reach PeepSo\'s own search again');
+        self::assertCount(1, \PeepSoUserSearch::$calls, 'one privacy-filtered pass, no term pass');
+        $scoped = \PeepSoUserSearch::$calls[0];
+        self::assertSame('', $scoped['needle']);
         self::assertSame([7], $scoped['args']['include']);
         self::assertSame(555, $scoped['viewerId'], 'the viewer\'s block filter applies');
     }
 
+    public function testTheRawQueryNeverReachesPeepSo(): void
+    {
+        // A login probe. The real matcher never matches a login, so it
+        // answers nothing — and PeepSo, which WOULD match u_alice, is never
+        // asked with that string.
+        self::matcherReturns([]);
+        \PeepSoUserSearch::$nextResults = [7];
+
+        self::assertSame([], UserSearchRepository::search('u_alice', 20, 0));
+        foreach (\PeepSoUserSearch::$calls as $call) {
+            self::assertNotSame('u_alice', $call['needle']);
+        }
+    }
+
+    public function testAHiddenRealNameReturnsNothing(): void
+    {
+        // Member 8 hides the real name "Margaret". The matcher matches a
+        // hidden real name by handle only, so "marg" finds nobody — and
+        // PeepSo's first/last-name search is never asked.
+        $u = new \WP_User();
+        $u->ID = 8;
+        $u->user_login = 'u_mags';
+        $u->user_nicename = 'u_mags';
+        $u->display_name = 'Margaret';
+        $GLOBALS['__bcc_userdata'][8] = $u;
+        $GLOBALS['__bcc_usermeta'][8] = ['bcc_handle' => 'mags', 'first_name' => 'Margaret', 'bcc_privacy_real_name_hidden' => '1'];
+        self::matcherReturns([]);
+        \PeepSoUserSearch::$nextResults = [8];
+
+        self::assertSame([], UserSearchRepository::search('marg', 20, 0));
+        self::assertSame([], \PeepSoUserSearch::$calls, 'no candidates, so no PeepSo call at all');
+    }
+
     public function testACandidateThePrivacyFilterHidesIsNotReturned(): void
     {
-        \PeepSoUserSearch::$nextResults = [];
-        \PeepSoUserSearch::$visible     = [];   // e.g. hidden from listings
+        \PeepSoUserSearch::$visible = [];   // e.g. hidden from listings
         self::matcherReturns([7]);
 
         self::assertSame([], UserSearchRepository::search('bob', 20, 0));
     }
 
-    public function testAMemberBothPassesFindIsReturnedOnce(): void
+    public function testWithoutBccTrustNothingIsReturnedAndPeepSoIsNotAsked(): void
     {
-        \PeepSoUserSearch::$nextResults = [7];  // e.g. first name "Robert"
-        self::matcherReturns([7]);
-
-        self::assertCount(1, UserSearchRepository::search('rob', 20, 0));
-    }
-
-    public function testWithoutBccTrustOnlyThePeepSoTermSearchRuns(): void
-    {
-        \PeepSoUserSearch::$nextResults = [];
+        \PeepSoUserSearch::$nextResults = [7];
 
         self::assertFalse(class_exists('\\BCC\\Trust\\Core\\Support\\MemberSearchCandidates', false));
         self::assertSame([], UserSearchRepository::search('bob', 20, 0));
-        self::assertCount(1, \PeepSoUserSearch::$calls);
+        self::assertSame([], \PeepSoUserSearch::$calls);
     }
 }

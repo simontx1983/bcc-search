@@ -23,8 +23,11 @@ if (!defined('ABSPATH')) {
  * enumerable by iterating the prefix. That turned the endpoint into an
  * anonymous member-directory scrape.
  *
- * This repository now resolves candidate ids through **PeepSoUserSearch** —
- * the same privacy-aware WP_User_Query wrapper `/users/mention-search` uses
+ * MATCHING is bcc-trust's `MemberSearchCandidates` (display name or current
+ * @handle; never the login or email; a hidden real name by handle only).
+ * Those candidate ids then go through **PeepSoUserSearch** as `include` with
+ * an EMPTY term (F-302) — the same privacy-aware WP_User_Query wrapper
+ * `/users/mention-search` uses
  * (`BCC\Trust\Core\Services\Mentions\MentionSearchService`). Its
  * `pre_user_query` callback applies: ban filter, `profile_acc != PRIVATE`,
  * members-only-when-anon, `peepso_user_blocked` (both directions when a
@@ -73,45 +76,18 @@ final class UserSearchRepository
             return [];
         }
 
-        // PeepSoUserSearch force-sets fields=ID and applies the privacy
-        // filter set in its pre_user_query callback. It escapes the needle
-        // via $wpdb->esc_like internally; we trim upstream. Passing a
-        // resolved viewer id (not null) additionally enables the
-        // block-both-directions filter for signed-in callers.
-        $search = new \PeepSoUserSearch(
-            [
-                'number'  => $limit * self::OVERFETCH_FACTOR,
-                'orderby' => 'username',
-                'order'   => 'ASC',
-            ],
-            $viewerId > 0 ? $viewerId : null,
-            $query
-        );
-
-        /** @var mixed $rawResults */
-        $rawResults = $search->results;
-        $rawIds     = is_array($rawResults) ? $rawResults : [];
-
-        $userIds = [];
-        foreach ($rawIds as $id) {
-            $idInt = (int) $id;
-            if ($idInt > 0) {
-                $userIds[$idInt] = $idInt;
-            }
-        }
-
-        // F-302: PeepSo's own search matches first/last name and user_login,
-        // never the BCC @handle or the display name. A member's login is
-        // u_<the handle they SIGNED UP with> and never changes, so after a
-        // rename the member could not be found by their current handle at
-        // all. Union in bcc-trust's shared matcher (display name or @handle,
-        // never the login; the same one /members and the @-mention picker
-        // use), routed back through PeepSoUserSearch as `include` with an
-        // EMPTY term, so the same privacy filter set applies to these ids.
-        foreach (self::handleOrNameMatches($query, $limit * self::OVERFETCH_FACTOR, $viewerId) as $idInt) {
-            $userIds[$idInt] = $idInt;
-        }
-        $userIds = array_values($userIds);
+        // ⛔ The raw query NEVER reaches PeepSo's own search (F-302 review).
+        // PeepSo matches user_login and first/last name, and the login is
+        // u_<the handle a member signed up with> (or, for a member #540
+        // rotated, the old login itself): passing the query there made this
+        // anonymous endpoint confirm logins and hidden real names. MATCHING
+        // is bcc-trust's MemberSearchCandidates — display name or current
+        // @handle, never the login, and a hidden real name by handle only —
+        // the same matcher /members and the @-mention picker use. PRIVACY
+        // stays PeepSo's: the candidates go back through PeepSoUserSearch as
+        // `include` with an EMPTY term. Without bcc-trust there is no
+        // matcher, so nothing is returned.
+        $userIds = self::handleOrNameMatches($query, $limit * self::OVERFETCH_FACTOR, $viewerId);
 
         if ($userIds === []) {
             return [];
@@ -123,12 +99,10 @@ final class UserSearchRepository
         // bcc_handle read below is cache-served, not a query.
         cache_users($userIds);
 
-        // F-54: PeepSoUserSearch matches first/last name OR user_login (and
-        // user_email when PeepSo's members_email_searchable is on). On this
-        // anonymous endpoint that made the search a substring oracle on
-        // login names: probing "adm" and getting back a differently-named
-        // user revealed their login. Keep a row only when the query matches
-        // something PUBLIC about the person; a login-/email-only match drops.
+        // F-54: keep a row only when the query matches something PUBLIC
+        // about the person. Since F-302 the matcher itself never looks at
+        // the login or email, so this is defence in depth: it still drops a
+        // row if a future matcher change lets a login-/email-only hit in.
         $needle = mb_strtolower(trim($query));
 
         $dtos = [];
