@@ -143,14 +143,13 @@ final class UserSearchRepository
             if ($nameHidden) {
                 $displayName = '@' . $handle;
             }
-            $publicFields = $nameHidden
-                ? [$handle]
-                : [
-                    $displayName,
-                    $handle,
-                    (string) get_user_meta($userId, 'first_name', true),
-                    (string) get_user_meta($userId, 'last_name', true),
-                ];
+            // Exactly what the result SHOWS: the effective display name
+            // (after the login-shaped and hidden-name swaps above) and the
+            // handle. Not first/last name (F-302 review): a member whose
+            // display_name is still their u_<original> login became a
+            // candidate through it, and a first-name match then kept them,
+            // so "alice" found the renamed alice→bob.
+            $publicFields = $nameHidden ? [$handle] : [$displayName, $handle];
             if ($needle !== '' && !self::matchesPublicField($needle, $publicFields)) {
                 continue;
             }

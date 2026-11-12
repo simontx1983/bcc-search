@@ -113,6 +113,21 @@ final class UserSearchCurrentHandleTest extends TestCase
         self::assertSame([], \PeepSoUserSearch::$calls, 'no candidates, so no PeepSo call at all');
     }
 
+    public function testAnOldLoginShapedDisplayNameAndAFirstNameDoNotFindTheRenamedMember(): void
+    {
+        // alice renamed to bob, but display_name still holds the login
+        // u_alice and first_name is Alice. The matcher can surface her
+        // through that display_name; what the result SHOWS is "bob", so
+        // "alice" must not keep her (not even through the first name).
+        $GLOBALS['__bcc_userdata'][7]->display_name = 'u_alice';
+        $GLOBALS['__bcc_usermeta'][7] = ['bcc_handle' => 'bob', 'first_name' => 'Alice', 'last_name' => 'Smith'];
+        self::matcherReturns([7]);
+
+        self::assertSame([], UserSearchRepository::search('alice', 20, 0));
+        self::assertSame([], UserSearchRepository::search('smith', 20, 0));
+        self::assertCount(1, UserSearchRepository::search('bob', 20, 0), 'control: the shown handle still matches');
+    }
+
     public function testACandidateThePrivacyFilterHidesIsNotReturned(): void
     {
         \PeepSoUserSearch::$visible = [];   // e.g. hidden from listings
