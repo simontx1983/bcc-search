@@ -144,12 +144,26 @@ final class UserSearchRepository
                 $displayName = $handle;
             }
 
-            if ($needle !== '' && !self::matchesPublicField($needle, [
-                $displayName,
-                $handle,
-                (string) get_user_meta($userId, 'first_name', true),
-                (string) get_user_meta($userId, 'last_name', true),
-            ])) {
+            // F-28: "Hide my real name" (bcc-trust §K2 real_name_hidden,
+            // user meta bcc_privacy_real_name_hidden). For everyone but the
+            // member: the real name is NOT a searchable field (a name search
+            // would otherwise link it to the @handle) and the result shows
+            // '@handle'. The response cache is keyed per viewer, so the
+            // member's own view can't leak to others.
+            $nameHidden = $userId !== $viewerId
+                && filter_var(get_user_meta($userId, 'bcc_privacy_real_name_hidden', true), FILTER_VALIDATE_BOOLEAN);
+            if ($nameHidden) {
+                $displayName = '@' . $handle;
+            }
+            $publicFields = $nameHidden
+                ? [$handle]
+                : [
+                    $displayName,
+                    $handle,
+                    (string) get_user_meta($userId, 'first_name', true),
+                    (string) get_user_meta($userId, 'last_name', true),
+                ];
+            if ($needle !== '' && !self::matchesPublicField($needle, $publicFields)) {
                 continue;
             }
 
