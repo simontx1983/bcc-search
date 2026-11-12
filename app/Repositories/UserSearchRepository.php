@@ -96,9 +96,23 @@ final class UserSearchRepository
         foreach ($rawIds as $id) {
             $idInt = (int) $id;
             if ($idInt > 0) {
-                $userIds[] = $idInt;
+                $userIds[$idInt] = $idInt;
             }
         }
+
+        // F-302: PeepSo's own search matches first/last name and user_login,
+        // never the BCC @handle or the display name. A member's login is
+        // u_<the handle they SIGNED UP with> and never changes, so after a
+        // rename the member could not be found by their current handle at
+        // all. Union in bcc-trust's shared matcher (display name or @handle,
+        // never the login; the same one /members and the @-mention picker
+        // use), routed back through PeepSoUserSearch as `include` with an
+        // EMPTY term, so the same privacy filter set applies to these ids.
+        foreach (self::handleOrNameMatches($query, $limit * self::OVERFETCH_FACTOR, $viewerId) as $idInt) {
+            $userIds[$idInt] = $idInt;
+        }
+        $userIds = array_values($userIds);
+
         if ($userIds === []) {
             return [];
         }
@@ -182,6 +196,54 @@ final class UserSearchRepository
             strcmp(mb_strtolower($a->displayName), mb_strtolower($b->displayName)) ?: ($a->id <=> $b->id));
 
         return array_slice($dtos, 0, $limit);
+    }
+
+    /**
+     * Ids whose display name or current @handle contains $query, after
+     * PeepSo's privacy filter set (F-302). Empty when bcc-trust is not
+     * active: its MemberSearchCandidates is the one matcher for those two
+     * fields, and this plugin never reimplements it.
+     *
+     * @return list<int>
+     */
+    private static function handleOrNameMatches(string $query, int $number, int $viewerId): array
+    {
+        $matcher = '\\BCC\\Trust\\Core\\Support\\MemberSearchCandidates';
+        // Fail closed without PeepSo too, like search(): never return ids
+        // the privacy filter set did not see.
+        if (!class_exists($matcher) || !class_exists('PeepSoUserSearch')) {
+            return [];
+        }
+
+        /** @var list<int> $candidates */
+        $candidates = $matcher::ids($query);
+        if ($candidates === []) {
+            return [];
+        }
+
+        // ⛔ Empty search term: the raw query must not reach PeepSo's own
+        // search a second time, only its privacy filter over `include`.
+        $search = new \PeepSoUserSearch(
+            [
+                'number'  => $number,
+                'orderby' => 'username',
+                'order'   => 'ASC',
+                'include' => $candidates,
+            ],
+            $viewerId > 0 ? $viewerId : null,
+            ''
+        );
+
+        /** @var mixed $raw */
+        $raw = $search->results;
+        $ids = [];
+        foreach (is_array($raw) ? $raw : [] as $id) {
+            $idInt = (int) $id;
+            if ($idInt > 0) {
+                $ids[] = $idInt;
+            }
+        }
+        return $ids;
     }
 
     /**
