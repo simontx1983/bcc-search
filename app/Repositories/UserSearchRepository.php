@@ -23,8 +23,11 @@ if (!defined('ABSPATH')) {
  * enumerable by iterating the prefix. That turned the endpoint into an
  * anonymous member-directory scrape.
  *
- * This repository now resolves candidate ids through **PeepSoUserSearch** —
- * the same privacy-aware WP_User_Query wrapper `/users/mention-search` uses
+ * MATCHING is bcc-trust's `MemberSearchCandidates` (display name or current
+ * @handle; never the login or email; a hidden real name by handle only).
+ * Those candidate ids then go through **PeepSoUserSearch** as `include` with
+ * an EMPTY term (F-302) — the same privacy-aware WP_User_Query wrapper
+ * `/users/mention-search` uses
  * (`BCC\Trust\Core\Services\Mentions\MentionSearchService`). Its
  * `pre_user_query` callback applies: ban filter, `profile_acc != PRIVATE`,
  * members-only-when-anon, `peepso_user_blocked` (both directions when a
@@ -73,32 +76,19 @@ final class UserSearchRepository
             return [];
         }
 
-        // PeepSoUserSearch force-sets fields=ID and applies the privacy
-        // filter set in its pre_user_query callback. It escapes the needle
-        // via $wpdb->esc_like internally; we trim upstream. Passing a
-        // resolved viewer id (not null) additionally enables the
-        // block-both-directions filter for signed-in callers.
-        $search = new \PeepSoUserSearch(
-            [
-                'number'  => $limit * self::OVERFETCH_FACTOR,
-                'orderby' => 'username',
-                'order'   => 'ASC',
-            ],
-            $viewerId > 0 ? $viewerId : null,
-            $query
-        );
+        // ⛔ The raw query NEVER reaches PeepSo's own search (F-302 review).
+        // PeepSo matches user_login and first/last name, and the login is
+        // u_<the handle a member signed up with> (or, for a member #540
+        // rotated, the old login itself): passing the query there made this
+        // anonymous endpoint confirm logins and hidden real names. MATCHING
+        // is bcc-trust's MemberSearchCandidates — display name or current
+        // @handle, never the login, and a hidden real name by handle only —
+        // the same matcher /members and the @-mention picker use. PRIVACY
+        // stays PeepSo's: the candidates go back through PeepSoUserSearch as
+        // `include` with an EMPTY term. Without bcc-trust there is no
+        // matcher, so nothing is returned.
+        $userIds = self::handleOrNameMatches($query, $limit * self::OVERFETCH_FACTOR, $viewerId);
 
-        /** @var mixed $rawResults */
-        $rawResults = $search->results;
-        $rawIds     = is_array($rawResults) ? $rawResults : [];
-
-        $userIds = [];
-        foreach ($rawIds as $id) {
-            $idInt = (int) $id;
-            if ($idInt > 0) {
-                $userIds[] = $idInt;
-            }
-        }
         if ($userIds === []) {
             return [];
         }
@@ -109,12 +99,10 @@ final class UserSearchRepository
         // bcc_handle read below is cache-served, not a query.
         cache_users($userIds);
 
-        // F-54: PeepSoUserSearch matches first/last name OR user_login (and
-        // user_email when PeepSo's members_email_searchable is on). On this
-        // anonymous endpoint that made the search a substring oracle on
-        // login names: probing "adm" and getting back a differently-named
-        // user revealed their login. Keep a row only when the query matches
-        // something PUBLIC about the person; a login-/email-only match drops.
+        // F-54: keep a row only when the query matches something PUBLIC
+        // about the person. Since F-302 the matcher itself never looks at
+        // the login or email, so this is defence in depth: it still drops a
+        // row if a future matcher change lets a login-/email-only hit in.
         $needle = mb_strtolower(trim($query));
 
         $dtos = [];
@@ -155,14 +143,13 @@ final class UserSearchRepository
             if ($nameHidden) {
                 $displayName = '@' . $handle;
             }
-            $publicFields = $nameHidden
-                ? [$handle]
-                : [
-                    $displayName,
-                    $handle,
-                    (string) get_user_meta($userId, 'first_name', true),
-                    (string) get_user_meta($userId, 'last_name', true),
-                ];
+            // Exactly what the result SHOWS: the effective display name
+            // (after the login-shaped and hidden-name swaps above) and the
+            // handle. Not first/last name (F-302 review): a member whose
+            // display_name is still their u_<original> login became a
+            // candidate through it, and a first-name match then kept them,
+            // so "alice" found the renamed alice→bob.
+            $publicFields = $nameHidden ? [$handle] : [$displayName, $handle];
             if ($needle !== '' && !self::matchesPublicField($needle, $publicFields)) {
                 continue;
             }
@@ -182,6 +169,54 @@ final class UserSearchRepository
             strcmp(mb_strtolower($a->displayName), mb_strtolower($b->displayName)) ?: ($a->id <=> $b->id));
 
         return array_slice($dtos, 0, $limit);
+    }
+
+    /**
+     * Ids whose display name or current @handle contains $query, after
+     * PeepSo's privacy filter set (F-302). Empty when bcc-trust is not
+     * active: its MemberSearchCandidates is the one matcher for those two
+     * fields, and this plugin never reimplements it.
+     *
+     * @return list<int>
+     */
+    private static function handleOrNameMatches(string $query, int $number, int $viewerId): array
+    {
+        $matcher = '\\BCC\\Trust\\Core\\Support\\MemberSearchCandidates';
+        // Fail closed without PeepSo too, like search(): never return ids
+        // the privacy filter set did not see.
+        if (!class_exists($matcher) || !class_exists('PeepSoUserSearch')) {
+            return [];
+        }
+
+        /** @var list<int> $candidates */
+        $candidates = $matcher::ids($query);
+        if ($candidates === []) {
+            return [];
+        }
+
+        // ⛔ Empty search term: the raw query must not reach PeepSo's own
+        // search a second time, only its privacy filter over `include`.
+        $search = new \PeepSoUserSearch(
+            [
+                'number'  => $number,
+                'orderby' => 'username',
+                'order'   => 'ASC',
+                'include' => $candidates,
+            ],
+            $viewerId > 0 ? $viewerId : null,
+            ''
+        );
+
+        /** @var mixed $raw */
+        $raw = $search->results;
+        $ids = [];
+        foreach (is_array($raw) ? $raw : [] as $id) {
+            $idInt = (int) $id;
+            if ($idInt > 0) {
+                $ids[] = $idInt;
+            }
+        }
+        return $ids;
     }
 
     /**

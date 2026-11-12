@@ -25,6 +25,17 @@ namespace {
             /** @var list<int|numeric-string> */
             public static array $nextResults = [];
 
+            /** @var list<array{args: array<string,mixed>, viewerId: int|null, needle: string}> */
+            public static array $calls = [];
+
+            /**
+             * Ids the privacy filter lets through on an `include` call (F-302);
+             * null = every included id is visible.
+             *
+             * @var list<int>|null
+             */
+            public static ?array $visible = null;
+
             /** @var list<int|numeric-string> */
             public array $results = [];
 
@@ -32,6 +43,15 @@ namespace {
             public function __construct(array $args, ?int $viewerId, string $needle)
             {
                 self::$lastCtor = ['args' => $args, 'viewerId' => $viewerId, 'needle' => $needle];
+                self::$calls[]  = self::$lastCtor;
+                if (isset($args['include']) && is_array($args['include'])) {
+                    // The include-scoped pass: privacy-filtered candidates.
+                    $this->results = array_values(array_filter(
+                        array_map('intval', $args['include']),
+                        static fn (int $id): bool => self::$visible === null || in_array($id, self::$visible, true)
+                    ));
+                    return;
+                }
                 $this->results  = self::$nextResults;
             }
 
@@ -39,6 +59,8 @@ namespace {
             {
                 self::$lastCtor    = null;
                 self::$nextResults = [];
+                self::$calls       = [];
+                self::$visible     = null;
             }
         }
     }

@@ -39,6 +39,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testRoutesThroughPeepSoUserSearchAndForwardsViewerId(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7, 9];
 
@@ -63,7 +64,11 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // Viewer id forwarded so PeepSoUserSearch applies the block filter.
         self::assertNotNull(\PeepSoUserSearch::$lastCtor);
         self::assertSame(555, \PeepSoUserSearch::$lastCtor['viewerId']);
-        self::assertSame('a', \PeepSoUserSearch::$lastCtor['needle']);
+        // F-302: matching is bcc-trust's; PeepSo gets the candidates as
+        // `include` and an EMPTY term, never the raw query.
+        self::assertSame('', \PeepSoUserSearch::$lastCtor['needle']);
+        self::assertSame([7, 9], \PeepSoUserSearch::$lastCtor['args']['include']);
+        self::assertSame('a', $GLOBALS['__bcc_member_candidates_needle']);
 
         // Results projected in the privacy-filtered search order.
         self::assertCount(2, $dtos);
@@ -93,6 +98,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // F-54: PeepSo matched 'adm' on user_login; the visible fields of
         // this user ("Carol" / carol) do not contain it, so the row must drop.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [21];
         $GLOBALS['__bcc_userdata'] = [];
@@ -106,6 +112,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // F-54: without a handle the only public identifier would be the
         // login-derived nicename.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [22];
         $GLOBALS['__bcc_userdata'] = [];
@@ -118,6 +125,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     {
         // F-54: a wp-admin-created account defaults display_name to the login.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [23];
         $GLOBALS['__bcc_userdata'] = [];
@@ -135,6 +143,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // (dropped); the public matches behind them must still come back,
         // trimmed to the requested limit.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         $GLOBALS['__bcc_userdata'] = [];
         $ids = [];
@@ -157,8 +166,11 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAnonymousViewerPassesNullToWrapper(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
-        \PeepSoUserSearch::$nextResults = [];
+        // One candidate, so the privacy-filtered pass runs (with none,
+        // PeepSo is never called — F-302).
+        \PeepSoUserSearch::$nextResults = [1];
 
         UserSearchRepository::search('a', 20, 0);
 
@@ -170,6 +182,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAHiddenRealNameIsNotSearchableAndShowsAsHandle(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7];
         self::user(7, 'secret_login7', 'Alice Smith', ['bcc_handle' => 'quietfox', 'bcc_privacy_real_name_hidden' => '1', 'first_name' => 'Alice', 'last_name' => 'Smith']);
@@ -188,6 +201,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testTheMemberStillFindsAndSeesTheirOwnName(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7];
         self::user(7, 'secret_login7', 'Alice Smith', ['bcc_handle' => 'quietfox', 'bcc_privacy_real_name_hidden' => '1']);
@@ -200,6 +214,7 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAFalseFlagLeavesTheNameSearchable(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [8];
         self::user(8, 'secret_login8', 'Bob Jones', ['bcc_handle' => 'bobj', 'bcc_privacy_real_name_hidden' => '0']);
