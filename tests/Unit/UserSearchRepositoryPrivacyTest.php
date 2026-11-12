@@ -165,4 +165,47 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         self::assertNotNull(\PeepSoUserSearch::$lastCtor);
         self::assertNull(\PeepSoUserSearch::$lastCtor['viewerId']);
     }
+    // ── F-28: "Hide my real name" ───────────────────────────────────────
+
+    public function testAHiddenRealNameIsNotSearchableAndShowsAsHandle(): void
+    {
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [7];
+        self::user(7, 'secret_login7', 'Alice Smith', ['bcc_handle' => 'quietfox', 'bcc_privacy_real_name_hidden' => '1', 'first_name' => 'Alice', 'last_name' => 'Smith']);
+
+        // A search by the real name must not find the member (it would
+        // link the name to @quietfox).
+        self::assertSame([], UserSearchRepository::search('alice', 20, 555));
+
+        // Found by handle, shown as @handle.
+        \PeepSoUserSearch::$nextResults = [7];
+        $dtos = UserSearchRepository::search('quiet', 20, 555);
+        self::assertCount(1, $dtos);
+        self::assertSame('@quietfox', $dtos[0]->displayName);
+    }
+
+    public function testTheMemberStillFindsAndSeesTheirOwnName(): void
+    {
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [7];
+        self::user(7, 'secret_login7', 'Alice Smith', ['bcc_handle' => 'quietfox', 'bcc_privacy_real_name_hidden' => '1']);
+
+        $dtos = UserSearchRepository::search('alice', 20, 7);
+        self::assertCount(1, $dtos);
+        self::assertSame('Alice Smith', $dtos[0]->displayName);
+    }
+
+    public function testAFalseFlagLeavesTheNameSearchable(): void
+    {
+        require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        \PeepSoUserSearch::reset();
+        \PeepSoUserSearch::$nextResults = [8];
+        self::user(8, 'secret_login8', 'Bob Jones', ['bcc_handle' => 'bobj', 'bcc_privacy_real_name_hidden' => '0']);
+
+        $dtos = UserSearchRepository::search('jones', 20, 555);
+        self::assertCount(1, $dtos);
+        self::assertSame('Bob Jones', $dtos[0]->displayName);
+    }
 }
