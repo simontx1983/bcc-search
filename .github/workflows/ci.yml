@@ -37,9 +37,18 @@ jobs:
           repository: simontx1983/bcc-core
           path: app/public/wp-content/plugins/bcc-core
 
+      # Production and staging run PHP 8.3.30, so CI does too (F-434; bcc-trust
+      # #771 made the same move).
+      #
+      # ⚠ Unlike bcc-trust, this repo sets no `config.platform.php` and no
+      # PHPStan `phpVersion`, so the runner's version IS PHPStan's analysis
+      # target (`phpstan diagnose`: "8.3.x (from runtime)"). Bumping this line
+      # moves both at once; a future bump will move the target again.
+      # composer.lock pins every dev package and production ships none, so
+      # `composer install` resolves the same set on either version.
       - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
-          php-version: '8.2'
+          php-version: '8.3'
           extensions: mbstring
           tools: composer:v2
           coverage: none
