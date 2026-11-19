@@ -37,9 +37,18 @@ jobs:
           repository: simontx1983/bcc-core
           path: app/public/wp-content/plugins/bcc-core
 
+      # Production and staging run PHP 8.3.30, so CI does too (F-434; bcc-trust
+      # #771 made the same move).
+      #
+      # PHPStan's analysis target is pinned separately, by the `phpVersion`
+      # range in phpstan.neon (the 8.1 floor to 8.3), so bumping this line
+      # moves only the runtime. (bcc-trust
+      # pins its target through `config.platform.php`; this repo sets no
+      # platform.) composer.lock pins every dev package and production ships
+      # none, so `composer install` resolves the same set on either version.
       - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
-          php-version: '8.2'
+          php-version: '8.3'
           extensions: mbstring
           tools: composer:v2
           coverage: none
