@@ -181,6 +181,26 @@ namespace {
         }
     }
 
+    /**
+     * ⚠ FAITHFUL: writes ONLY when the key is absent. F-442 made the
+     * generation reader populate a true cache MISS with add() rather than
+     * set(), so that a bump landing between the cache read and the write
+     * survives. A permissive stub behaving like set() would hide exactly the
+     * behaviour that change exists for.
+     */
+    if (!function_exists('wp_cache_add')) {
+        function wp_cache_add(string $key, mixed $value, string $group = '', int $ttl = 0): bool
+        {
+            $k = $group . ':' . $key;
+            if (array_key_exists($k, UserSearchGenStore::$cache)) {
+                return false;
+            }
+            UserSearchGenStore::$setKeys[] = $key;
+            UserSearchGenStore::$cache[$k] = $value;
+            return true;
+        }
+    }
+
     if (!function_exists('get_option')) {
         function get_option(string $name, mixed $default = false): mixed
         {
