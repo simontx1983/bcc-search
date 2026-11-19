@@ -224,6 +224,7 @@ final class UserSearchCacheGenerationTest extends TestCase
                 'add_option_allow_hide_user_from_user_listing',
                 'added_user_meta',
                 'bcc_profile_visibility_changed',
+                'bcc_user_suspension_changed',
                 'delete_option_allow_hide_user_from_user_listing',
                 'deleted_user',
                 'deleted_user_meta',
@@ -319,5 +320,8 @@ final class UserSearchCacheGenerationTest extends TestCase
         // The profile privacy level has no hook of PeepSo's own; this is
         // bcc-trust's, fired by /me/profile-prefs on a real change.
         yield 'a profile-privacy change'     => ['bcc_profile_visibility_changed'];
+        // BCC suspension is filtered by bcc-trust's own pre_user_query
+        // listener, which PeepSo knows nothing about (F-182).
+        yield 'a suspension or unsuspension' => ['bcc_user_suspension_changed'];
     }
 }
