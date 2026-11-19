@@ -105,17 +105,22 @@ final class UserSearchController
      * (like the other two verticals') so it fires on admin, AJAX and cron
      * writes, not only on REST requests.
      *
-     * ⚠ ONE FILTER CANNOT BE HOOKED: `usr_profile_acc`, the profile
-     * privacy level. PeepSo writes it straight to its own table —
+     * ⚠ `usr_profile_acc` — the profile privacy level — is the one filter
+     * with NO hook of its own. PeepSo writes it straight to its own table:
      * `PeepSoUser::update_peepso_user()` runs `$wpdb->update` and fires no
      * action, and the `usr_profile_acc` branch of
      * `PeepSoProfilePreferencesAjax::savepreference()` deliberately
-     * bypasses `update_user_meta`, so no meta hook sees it either. A member
-     * switching their profile to Private is therefore still bounded by the
-     * 45-second TTL and nothing better. Everything else below is bumped at
-     * once. Said here rather than left for someone to discover: a counter
-     * that silently covers five of six triggers is worse than one whose gap
-     * is written down.
+     * bypasses `update_user_meta`, so no meta hook sees it either.
+     *
+     * It is covered anyway for the path members actually use:
+     * bcc-trust's own `/me/profile-prefs` route fires
+     * `bcc_profile_visibility_changed` after writing it, and only when the
+     * value really changed (`MyProfilePrefsEndpoint`), so this listens to
+     * that. What stays uncovered is a write that goes through PeepSo's own
+     * preferences AJAX, PeepSo's admin screens, or straight into the
+     * database — those still fall back to the 45-second TTL. Said here
+     * rather than left for someone to discover: a counter whose remaining
+     * gap is written down is worth more than one that looks complete.
      *
      * The ban case DOES have a hook, which is easy to miss because PeepSo
      * fires nothing named for banning: a ban is a role change, and
@@ -152,6 +157,12 @@ final class UserSearchController
 
         // Ban / unban / verification — see the docblock above.
         add_action('peepso_action_user_role_change', $bump);
+
+        // The profile privacy level, via bcc-trust's own route. PeepSo's
+        // table write fires nothing, so this is the only hook there is for
+        // it — and bcc-trust fires it only on a real change, which is what
+        // keeps a settings form resubmitting the same value from bumping.
+        add_action('bcc_profile_visibility_changed', $bump);
 
         // The site-wide hide-from-listing switch.
         add_action('add_option_' . self::BUST_OPTION, $bump);
