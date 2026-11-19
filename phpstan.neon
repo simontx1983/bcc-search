@@ -9,8 +9,11 @@ parameters:
     # minor version (8.3). Without this the target follows the runner, so a CI
     # bump would move it silently; a flat 8.3 would let 8.3-only code pass
     # analysis that the 8.1 floor cannot run. Raise `min` together with the
-    # floor. bcc-trust pins its target through composer.json's
-    # config.platform.php instead; this repo sets no platform.
+    # floor. bcc-trust uses the same mechanism (trust #776: min 80200, its
+    # 8.2 floor) and keeps config.platform.php at that floor for Composer's
+    # dependency resolution only. This repo sets no platform and ships no
+    # production dependencies; its committed vendor/composer/platform_check.php
+    # enforces the same 8.1 floor at runtime.
     phpVersion:
         min: 80100
         max: 80399
