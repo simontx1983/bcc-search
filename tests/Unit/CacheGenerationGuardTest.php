@@ -125,15 +125,27 @@ final class CacheGenerationGuardTest extends TestCase
         self::assertSame(4, self::cached());
     }
 
-    /** @return iterable<string, array{0: mixed}> */
+    /**
+     * @return iterable<string, array{0: mixed}>
+     *
+     * ⭐ The last two cast HIGH, and they are the cases the validity check
+     * exists for. Every other value here casts to 0 or 1 — below anything
+     * these tests publish — so the guard falls through and writes whether or
+     * not it checks validity. A mutation removing that check therefore
+     * SURVIVED until these two were added. Without the check the guard would
+     * read a digit-prefixed string as "newer", adopt it, return a bogus
+     * counter and leave the poison cached for the whole TTL.
+     */
     public static function poisonedCacheValues(): iterable
     {
-        yield 'a word'        => ['nonsense'];
-        yield 'a float'       => [1.5];
-        yield 'an array'      => [['9']];
-        yield 'null'          => [null];
-        yield 'a bool'        => [true];
-        yield 'a signed int'  => ['-5'];
+        yield 'a word'                     => ['nonsense'];
+        yield 'a float'                    => [1.5];
+        yield 'an array'                   => [['9']];
+        yield 'null'                       => [null];
+        yield 'a bool'                     => [true];
+        yield 'a signed int'               => ['-5'];
+        yield 'a digit-PREFIXED string'    => ['9999999999abc'];
+        yield 'a float that casts high'    => [1.0e12];
     }
 
     /** A digit-string counts, because wp_options hands back strings. */
