@@ -1757,7 +1757,25 @@ class SearchController
             return;
         }
         self::$bustQueued = false;
-        $version = time();
+
+        // ⚠ F-442: strictly increasing, for the same reason as the LKG
+        // generation below — and it matters here too, because a privacy
+        // flip bumps BOTH (see bust_search_privacy()). Fixing only the LKG
+        // generation would leave the same one-second hole in the HOT,
+        // version-scoped cache. Harmless for ordinary content busts: still
+        // a seconds-based integer, still increasing.
+        // ⚠ Read inline rather than through getCacheVersion(): that reader
+        // can usleep ~36ms and claim a heal lock, neither of which belongs
+        // in a shutdown handler, and it writes the cache as a side effect.
+        // The floor we need is simply the highest value a reader could
+        // currently return — a valid cache entry, else the option.
+        $current = wp_cache_get(self::SEARCH_VERSION_KEY, self::CACHE_GROUP);
+        $current = self::isValidVersionValue($current)
+            ? (int) $current
+            : self::readValidatedVersionOption();
+
+        $version = max(time(), $current + 1);
+
         update_option(self::SEARCH_VERSION_KEY, $version, false);
         // Uniform TTL with the heal path — no "forever" keys in multi-node
         // setups that would defeat getCacheVersion()'s damping window.
@@ -1789,26 +1807,69 @@ class SearchController
             return;
         }
         self::$privacyBustQueued = false;
-        $gen = time();
+
+        // ⚠ F-442: STRICTLY INCREASING, not a bare time(). A bump landing in
+        // the same second as the current generation would otherwise produce
+        // the SAME value, so the cache key would not change and the entry
+        // written just before the privacy flip would stay reachable for the
+        // rest of that second. One second rather than a full TTL, but
+        // "privacy is a binary invisibility guarantee, not a freshness
+        // budget" has no one-second exemption. The value stays a
+        // seconds-based integer, and a backwards clock jump cannot stall it.
+        // Read inline, for the same reason as the content version above:
+        // getLkgGeneration() writes the cache as a side effect, so calling
+        // it here would populate the OLD value and then immediately have it
+        // replaced by the write below.
+        $current = wp_cache_get(self::SEARCH_LKG_GEN_KEY, self::CACHE_GROUP);
+        $current = self::isValidVersionValue($current)
+            ? (int) $current
+            : (int) get_option(self::SEARCH_LKG_GEN_KEY, 1);
+
+        $gen = max(time(), max(1, $current) + 1);
+
         update_option(self::SEARCH_LKG_GEN_KEY, $gen, false);
         wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
     }
 
     /**
      * Current LKG generation. Read the same way as the cache version —
-     * cache first, option fallback, safe floor of 1 — but with no heal
-     * race: LKG-gen changes are rare (privacy flips only), so a plain
-     * cache-miss option read is fine.
+     * cache first, option fallback, safe floor of 1 — but without that
+     * reader's heal lock and backoff.
+     *
+     * ⚠ F-442 CORRECTED THE CLAIM THAT USED TO BE HERE. It said there was
+     * "no heal race: LKG-gen changes are rare (privacy flips only), so a
+     * plain cache-miss option read is fine." Rarity changes the LIKELIHOOD,
+     * not the consequence. When it does happen, a stale generation is
+     * cached for the whole TTL and the privacy flip that bumped it
+     * invalidates nothing — and what then gets served is a last-known-good
+     * copy of results for a page that has just been made secret. "Rare" is
+     * not the standard a visibility guarantee is held to.
+     *
+     * The write below is therefore add()-on-miss / set()-on-poison; see the
+     * comment at the point of use.
      */
     private static function getLkgGeneration(): int
     {
-        $cached = wp_cache_get(self::SEARCH_LKG_GEN_KEY, self::CACHE_GROUP);
+        $found  = null;
+        $cached = wp_cache_get(self::SEARCH_LKG_GEN_KEY, self::CACHE_GROUP, false, $found);
         if (self::isValidVersionValue($cached)) {
             return (int) $cached;
         }
         $opt = get_option(self::SEARCH_LKG_GEN_KEY, 1);
         $gen = self::isValidVersionValue($opt) ? max(1, (int) $opt) : 1;
-        wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+
+        // ⚠ F-442: add() on a true MISS, so a bump that landed between the
+        // cache read and here is not overwritten by the stale option value.
+        // set() on a POISONED entry (present but invalid), because add()
+        // would fail on an existing key and leave the bad value cached for
+        // the whole TTL. getCacheVersion() above heals poison the same way,
+        // which is why it keeps set() and gets no add().
+        if ($found === true) {
+            wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+        } else {
+            wp_cache_add(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+        }
+
         return $gen;
     }
 }

@@ -105,7 +105,25 @@ final class GroupSearchController
             return;
         }
         self::$genBumpQueued = false;
-        $gen = time();
+
+        // ⚠ F-442: STRICTLY INCREASING, not a bare time(). A bump landing in
+        // the same second as the current generation would otherwise produce
+        // the SAME value, so the cache key would not change and the entry
+        // written just before the privacy flip would stay reachable for the
+        // rest of that second. One second rather than a full TTL, but
+        // "privacy is a binary invisibility guarantee, not a freshness
+        // budget" has no one-second exemption. The value stays a
+        // seconds-based integer, and a backwards clock jump cannot stall it.
+        // Read inline: getGeneration() writes the cache as a side effect,
+        // so calling it here would populate the OLD value and then have it
+        // replaced by the write below.
+        $current = wp_cache_get(self::GEN_KEY, self::CACHE_GROUP);
+        $current = (is_int($current) || (is_string($current) && ctype_digit($current)))
+            ? (int) $current
+            : (int) get_option(self::GEN_KEY, 1);
+
+        $gen = max(time(), max(1, $current) + 1);
+
         update_option(self::GEN_KEY, $gen, false);
         wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
     }
@@ -113,13 +131,37 @@ final class GroupSearchController
     /** Current generation: cache first, option fallback, safe floor of 1. */
     private static function getGeneration(): int
     {
-        $cached = wp_cache_get(self::GEN_KEY, self::CACHE_GROUP);
+        $found  = null;
+        $cached = wp_cache_get(self::GEN_KEY, self::CACHE_GROUP, false, $found);
         if (is_int($cached) || (is_string($cached) && ctype_digit($cached))) {
             return max(1, (int) $cached);
         }
         $opt = get_option(self::GEN_KEY, 1);
         $gen = (is_int($opt) || (is_string($opt) && ctype_digit($opt))) ? max(1, (int) $opt) : 1;
-        wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+
+        // ⚠ F-442: WHICH WRITE depends on WHY we are here, and getting it
+        // wrong either way is a bug.
+        //
+        // A true MISS populates with add(). This read is not atomic with
+        // the option read above, so a bump can land in between; with set()
+        // we would then cache the stale value we had already read and keep
+        // serving the pre-bump generation for the whole TTL — with a
+        // persistent object cache, exactly the invalidation this counter
+        // exists to guarantee. add() fails when the bump got there first,
+        // and the bump survives.
+        //
+        // A POISONED entry (present, but not a valid generation) must be
+        // OVERWRITTEN with set(). add() would fail — the key exists — and
+        // leave the bad value cached for the TTL with no path out. We
+        // accept that this heal can overwrite a concurrent bump: a rare
+        // lost bump costs one TTL of staleness, where stuck poison costs
+        // every request until it expires.
+        if ($found === true) {
+            wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+        } else {
+            wp_cache_add(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+        }
+
         return $gen;
     }
 
