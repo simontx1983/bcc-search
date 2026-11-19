@@ -46,12 +46,9 @@ final class UserSearchRepository
     private const DEFAULT_LIMIT = 20;
     private const MAX_LIMIT     = 50;
 
-    // F-54 follow-up: the public-field filter below drops rows PeepSo matched
-    // on user_login / email only, AFTER the SQL LIMIT. Fetching exactly
-    // $limit let a broad query whose first N hits were login-only matches
-    // return too few rows, or none. Over-fetch, filter, then trim. Bounded:
-    // at most MAX_LIMIT * OVERFETCH_FACTOR ids, one cache_users() batch.
-    private const OVERFETCH_FACTOR = 3;
+    // The two usermeta keys a result's shown name depends on (bcc-trust).
+    private const META_HANDLE           = 'bcc_handle';
+    private const META_REAL_NAME_HIDDEN = 'bcc_privacy_real_name_hidden';
 
     /**
      * Privacy-filtered prefix search over the PeepSo user directory.
@@ -87,17 +84,26 @@ final class UserSearchRepository
         // stays PeepSo's: the candidates go back through PeepSoUserSearch as
         // `include` with an EMPTY term. Without bcc-trust there is no
         // matcher, so nothing is returned.
-        $userIds = self::handleOrNameMatches($query, $limit * self::OVERFETCH_FACTOR, $viewerId);
+        //
+        // F-431: EVERY privacy-passing candidate comes back, and the cut to
+        // $limit happens only after the sort by what is shown, below. The
+        // privacy pass used to stop at $limit × 3 in PeepSo's user_login
+        // order, so a member whose login sorted late fell out before the
+        // display-name sort ever saw them, and the top N by name could miss
+        // matches. Bounded by the matcher's own cap
+        // (MemberSearchCandidates::MAX_CANDIDATES).
+        $userIds = self::handleOrNameMatches($query, $viewerId);
 
         if ($userIds === []) {
             return [];
         }
 
-        // Prime the WP user cache once so the per-id get_userdata() below is
-        // a single query rather than N. Order is preserved from the search.
-        // cache_users() also primes the usermeta cache, so the per-id
-        // bcc_handle read below is cache-served, not a query.
-        cache_users($userIds);
+        // The shown name of EVERY candidate, from two narrow reads (F-431):
+        // four wp_users columns and two usermeta keys. Not cache_users(),
+        // which loads every meta row of every member: measured at 1000
+        // candidates, that was 550-750 ms cold against 22-33 ms for these
+        // reads (and today's 150-id cut was already 115-140 ms cold).
+        $identities = self::publicIdentities($userIds);
 
         // F-54: keep a row only when the query matches something PUBLIC
         // about the person. Since F-302 the matcher itself never looks at
@@ -107,12 +113,11 @@ final class UserSearchRepository
 
         $dtos = [];
         foreach ($userIds as $userId) {
-            $user = get_userdata($userId);
-            if (!$user instanceof \WP_User) {
+            $identity = $identities[$userId] ?? null;
+            if ($identity === null) {
                 continue;
             }
-            $handleRaw = get_user_meta($userId, 'bcc_handle', true);
-            $handle    = is_string($handleRaw) ? trim($handleRaw) : '';
+            $handle = trim($identity['handle']);
 
             // F-54: no public handle → no public identity to show. The old
             // fallback was user_nicename, which BCC signup derives from the
@@ -121,9 +126,9 @@ final class UserSearchRepository
                 continue;
             }
 
-            $login       = (string) $user->user_login;
-            $nicename    = (string) $user->user_nicename;
-            $displayName = (string) $user->display_name;
+            $login       = $identity['user_login'];
+            $nicename    = $identity['user_nicename'];
+            $displayName = $identity['display_name'];
             // A wp-admin-created account defaults display_name to the login.
             if ($displayName === ''
                 || strcasecmp($displayName, $login) === 0
@@ -139,7 +144,7 @@ final class UserSearchRepository
             // '@handle'. The response cache is keyed per viewer, so the
             // member's own view can't leak to others.
             $nameHidden = $userId !== $viewerId
-                && filter_var(get_user_meta($userId, 'bcc_privacy_real_name_hidden', true), FILTER_VALIDATE_BOOLEAN);
+                && filter_var($identity['real_name_hidden'], FILTER_VALIDATE_BOOLEAN);
             if ($nameHidden) {
                 $displayName = '@' . $handle;
             }
@@ -164,11 +169,101 @@ final class UserSearchRepository
         }
 
         // F-54: PeepSo orders by user_login; re-order by what is shown so the
-        // order itself does not encode login names.
+        // order itself does not encode login names. F-431: over every
+        // privacy-passing candidate, so the cut to $limit below is by the
+        // shown name and nothing else.
         usort($dtos, static fn (UserDTO $a, UserDTO $b): int =>
             strcmp(mb_strtolower($a->displayName), mb_strtolower($b->displayName)) ?: ($a->id <=> $b->id));
 
         return array_slice($dtos, 0, $limit);
+    }
+
+    /**
+     * What a search result is built from, for each id: the four wp_users
+     * columns and the two usermeta values the shown name depends on. Two
+     * queries over a bounded IN() (≤ MemberSearchCandidates::MAX_CANDIDATES
+     * ids), explicit columns. A meta key stored twice reads as its FIRST row,
+     * as get_user_meta($id, $key, true) would.
+     *
+     * Throws on a DB error rather than answering an empty list, which would
+     * read as "nobody matched" (the F-432 class); the controller turns it
+     * into its 503.
+     *
+     * @param list<int> $userIds
+     * @return array<int, array{user_login: string, user_nicename: string, display_name: string, handle: string, real_name_hidden: string}>
+     */
+    private static function publicIdentities(array $userIds): array
+    {
+        global $wpdb;
+
+        $in = implode(',', array_fill(0, count($userIds), '%d'));
+
+        /** @var list<array<string, mixed>>|null $users */
+        $users = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT ID, user_login, user_nicename, display_name
+                   FROM {$wpdb->users}
+                  WHERE ID IN ({$in})",
+                ...$userIds
+            ),
+            ARRAY_A
+        );
+        self::throwOnDbError('UserSearchRepository::publicIdentities users');
+
+        /** @var list<array<string, mixed>>|null $meta */
+        $meta = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT user_id, meta_key, meta_value
+                   FROM {$wpdb->usermeta}
+                  WHERE meta_key IN (%s, %s)
+                    AND user_id IN ({$in})
+                  ORDER BY umeta_id ASC",
+                self::META_HANDLE,
+                self::META_REAL_NAME_HIDDEN,
+                ...$userIds
+            ),
+            ARRAY_A
+        );
+        self::throwOnDbError('UserSearchRepository::publicIdentities usermeta');
+
+        $values = [];
+        foreach (is_array($meta) ? $meta : [] as $row) {
+            $id  = (int) ($row['user_id'] ?? 0);
+            $key = (string) ($row['meta_key'] ?? '');
+            if ($id > 0 && !isset($values[$id][$key])) {
+                $values[$id][$key] = (string) ($row['meta_value'] ?? '');
+            }
+        }
+
+        $out = [];
+        foreach (is_array($users) ? $users : [] as $row) {
+            $id = (int) ($row['ID'] ?? 0);
+            if ($id <= 0) {
+                continue;
+            }
+            $out[$id] = [
+                'user_login'       => (string) ($row['user_login'] ?? ''),
+                'user_nicename'    => (string) ($row['user_nicename'] ?? ''),
+                'display_name'     => (string) ($row['display_name'] ?? ''),
+                'handle'           => $values[$id][self::META_HANDLE] ?? '',
+                'real_name_hidden' => $values[$id][self::META_REAL_NAME_HIDDEN] ?? '',
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * Throw on DB error. Immediate-check contract: call on the line
+     * following the wpdb accessor, nothing else between. Same contract as
+     * GroupSearchRepository's and SearchRepository's.
+     */
+    private static function throwOnDbError(string $context): void
+    {
+        global $wpdb;
+        $err = (string) $wpdb->last_error;
+        if ($err !== '') {
+            throw new \RuntimeException("{$context}: {$err}");
+        }
     }
 
     /**
@@ -177,9 +272,14 @@ final class UserSearchRepository
      * active: its MemberSearchCandidates is the one matcher for those two
      * fields, and this plugin never reimplements it.
      *
+     * All of them (F-431): the caller orders by the shown name, which only
+     * exists in PHP, so no cut may happen here. Not PeepSo's order either:
+     * its only name order is first/last name, which would make the cut
+     * depend on real names a member hid (F-54).
+     *
      * @return list<int>
      */
-    private static function handleOrNameMatches(string $query, int $number, int $viewerId): array
+    private static function handleOrNameMatches(string $query, int $viewerId): array
     {
         $matcher = '\\BCC\\Trust\\Core\\Support\\MemberSearchCandidates';
         // Fail closed without PeepSo too, like search(): never return ids
@@ -196,9 +296,11 @@ final class UserSearchRepository
 
         // ⛔ Empty search term: the raw query must not reach PeepSo's own
         // search a second time, only its privacy filter over `include`.
+        // `number` = every candidate, so the privacy pass filters and never
+        // cuts; `orderby` then only makes the result deterministic.
         $search = new \PeepSoUserSearch(
             [
-                'number'  => $number,
+                'number'  => count($candidates),
                 'orderby' => 'username',
                 'order'   => 'ASC',
                 'include' => $candidates,
