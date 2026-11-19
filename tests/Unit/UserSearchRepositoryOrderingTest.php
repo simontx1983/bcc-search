@@ -28,7 +28,7 @@ use PHPUnit\Framework\TestCase;
 final class UserSearchRepositoryOrderingTest extends TestCase
 {
     /**
-     * @param array<string, string> $meta
+     * @param array<string, string|list<string>> $meta
      */
     private static function user(int $id, string $login, string $display, array $meta): void
     {
@@ -131,6 +131,18 @@ final class UserSearchRepositoryOrderingTest extends TestCase
         self::assertStringNotContainsString('*', $users . $meta);
         // Every privacy-passing candidate is read, not a login-ordered slice.
         self::assertStringContainsString('101,102', $users);
+    }
+
+    public function testAMetaKeyStoredTwiceReadsAsItsFirstRowLikeGetUserMeta(): void
+    {
+        self::load();
+        self::user(7, 'u_seven', 'Opal', ['bcc_handle' => ['op-first', 'op-second']]);
+        $GLOBALS['__bcc_member_candidates'] = [7];
+
+        $dtos = UserSearchRepository::search('op', 5, 0);
+
+        self::assertCount(1, $dtos);
+        self::assertSame('op-first', $dtos[0]->handle);
     }
 
     public function testAFailedUsersReadThrowsInsteadOfAnsweringNobody(): void

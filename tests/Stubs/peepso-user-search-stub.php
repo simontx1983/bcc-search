@@ -156,11 +156,17 @@ namespace {
                 preg_match_all("/'([a-z_]+)'/", $sql, $k);
                 foreach ($ids as $id) {
                     foreach ($k[1] as $key) {
-                        if (isset($GLOBALS['__bcc_usermeta'][$id][$key])) {
+                        if (!isset($GLOBALS['__bcc_usermeta'][$id][$key])) {
+                            continue;
+                        }
+                        // A list fixture is a key stored more than once: one
+                        // row per value, in umeta_id order.
+                        $value = $GLOBALS['__bcc_usermeta'][$id][$key];
+                        foreach (is_array($value) ? $value : [$value] as $one) {
                             $rows[] = [
                                 'user_id'    => (string) $id,
                                 'meta_key'   => $key,
-                                'meta_value' => (string) $GLOBALS['__bcc_usermeta'][$id][$key],
+                                'meta_value' => (string) $one,
                             ];
                         }
                     }
