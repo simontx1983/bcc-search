@@ -2,6 +2,7 @@
 
 namespace BCC\Search\Repositories;
 
+use BCC\Core\Repositories\PeepSoPagePrivacy;
 use BCC\Search\DTO\PageCandidateDTO;
 use BCC\Search\DTO\PageHydratedDTO;
 use BCC\Search\DTO\TrendingPageRowDTO;
@@ -329,15 +330,14 @@ final class SearchRepository
         // secret pages are still post_status='publish' and the status filter
         // alone leaks them. Because these are raw $wpdb queries (not WP_Query),
         // PeepSo's own posts_clauses privacy filter never runs — we must
-        // enforce it here. Mirrors the secret-group exclusion in
-        // GroupSearchRepository; CLOSED (1) pages stay findable. [audit H3]
-        $privacy_join = "LEFT JOIN {$wpdb->postmeta} pm_priv
-                                ON pm_priv.post_id = p.ID
-                               AND pm_priv.meta_key = 'peepso_page_privacy'";
-        $privacy_where = "AND (pm_priv.meta_value IS NULL
-                               OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)";
+        // enforce it here. CLOSED (1) pages stay findable. [audit H3]
+        //
+        // The rule is bcc-core's shared PeepSoPagePrivacy::notSecretSql(), the
+        // one every page surface uses. It replaced a LEFT JOIN + `<> 2` copy
+        // here that let a page carrying two privacy rows (0 and 2) through.
+        $not_secret = PeepSoPagePrivacy::notSecretSql('p.ID');
 
-        $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish' {$privacy_where}";
+        $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish' AND {$not_secret}";
 
         // ── FULLTEXT path ────────────────────────────────────────────────
         // Gated on BOTH length and index presence. When the v2 index has
@@ -403,7 +403,6 @@ final class SearchRepository
                 $sql = $wpdb->prepare(
                     "SELECT {$distinct} p.ID, p.post_title
                      FROM {$posts_table} p
-                     {$privacy_join}
                      {$cat_join}
                      WHERE {$base_where}
                        AND (MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE)
@@ -457,7 +456,6 @@ final class SearchRepository
         $sql = $wpdb->prepare(
             "SELECT {$distinct} p.ID, p.post_title
              FROM {$posts_table} p
-             {$privacy_join}
              {$cat_join}
              WHERE {$base_where}
                AND p.post_title LIKE %s
@@ -545,6 +543,10 @@ final class SearchRepository
         // avoidable work. One flat IN(...) query over page_categories
         // replaces both subqueries with a single, ORDER-BY + LIMIT-bounded
         // batch.
+        // SECRET pages are dropped here too (the shared bcc-core rule): this
+        // is the chokepoint that also hydrates primary-trending ids.
+        $not_secret = PeepSoPagePrivacy::notSecretSql('p.ID');
+
         $rows = $wpdb->get_results($wpdb->prepare(
             "SELECT
                 p.ID,
@@ -557,11 +559,8 @@ final class SearchRepository
                                                 AND pm_av.meta_key = 'peepso_page_avatar_hash'
              LEFT JOIN {$wpdb->postmeta}  pm_type ON pm_type.post_id = p.ID
                                                   AND pm_type.meta_key = '_bcc_page_type'
-             LEFT JOIN {$wpdb->postmeta}  pm_priv ON pm_priv.post_id = p.ID
-                                                  AND pm_priv.meta_key = 'peepso_page_privacy'
              WHERE p.ID IN ({$id_placeholders})
-               AND (pm_priv.meta_value IS NULL
-                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)
+               AND {$not_secret}
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
             ...array_merge($ids, $ids, [count($ids)])
@@ -703,17 +702,14 @@ final class SearchRepository
     {
         global $wpdb;
         $posts_table = $wpdb->posts;
+        $not_secret  = PeepSoPagePrivacy::notSecretSql('p.ID');
 
         $col = $wpdb->get_col($wpdb->prepare(
             "SELECT p.ID
              FROM {$posts_table} p
-             LEFT JOIN {$wpdb->postmeta} pm_priv
-                    ON pm_priv.post_id = p.ID
-                   AND pm_priv.meta_key = 'peepso_page_privacy'
              WHERE p.post_type = 'peepso-page'
                AND p.post_status = 'publish'
-               AND (pm_priv.meta_value IS NULL
-                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)
+               AND {$not_secret}
              ORDER BY p.ID DESC
              LIMIT %d",
             $limit
