@@ -168,6 +168,9 @@ add_filter('bcc_expected_cron_hooks', function (array $hooks): array {
 add_action('init', [\BCC\Search\Controllers\SearchController::class, 'register_cache_hooks']);
 // Groups vertical: privacy-driven cache-bust (peepso_group_privacy → secret).
 add_action('init', [\BCC\Search\Controllers\GroupSearchController::class, 'register_cache_hooks']);
+// Users vertical (F-430): privacy, ban, block and rename cache-bust. Before
+// this, the member-search cache had no invalidation at all — only a 45s TTL.
+add_action('init', [\BCC\Search\Controllers\UserSearchController::class, 'register_cache_hooks']);
 
 // ── System-health filter contribution ────────────────────────────────────────
 // Phase 3 of the post-stabilization observability initiative (2026-05-09).
