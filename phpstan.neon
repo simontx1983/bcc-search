@@ -3,6 +3,11 @@ includes:
 
 parameters:
     level: 8
+    # Analyse as production's PHP minor version (8.3), whatever the runner is
+    # (F-434). Without this the target follows the runner, so a CI bump would
+    # move it silently. bcc-trust pins its target through composer.json's
+    # config.platform.php instead; this repo sets no platform.
+    phpVersion: 80300
     paths:
         - app/
     scanDirectories:
