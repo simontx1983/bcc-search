@@ -30,6 +30,15 @@ namespace BCC\Search\Tests\Stubs {
         /** Invoked inside get_option(), to stand in for a concurrent bump. */
         public static ?\Closure $onOptionRead = null;
 
+        /**
+         * Invoked inside update_option(), i.e. DURING a flush, after it has
+         * decided its new value and before it writes the cache. The only
+         * point where a test can slip a concurrent bump into a flush — which
+         * is what makes "a bump publishes unconditionally" a behavioural
+         * assertion instead of a source-shape one (F-445).
+         */
+        public static ?\Closure $onOptionWrite = null;
+
         /** @var list<array{op: string, key: string, value: mixed, wrote: bool}> */
         public static array $writes = [];
 
@@ -37,7 +46,8 @@ namespace BCC\Search\Tests\Stubs {
         {
             self::$cache        = [];
             self::$options      = [];
-            self::$onOptionRead = null;
+            self::$onOptionRead  = null;
+            self::$onOptionWrite = null;
             self::$writes       = [];
         }
 
@@ -112,6 +122,12 @@ namespace {
         function update_option(string $name, mixed $value, mixed $autoload = null): bool
         {
             GenStore::$options[$name] = $value;
+            if (GenStore::$onOptionWrite !== null) {
+                $hook = GenStore::$onOptionWrite;
+                // One-shot, like onOptionRead.
+                GenStore::$onOptionWrite = null;
+                $hook($name, $value);
+            }
             return true;
         }
     }

@@ -8,6 +8,7 @@ if (!defined('ABSPATH')) {
 
 use BCC\Core\Security\Throttle;
 use BCC\Search\Services\UserSearchService;
+use BCC\Search\Support\CacheGeneration;
 use BCC\Search\Support\QueryQualityGate;
 
 /**
@@ -270,11 +271,22 @@ final class UserSearchController
         // accept that this heal can overwrite a concurrent bump: a rare
         // lost bump costs one TTL of staleness, where stuck poison costs
         // every request until it expires.
+            // ⚠ F-445: a POISONED entry is published through the shared
+            // guard, not a plain set(). We are here because the cached
+            // value was invalid, so there is nothing valid to regress
+            // over — UNLESS a bump landed between that read and this
+            // write, which is exactly the race. The guard adopts the
+            // bump's value instead of overwriting it.
         if ($found === true) {
-            wp_cache_set(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
-        } else {
-            wp_cache_add(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
+            return CacheGeneration::publishWithoutRegressing(
+                self::GEN_KEY,
+                self::CACHE_GROUP,
+                self::CACHE_TTL,
+                $gen
+            );
         }
+
+        wp_cache_add(self::GEN_KEY, $gen, self::CACHE_GROUP, self::CACHE_TTL);
 
         return $gen;
     }
