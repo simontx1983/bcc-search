@@ -36,6 +36,9 @@ namespace BCC\Search\Tests\Stubs {
 
         public static int $viewerId = 0;
 
+        /** F-432: when set, UserSearchService::search() throws a RuntimeException with this message. */
+        public static ?string $serviceThrows = null;
+
         public static function reset(): void
         {
             self::$cache   = [];
@@ -44,6 +47,7 @@ namespace BCC\Search\Tests\Stubs {
             self::$setKeys = [];
             self::$getKeys = [];
             self::$viewerId = 0;
+            self::$serviceThrows = null;
         }
 
         /** Every callback registered for $hook. */
@@ -99,6 +103,9 @@ namespace BCC\Search\Services {
             /** @return array<string, mixed> */
             public function search(string $q, int $limit, int $viewerId): array
             {
+                if (UserSearchGenStore::$serviceThrows !== null) {
+                    throw new \RuntimeException(UserSearchGenStore::$serviceThrows);
+                }
                 return [
                     'results' => [['id' => 1, 'handle' => 'alice']],
                     'meta'    => ['count' => 1, 'query' => $q],
@@ -146,6 +153,12 @@ namespace {
             public function get_status(): int
             {
                 return $this->status;
+            }
+
+            /** @return array<string, string> */
+            public function get_headers(): array
+            {
+                return $this->headers;
             }
         }
     }
