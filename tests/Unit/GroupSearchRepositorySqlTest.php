@@ -7,6 +7,8 @@ namespace BCC\Search\Tests\Unit;
 use BCC\Search\DTO\GroupDTO;
 use BCC\Search\Repositories\GroupSearchRepository;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunTestsInSeparateProcesses;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -20,11 +22,27 @@ use PHPUnit\Framework\TestCase;
  * findable by name — the same browse semantics as bcc-core's
  * listBrowsableGroupIds(). Because that exclusion lives in raw SQL, we
  * cover it with a hand-rolled $wpdb double (no MySQL): the fake captures
- * the prepared template + bound args so we can assert the privacy clause
- * and the SECRET sentinel (2) are actually there. Dropping either would
- * silently turn group search into "show every secret group."
+ * the prepared template + bound args so we can assert the exclusion is
+ * actually there. Dropping it would silently turn group search into
+ * "show every secret group."
+ *
+ * ⚠ F-429 CHANGED WHAT "actually there" MEANS. This file used to assert the
+ * exclusion by looking for `pm_priv.meta_value IS NULL` and a bound `2`.
+ * That form was the defect: it listed a group whenever ANY of its privacy
+ * rows was not 2 — so a group carrying both a '0' row and a '2' row was
+ * findable — and the LEFT JOIN returned such a group once per row. The
+ * exclusion is now bcc-core's PeepSoGroupPrivacy::notSecretSql(), a
+ * correlated NOT EXISTS with no join and no bound sentinel, so the old
+ * assertions had to be replaced rather than kept alongside: they would now
+ * fail on correct code, which is the worst kind of test.
+ *
+ * These remain SOURCE-SHAPE assertions — a fake $wpdb cannot run SQL. The
+ * behaviour they stand for (two-row group hidden, no duplicate rows) is
+ * proven against a real SQL engine in the F-429 PR.
  */
 #[CoversClass(GroupSearchRepository::class)]
+#[RunTestsInSeparateProcesses]
+#[PreserveGlobalState(false)]
 final class GroupSearchRepositorySqlTest extends TestCase
 {
     private object $wpdb;
@@ -34,6 +52,13 @@ final class GroupSearchRepositorySqlTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        // F-429: the privacy rule now lives in bcc-core. Loaded from the
+        // checkout beside this plugin, exactly as the pages twin does
+        // (SearchRepositoryPrivacySqlTest) — which is also why this class
+        // runs in separate processes: a required file would otherwise leak
+        // into the rest of the unit run.
+        self::requireCore('src/Repositories/PeepSoGroupPrivacy.php');
+
         $this->hadWpdb  = array_key_exists('wpdb', $GLOBALS);
         $this->prevWpdb = $GLOBALS['wpdb'] ?? null;
         $this->wpdb     = $this->makeFakeWpdb();
@@ -48,6 +73,26 @@ final class GroupSearchRepositorySqlTest extends TestCase
             unset($GLOBALS['wpdb']);
         }
         parent::tearDown();
+    }
+
+    /**
+     * A file of the bcc-core checkout beside this plugin. In CI a missing
+     * file FAILS (a skip is invisible in a green run); locally a bare clone
+     * may have no sibling, so it skips there. Same contract as
+     * SearchRepositoryPrivacySqlTest::requireCore().
+     */
+    private static function requireCore(string $relPath): void
+    {
+        $path = dirname(__DIR__, 3) . '/bcc-core/' . $relPath;
+        if (is_file($path)) {
+            require_once $path;
+            return;
+        }
+        $inCi = (string) getenv('GITHUB_ACTIONS') !== '' || strtolower((string) getenv('CI')) === 'true';
+        if ($inCi) {
+            self::fail('bcc-core file missing at ' . $path . ' while running in CI.');
+        }
+        self::markTestSkipped('bcc-core sibling not present at ' . $path . ' (expected outside CI).');
     }
 
     private function makeFakeWpdb(): object
@@ -86,23 +131,51 @@ final class GroupSearchRepositorySqlTest extends TestCase
         };
     }
 
-    public function testQueryExcludesSecretGroupsAndBindsTheSentinel(): void
+    public function testQueryExcludesSecretGroupsWithTheSharedRule(): void
     {
         $this->wpdb->rows = [];
 
         GroupSearchRepository::search('dev', 20);
 
         $sql = (string) $this->wpdb->lastQuery;
-        self::assertStringContainsString('pm_priv.meta_value IS NULL', $sql);
-        self::assertStringContainsString('CAST(pm_priv.meta_value AS UNSIGNED) <> %d', $sql);
 
-        // The sentinel + meta key must be bound, else the exclusion degrades
-        // to a no-op that returns every secret group.
-        self::assertContains(2, $this->wpdb->lastArgs, 'PRIVACY_SECRET (2) must be a bound arg');
-        self::assertContains('peepso_group_privacy', $this->wpdb->lastArgs);
+        // The shared NOT EXISTS, correlated on the group id. Each part is
+        // load-bearing: without the meta_key the predicate would match any
+        // meta row, and without `= 2` it would hide every group that has a
+        // privacy row at all.
+        self::assertStringContainsString('NOT EXISTS (', $sql);
+        self::assertStringContainsString("bcc_group_priv.post_id = p.ID", $sql);
+        self::assertStringContainsString("meta_key = 'peepso_group_privacy'", $sql);
+        self::assertStringContainsString('= 2', $sql);
+
         self::assertContains('_bcc_group_kind', $this->wpdb->lastArgs);
         self::assertContains('peepso-group', $this->wpdb->lastArgs);
         self::assertContains('publish', $this->wpdb->lastArgs);
+    }
+
+    /**
+     * ⭐ The superseded form must not come back — and the join matters on its
+     * own, not just the comparison. A future edit that re-added the join and
+     * kept `NOT EXISTS` would stop leaking but would still fan out, and
+     * `LIMIT` is applied before the hydration loop collapses by ID, so the
+     * page would silently come back short.
+     */
+    public function testTheSupersededPrivacyFormIsGone(): void
+    {
+        $this->wpdb->rows = [];
+
+        GroupSearchRepository::search('dev', 20);
+
+        $sql = (string) $this->wpdb->lastQuery;
+
+        self::assertStringNotContainsString('pm_priv', $sql, 'the privacy join is back');
+        self::assertStringNotContainsString('IS NULL', $sql);
+        self::assertStringNotContainsString('<> %d', $sql);
+        // The sentinel and the meta key are inside the shared fragment now,
+        // so neither is a bound argument. Either reappearing here means the
+        // inline copy has been reinstated.
+        self::assertNotContains(2, $this->wpdb->lastArgs);
+        self::assertNotContains('peepso_group_privacy', $this->wpdb->lastArgs);
     }
 
     public function testSubstringMatchWithPrefixFirstRankingAndKindJoin(): void

@@ -2,6 +2,7 @@
 
 namespace BCC\Search\Repositories;
 
+use BCC\Core\Repositories\PeepSoGroupPrivacy;
 use BCC\Search\DTO\GroupDTO;
 
 if (!defined('ABSPATH')) {
@@ -55,7 +56,12 @@ final class GroupSearchRepository
     // bcc-core PeepSoGroupRepository::listBrowsableGroupIds(). (The
     // stricter closed+secret exclusion, getNonOpenGroupIds(), is for the
     // main-feed author gate, not name discovery.)
-    private const PRIVACY_SECRET = 2;
+    //
+    // F-429: the exclusion itself is no longer written here. It is
+    // bcc-core's PeepSoGroupPrivacy::notSecretSql(), the one rule every
+    // group surface uses - the same move the pages vertical made to
+    // PeepSoPagePrivacy. The local sentinel went with it; the value now
+    // lives on the shared class as PeepSoGroupPrivacy::SECRET.
 
     /**
      * Throw on DB error. Immediate-check contract: call on the line
@@ -82,16 +88,15 @@ final class GroupSearchRepository
      *     LEFT JOIN wp_postmeta pm_av
      *              ON pm_av.post_id = p.ID
      *             AND pm_av.meta_key = 'peepso_group_avatar_hash'
-     *     LEFT JOIN wp_postmeta pm_priv
-     *              ON pm_priv.post_id = p.ID
-     *             AND pm_priv.meta_key = 'peepso_group_privacy'
      *     LEFT JOIN wp_postmeta pm_kind
      *              ON pm_kind.post_id = p.ID
      *             AND pm_kind.meta_key = '_bcc_group_kind'
      *     WHERE  p.post_type   = 'peepso-group'
      *       AND  p.post_status = 'publish'
-     *       AND  (pm_priv.meta_value IS NULL
-     *             OR CAST(pm_priv.meta_value AS UNSIGNED) <> 2)  -- hide secret
+     *       AND  NOT EXISTS (SELECT 1 FROM wp_postmeta bcc_group_priv
+     *                         WHERE bcc_group_priv.post_id = p.ID
+     *                           AND bcc_group_priv.meta_key = 'peepso_group_privacy'
+     *                           AND CAST(bcc_group_priv.meta_value AS UNSIGNED) = 2)
      *       AND  p.post_title LIKE '%q%'
      *     ORDER BY (p.post_title LIKE 'q%') DESC, p.post_title ASC
      *     LIMIT %d
@@ -114,6 +119,21 @@ final class GroupSearchRepository
         $substring = '%' . $wpdb->esc_like($query) . '%';
         $prefix    = $wpdb->esc_like($query) . '%';
 
+        // F-429. The pm_priv LEFT JOIN this replaced listed a group whenever
+        // ANY one of its privacy rows was not 2, so a group carrying both a
+        // '0' row and a '2' row was findable by name. The shared fragment is
+        // a correlated NOT EXISTS, so secret means ANY row reads 2. It
+        // carries no placeholder, so it is safe to concatenate into this
+        // prepare() template.
+        //
+        // ⚠ The join also fanned out — one result row per privacy row — but
+        // that was NOT visible as duplicate results here: the hydration loop
+        // below collapses by ID, first row wins. What it cost was quota.
+        // `LIMIT` is applied by MySQL BEFORE that collapse, so each extra
+        // privacy row spent a result slot and the page came back short. The
+        // NOT EXISTS needs no join, so there is no fan-out left to absorb.
+        $not_secret = PeepSoGroupPrivacy::notSecretSql('p.ID');
+
         $sql = $wpdb->prepare(
             'SELECT ' . self::COLUMNS . ', pm_av.meta_value AS avatar_hash,
                     pm_kind.meta_value AS group_kind_raw
@@ -121,25 +141,19 @@ final class GroupSearchRepository
              LEFT JOIN ' . $wpdb->postmeta . ' pm_av
                     ON pm_av.post_id = p.ID
                    AND pm_av.meta_key = %s
-             LEFT JOIN ' . $wpdb->postmeta . ' pm_priv
-                    ON pm_priv.post_id = p.ID
-                   AND pm_priv.meta_key = %s
              LEFT JOIN ' . $wpdb->postmeta . ' pm_kind
                     ON pm_kind.post_id = p.ID
                    AND pm_kind.meta_key = %s
              WHERE p.post_type = %s
                AND p.post_status = %s
-               AND (pm_priv.meta_value IS NULL
-                    OR CAST(pm_priv.meta_value AS UNSIGNED) <> %d)
+               AND ' . $not_secret . '
                AND p.post_title LIKE %s
              ORDER BY (p.post_title LIKE %s) DESC, p.post_title ASC
              LIMIT %d',
             'peepso_group_avatar_hash',
-            'peepso_group_privacy',
             '_bcc_group_kind',
             self::GROUP_POST_TYPE,
             'publish',
-            self::PRIVACY_SECRET,
             $substring,
             $prefix,
             $limit
