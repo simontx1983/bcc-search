@@ -127,6 +127,21 @@ final class UserSearchController
      * `PeepSoUser::set_user_role()` fires `peepso_action_user_role_change`.
      * Search excludes `usr_role IN ('register','verified','ban')`, so that
      * one hook covers banning and verification alike.
+     *
+     * ⚠ BCC SUSPENSION IS A SEPARATE FILTER FROM PEEPSO'S BAN, and it is
+     * not visible from this repository at all. bcc-trust registers
+     * `ProfileAccess::filterSuspendedFromListing` on `pre_user_query`
+     * (from its own bootstrap), narrowed to PeepSo-built queries by the
+     * `_peepso_user_id` query var that `PeepSoUserSearch` always injects.
+     * It joins `user_info.is_suspended` — the same column the profile gate
+     * reads — and exempts admins and the viewer themselves (F-182). So a
+     * suspended member is excluded from these results even though PeepSo
+     * knows nothing about it: `suspendUser()` writes `is_suspended` and
+     * never touches `usr_role`.
+     *
+     * That is why `bcc_user_suspension_changed` is in the list below. It
+     * is easy to miss, because the filter is enumerated in no docblock on
+     * this side and a grep of this plugin finds nothing.
      */
     public static function register_cache_hooks(): void
     {
@@ -163,6 +178,13 @@ final class UserSearchController
         // it — and bcc-trust fires it only on a real change, which is what
         // keeps a settings form resubmitting the same value from bumping.
         add_action('bcc_profile_visibility_changed', $bump);
+
+        // BCC suspension — a filter PeepSo knows nothing about; see above.
+        // Fired by suspendUser(), unsuspendUser() and ModerationService
+        // after its commit. FeedRankingService already consumes this hook
+        // for the same reason, so this follows an established precedent
+        // rather than inventing one.
+        add_action('bcc_user_suspension_changed', $bump);
 
         // The site-wide hide-from-listing switch.
         add_action('add_option_' . self::BUST_OPTION, $bump);
