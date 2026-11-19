@@ -288,8 +288,14 @@ final class UserSearchRepository
             return [];
         }
 
+        // F-432: fail closed, the third argument. A matching read that did
+        // not run throws (RepositoryReadFailure, a RuntimeException, which
+        // UserSearchController answers 503) instead of answering "nobody
+        // matched". Passed POSITIONALLY: a bcc-trust that predates the flag
+        // ignores it and keeps its old answer, where a named argument would
+        // be a fatal. MAX_CANDIDATES is ids()' own default for `$max`.
         /** @var list<int> $candidates */
-        $candidates = $matcher::ids($query);
+        $candidates = $matcher::ids($query, $matcher::MAX_CANDIDATES, true);
         if ($candidates === []) {
             return [];
         }
@@ -298,16 +304,32 @@ final class UserSearchRepository
         // search a second time, only its privacy filter over `include`.
         // `number` = every candidate, so the privacy pass filters and never
         // cuts; `orderby` then only makes the result deterministic.
+        //
+        // F-432: PeepSoUserSearch is a WP_User_Query with these args merged
+        // in, and two of its defaults hide a failed read. Measured on the
+        // Local site (WP 7.0.2):
+        //   - count_total: SELECT FOUND_ROWS() runs after the failed SELECT
+        //     and CLEARS last_error;
+        //   - cache_results: even the failed query's [] is cached in
+        //     `user-queries`, so the same read then runs no query and answers
+        //     [] again until any user changes.
+        // Both off, so last_error is this read's own. Nothing here reads
+        // PeepSo's total.
+        global $wpdb;
+        $wpdb->last_error = '';
         $search = new \PeepSoUserSearch(
             [
-                'number'  => count($candidates),
-                'orderby' => 'username',
-                'order'   => 'ASC',
-                'include' => $candidates,
+                'number'        => count($candidates),
+                'orderby'       => 'username',
+                'order'         => 'ASC',
+                'include'       => $candidates,
+                'count_total'   => false,
+                'cache_results' => false,
             ],
             $viewerId > 0 ? $viewerId : null,
             ''
         );
+        self::throwOnDbError('UserSearchRepository::handleOrNameMatches privacy read');
 
         /** @var mixed $raw */
         $raw = $search->results;

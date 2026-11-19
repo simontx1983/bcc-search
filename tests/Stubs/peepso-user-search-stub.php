@@ -44,6 +44,13 @@ namespace {
              */
             public static ?array $visible = null;
 
+            /**
+             * F-432: when set, the `include` pass fails the way the real
+             * WP_User_Query does once count_total is off: no rows, and this
+             * string left in $wpdb->last_error.
+             */
+            public static ?string $failIncludeWith = null;
+
             /** @var list<int|numeric-string> */
             public array $results = [];
 
@@ -52,6 +59,11 @@ namespace {
             {
                 self::$lastCtor = ['args' => $args, 'viewerId' => $viewerId, 'needle' => $needle];
                 self::$calls[]  = self::$lastCtor;
+                if (isset($args['include']) && is_array($args['include']) && self::$failIncludeWith !== null) {
+                    $GLOBALS['wpdb']->last_error = self::$failIncludeWith;
+                    $this->results = [];
+                    return;
+                }
                 if (isset($args['include']) && is_array($args['include'])) {
                     // The include-scoped pass: privacy-filtered candidates.
                     $ids = array_values(array_filter(
@@ -85,6 +97,7 @@ namespace {
                 self::$nextResults = [];
                 self::$calls       = [];
                 self::$visible     = null;
+                self::$failIncludeWith = null;
             }
         }
     }
