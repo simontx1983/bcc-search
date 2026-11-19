@@ -40,8 +40,9 @@ jobs:
       # Production and staging run PHP 8.3.30, so CI does too (F-434; bcc-trust
       # #771 made the same move).
       #
-      # PHPStan's analysis target is pinned separately, by `phpVersion: 80300`
-      # in phpstan.neon, so bumping this line moves only the runtime. (bcc-trust
+      # PHPStan's analysis target is pinned separately, by the `phpVersion`
+      # range in phpstan.neon (the 8.1 floor to 8.3), so bumping this line
+      # moves only the runtime. (bcc-trust
       # pins its target through `config.platform.php`; this repo sets no
       # platform.) composer.lock pins every dev package and production ships
       # none, so `composer install` resolves the same set on either version.

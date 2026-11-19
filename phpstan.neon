@@ -3,11 +3,17 @@ includes:
 
 parameters:
     level: 8
-    # Analyse as production's PHP minor version (8.3), whatever the runner is
-    # (F-434). Without this the target follows the runner, so a CI bump would
-    # move it silently. bcc-trust pins its target through composer.json's
+    # Analyse for every PHP this plugin claims to run on, whatever the runner
+    # is (F-434): from the declared floor ("Requires PHP: 8.1" in
+    # bcc-search.php, require.php >=8.1 in composer.json) up to production's
+    # minor version (8.3). Without this the target follows the runner, so a CI
+    # bump would move it silently; a flat 8.3 would let 8.3-only code pass
+    # analysis that the 8.1 floor cannot run. Raise `min` together with the
+    # floor. bcc-trust pins its target through composer.json's
     # config.platform.php instead; this repo sets no platform.
-    phpVersion: 80300
+    phpVersion:
+        min: 80100
+        max: 80399
     paths:
         - app/
     scanDirectories:
