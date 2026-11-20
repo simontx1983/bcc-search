@@ -157,6 +157,80 @@ final class CacheGenerationGuardTest extends TestCase
         self::assertSame('20', self::cached());
     }
 
+    // ── $force: without it the guard is a no-op in production ──────────
+
+    /**
+     * ⭐⭐ THE TEST THIS CLASS WAS MISSING, and the reason every other test
+     * here passed against a guard that did nothing on the live site.
+     *
+     * Production runs the Redis Object Cache drop-in. Its `get()` answers
+     * from a per-request in-memory array and only consults Redis when that
+     * array has no entry OR `$force` is true. Every caller reaches the guard
+     * immediately after its own `wp_cache_get` found the poison — so the key
+     * is already in that array, and an unforced re-read returns the very
+     * value the caller just rejected.
+     *
+     * Here the in-request copy holds the poison the caller saw, and a bump
+     * from ANOTHER REQUEST has since landed in the shared store. Only a
+     * forced read can see it. An unforced guard overwrites a newer value
+     * with an older one — the exact failure this class exists to prevent.
+     */
+    public function testItSeesABumpThatOnlyExistsInTheSharedStore(): void
+    {
+        // What the caller read, and rejected: poison, now in the per-request
+        // copy because reading it put it there.
+        GenStore::concurrentWrite(self::KEY, self::GROUP, 'poisoned');
+        wp_cache_get(self::KEY, self::GROUP);
+        self::assertSame('poisoned', GenStore::$runtime[GenStore::k(self::KEY, self::GROUP)]);
+
+        // Another request bumps. It reaches the shared store only.
+        GenStore::concurrentWrite(self::KEY, self::GROUP, 9);
+
+        self::assertSame(9, self::publish(5), 'the guard did not see the concurrent bump');
+        self::assertSame(9, self::cached(), 'the guard overwrote a newer bump with an older value');
+    }
+
+    /**
+     * The same thing stated as an argument rather than an outcome. The
+     * behaviour above is what matters, but when it breaks this says WHY in
+     * one line instead of sending the next reader into the drop-in's source.
+     */
+    public function testTheGuardsReReadIsForced(): void
+    {
+        GenStore::concurrentWrite(self::KEY, self::GROUP, 3);
+        wp_cache_get(self::KEY, self::GROUP);
+        GenStore::$reads = [];
+
+        self::publish(7);
+
+        self::assertTrue(
+            GenStore::forcedReadHappened(self::KEY),
+            'the guard re-read the counter without $force, so under the production '
+            . 'drop-in it would have re-read its own request-local copy'
+        );
+    }
+
+    /**
+     * ⚠ ANTI-VACUITY CONTROL, on the HARNESS rather than the code. The two
+     * tests above only mean something if this stub's unforced read really is
+     * blind to a concurrent write. The stub used to have one flat store and
+     * ignored `$force` entirely — strictly more generous than production —
+     * and that is precisely why it certified a broken guard as working.
+     *
+     * If someone flattens it again, this fails and the two tests above stop
+     * being able to pass for the wrong reason.
+     */
+    public function testTheStubsUnforcedReadCannotSeeAConcurrentWrite(): void
+    {
+        GenStore::concurrentWrite(self::KEY, self::GROUP, 1);
+        wp_cache_get(self::KEY, self::GROUP);
+
+        GenStore::concurrentWrite(self::KEY, self::GROUP, 2);
+
+        self::assertSame(1, wp_cache_get(self::KEY, self::GROUP), 'the stub has no per-request layer');
+        self::assertSame(2, wp_cache_get(self::KEY, self::GROUP, true), 'the stub ignores $force');
+    }
+
     // ── the three readers ──────────────────────────────────────────────
 
     /** @return iterable<string, array{0: class-string, 1: string, 2: string, 3: string}> */
@@ -195,9 +269,13 @@ final class CacheGenerationGuardTest extends TestCase
         GenStore::$cache[GenStore::k($key, $group)] = 'poisoned';
         GenStore::$options[$key] = 5;
 
+        // ⚠⚠ concurrentWrite(), NOT wp_cache_set(). A bump from another
+        // request reaches the SHARED store and never touches this request's
+        // in-memory copy. Injecting it with wp_cache_set() made it visible
+        // to a non-forced re-read, which is why this test passed against a
+        // guard that was a no-op under the production drop-in.
         GenStore::$onOptionRead = static function () use ($key, $group): void {
-            wp_cache_set($key, 9, $group);
-            GenStore::$writes = [];
+            GenStore::concurrentWrite($key, $group, 9);
         };
 
         $got = (new \ReflectionMethod($class, $reader))->invoke(null);

@@ -44,6 +44,13 @@ if (!defined('ABSPATH')) {
  * is the source of truth in the first place. What this removes is a window
  * a whole option read wide; what remains is one cache read.
  *
+ * ⚠⚠ AND THAT ONE CACHE READ MUST BE FORCED. Under the production Redis
+ * drop-in an unforced re-read is answered from a per-request in-memory
+ * array, which already holds the value the caller just rejected — so the
+ * guard would never see a concurrent bump, would write every time, and this
+ * whole class would be a no-op on the live site while its tests passed.
+ * See the comment at the read itself.
+ *
  * ⛔ FOR HEAL AND POISON PUBLISHES ONLY. A BUMP MUST NEVER COME THROUGH
  * HERE. A bump is the authority on what the newest value is, so it writes
  * unconditionally; routing it through this guard would let a stale-high
@@ -80,7 +87,22 @@ final class CacheGeneration
      */
     public static function publishWithoutRegressing(string $key, string $group, int $ttl, int $value): int
     {
-        $current = wp_cache_get($key, $group);
+        // ⚠⚠ `$force = true` IS THE WHOLE GUARD. Without it this method is a
+        // no-op on the live site. Production runs the Redis Object Cache
+        // drop-in, whose `get()` answers from a per-request in-memory array
+        // and only consults Redis when that array has no entry OR $force:
+        //
+        //     if ( isset( $this->cache[ $derived_key ] ) && ! $force ) { ... }
+        //
+        // Every caller reaches this method immediately after its OWN
+        // `wp_cache_get` found the poison — so the key is already in that
+        // array, and an unforced re-read hands back the very value the caller
+        // just rejected. It would never see the concurrent bump this guard
+        // exists to protect, and would write unconditionally every time.
+        //
+        // A forced read costs one extra round trip, on the heal and poison
+        // paths only: the miss path uses `wp_cache_add` and never comes here.
+        $current = wp_cache_get($key, $group, true);
 
         // `>=`, not `>`: an equal value needs no write at all, and
         // rewriting it would only refresh a TTL the bump has just set.
