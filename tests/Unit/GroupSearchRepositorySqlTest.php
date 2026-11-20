@@ -57,6 +57,15 @@ final class GroupSearchRepositorySqlTest extends TestCase
         // (SearchRepositoryPrivacySqlTest) — which is also why this class
         // runs in separate processes: a required file would otherwise leak
         // into the rest of the unit run.
+        //
+        // ⚠⚠ THE TRAIT FIRST, and in this order. PeepSoGroupPrivacy gained
+        // `use ProbesReads` in bcc-core F-460, so requiring the class on its
+        // own fatals with `Trait "BCC\Core\Repositories\ProbesReads" not
+        // found`. It is a cross-repo break that surfaces HERE rather than in
+        // bcc-core, because bcc-core's own autoloader resolves the trait
+        // while this harness requires files by path. The pages twin already
+        // does exactly this; the groups twin was left behind.
+        self::requireCore('src/Repositories/ProbesReads.php');
         self::requireCore('src/Repositories/PeepSoGroupPrivacy.php');
 
         $this->hadWpdb  = array_key_exists('wpdb', $GLOBALS);

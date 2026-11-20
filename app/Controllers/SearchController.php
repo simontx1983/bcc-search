@@ -10,6 +10,7 @@ use BCC\Core\Security\Throttle;
 use BCC\Core\ServiceLocator;
 use BCC\Search\Repositories\SearchRepository;
 use BCC\Search\Repositories\SearchTermsRepository;
+use BCC\Search\Support\CacheGeneration;
 use BCC\Search\Support\QueryQualityGate;
 
 class SearchController
@@ -1405,9 +1406,21 @@ class SearchController
         $lockKey = self::SEARCH_VERSION_KEY . '_heal_lock';
 
         if (wp_cache_add($lockKey, 1, self::CACHE_GROUP, self::VERSION_HEAL_LOCK_TTL)) {
-            // Winner of the heal race.
-            $version = self::readValidatedVersionOption();
-            wp_cache_set(self::SEARCH_VERSION_KEY, $version, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+            // Winner of the heal race. ⚠ F-445: publishing goes through the
+            // shared guard, NOT a plain wp_cache_set. The heal lock orders
+            // healers against each other; it does not order a heal against a
+            // concurrent bump, which can land between the option read below
+            // and the cache write.
+            //
+            // A poisoned OPTION is handled better as a side effect:
+            // readValidatedVersionOption() answers with the floor of 1, which
+            // used to be published over a perfectly good cached version.
+            $version = CacheGeneration::publishWithoutRegressing(
+                self::SEARCH_VERSION_KEY,
+                self::CACHE_GROUP,
+                self::VERSION_CACHE_TTL,
+                self::readValidatedVersionOption()
+            );
             self::logCacheVersionFallbackRateLimited($cached, $version);
             return $version;
         }
@@ -1436,9 +1449,18 @@ class SearchController
      *
      * @param mixed $value
      */
+    /**
+     * ⚠ One copy of this predicate, in CacheGeneration (F-445). It used to
+     * be written out here AND inline in both generation readers; three
+     * copies of "what counts as a usable counter value" is how they drift.
+     * Kept as a method because eight call sites in this class read better
+     * for it.
+     *
+     * @param mixed $value
+     */
     private static function isValidVersionValue($value): bool
     {
-        return is_int($value) || (is_string($value) && ctype_digit($value));
+        return CacheGeneration::isValid($value);
     }
 
     /**
@@ -1864,11 +1886,22 @@ class SearchController
         // would fail on an existing key and leave the bad value cached for
         // the whole TTL. getCacheVersion() above heals poison the same way,
         // which is why it keeps set() and gets no add().
+            // ⚠ F-445: a POISONED entry is published through the shared
+            // guard, not a plain set(). We are here because the cached
+            // value was invalid, so there is nothing valid to regress
+            // over — UNLESS a bump landed between that read and this
+            // write, which is exactly the race. The guard adopts the
+            // bump's value instead of overwriting it.
         if ($found === true) {
-            wp_cache_set(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
-        } else {
-            wp_cache_add(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
+            return CacheGeneration::publishWithoutRegressing(
+                self::SEARCH_LKG_GEN_KEY,
+                self::CACHE_GROUP,
+                self::VERSION_CACHE_TTL,
+                $gen
+            );
         }
+
+        wp_cache_add(self::SEARCH_LKG_GEN_KEY, $gen, self::CACHE_GROUP, self::VERSION_CACHE_TTL);
 
         return $gen;
     }
