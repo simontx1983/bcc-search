@@ -149,10 +149,6 @@ final class GroupSearchRepository
 
         $rows = SearchReads::rowsOrThrow($sql, 'GroupSearchRepository::search query failed');
 
-        if (!is_array($rows)) {
-            return [];
-        }
-
         $dtos = [];
         $seen = [];
         foreach ($rows as $row) {

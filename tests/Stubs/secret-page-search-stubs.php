@@ -52,6 +52,19 @@ namespace {
         /** @var mixed rows of the last query, as OBJECTS like the real wpdb */
         public $last_result = [];
 
+        /**
+         * When true, a query containing MATCH( bails the way wpdb::query()
+         * does ABOVE flush(): returns false, leaves `last_error` EMPTY and
+         * `last_result` UNTOUCHED — so the previous query's rows are still
+         * sitting there.
+         *
+         * ⚠ Scoped to the FULLTEXT query on purpose. Bailing every read
+         * would make the title-prefix fallback throw too, and then a test
+         * could not tell "the stale rows were discarded" from "something
+         * threw before we looked".
+         */
+        public bool $bailOnMatch = false;
+
         /** @param mixed ...$args */
         public function prepare(string $query, mixed ...$args): string
         {
@@ -98,11 +111,48 @@ namespace {
          */
         public function query(string $query)
         {
-            $this->sent[]      = $query;
+            $this->sent[] = $query;
+
+            if ($this->bailOnMatch && str_contains($query, 'MATCH(')) {
+                // last_result DELIBERATELY untouched, last_error EMPTY.
+                $this->last_error = '';
+                return false;
+            }
+
             $this->last_error  = '';
             $this->last_result = [];
 
             return 0;
+        }
+    }
+}
+
+namespace BCC\Core\Observability {
+    /**
+     * Recording double for bcc-core's DegradationMetrics.
+     *
+     * The FULLTEXT fall-through records `search_ft_index /
+     * title_only_fallback` when the index is absent, which this harness's
+     * index check reports. Without this, exercising the fall-through dies
+     * with "Class not found" — a harness gap, not a defect in the code.
+     *
+     * ⚠⚠ `class_exists($x, false)` — THE SECOND ARGUMENT IS
+     * LOAD-BEARING. A bare `class_exists()` asks the autoloader, which
+     * would load the REAL class and make the guard always true, so this
+     * double would never be defined and the gap would return disguised.
+     *
+     * Only this suite loads this file, so the double cannot leak.
+     */
+    if (!\class_exists('BCC\Core\Observability\DegradationMetrics', false)) {
+        final class DegradationMetrics
+        {
+            /** @var list<array{0: string, 1: string}> */
+            public static array $recorded = [];
+
+            public static function record(string $subsystem, string $event): void
+            {
+                self::$recorded[] = [$subsystem, $event];
+            }
         }
     }
 }

@@ -394,7 +394,14 @@ final class SearchRepository
 
                 // LIMIT %d is applied in $sql (prepared above); $cap is
                 // the caller's result ceiling.
-                $rows = $wpdb->get_results($sql, ARRAY_A);
+                // ⚠⚠ rowsOrNull, NOT a last_error check. This path's
+                // fall-through policy is about ERRORS, and says nothing
+                // about a pre-flush() bail — where last_error is EMPTY and
+                // last_result still holds the PREVIOUS query's rows. Those
+                // rows never passed THIS query's $base_where, so returning
+                // them would serve candidates past the visibility clause.
+                // null falls through exactly as an error does.
+                $rows = SearchReads::rowsOrNull($sql);
 
                 // Fall-through policy:
                 //   - FT errored:  fall through to title-prefix (degraded but available).
@@ -408,10 +415,16 @@ final class SearchRepository
                 //     truly-empty results is worth correctness on stopword
                 //     queries.
                 //   - FT returned non-empty rows:  return them.
-                if ($wpdb->last_error) {
-                    error_log('[bcc-search] FULLTEXT query error, falling back to title-prefix: ' . $wpdb->last_error);
+                //   - FT could not be TRUSTED (driver error, or a bail
+                //     that left another query's rows behind): fall through,
+                //     and do not look at the rows.
+                if ($rows === null) {
+                    error_log(
+                        '[bcc-search] FULLTEXT read could not be trusted, falling back to title-prefix'
+                        . ($wpdb->last_error !== '' ? ': ' . $wpdb->last_error : ' (no driver error reported)')
+                    );
                     // Fall through to title-prefix LIKE below.
-                } elseif (is_array($rows) && !empty($rows)) {
+                } elseif ($rows !== []) {
                     return self::candidatesToDtos($rows);
                 }
                 // Otherwise (empty rows, or non-array) fall through to LIKE.
@@ -449,10 +462,6 @@ final class SearchRepository
         // here the FT path also failed OR wasn't tried. Throwing rather
         // than returning [] prevents the controller from cache-poisoning
         // the LKG with a "no results" payload built from a broken query.
-        if (!is_array($rows)) {
-            return [];
-        }
-
         return self::candidatesToDtos($rows);
     }
 
@@ -544,10 +553,6 @@ final class SearchRepository
         // A DB error here means the hydrate batch is corrupt — throw
         // rather than return [], which the controller would otherwise
         // cache as "0 results" for the LKG 1h window.
-        if (!is_array($rows)) {
-            return [];
-        }
-
         // Batch-fetch the primary category for each hydrated ID. Returns
         // up to (# distinct cats per page) * (# pages) rows — bounded in
         // practice at a few hundred. We iterate ORDER BY page, menu_order,
@@ -572,17 +577,15 @@ final class SearchRepository
                 ...$ids
             ), 'hydratePages category batch query failed');
 
-            if (is_array($cat_rows)) {
-                foreach ($cat_rows as $cr) {
-                    $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
-                    if ($pid <= 0 || isset($primary_cat_by_page[$pid])) {
-                        continue; // Keep only the first (primary) row per page.
-                    }
-                    $primary_cat_by_page[$pid] = [
-                        'name' => isset($cr['name']) ? (string) $cr['name'] : null,
-                        'slug' => isset($cr['slug']) ? (string) $cr['slug'] : null,
-                    ];
+            foreach ($cat_rows as $cr) {
+                $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
+                if ($pid <= 0 || isset($primary_cat_by_page[$pid])) {
+                    continue; // Keep only the first (primary) row per page.
                 }
+                $primary_cat_by_page[$pid] = [
+                    'name' => isset($cr['name']) ? (string) $cr['name'] : null,
+                    'slug' => isset($cr['slug']) ? (string) $cr['slug'] : null,
+                ];
             }
         }
 
@@ -690,7 +693,7 @@ final class SearchRepository
 
         // DB errors must propagate so the controller can take the LKG/503
         // path rather than serving "trending: []" from a broken query.
-        return array_map('intval', is_array($col) ? $col : []);
+        return array_map('intval', $col);
     }
 
     // ── Categories ──────────────────────────────────────────────────────
@@ -714,27 +717,28 @@ final class SearchRepository
         // request, the savings is up to ~1MB of PHP memory per request before
         // wp_cache absorbs it — meaningful under concurrent load.
         global $wpdb;
+
+        // Throws when the read cannot be trusted, so the controller can
+        // treat categories as "unknown" rather than caching an empty list
+        // that would also invalidate every type=... filter for the
+        // CAT_CACHE_TTL window.
+        /** @var list<object{slug: string, name: string}> $rows */
         $rows = SearchReads::objectsOrThrow(
             "SELECT post_name AS slug, post_title AS name
              FROM {$wpdb->posts}
              WHERE post_type = 'peepso-page-cat'
                AND post_status = 'publish'
              ORDER BY menu_order ASC, post_title ASC
-             LIMIT 100"
+             LIMIT 100",
+            'getCategories query failed'
         );
 
-        // Throw on DB error so the controller can treat categories as
-        // "unknown" rather than caching an empty list that would also
-        // invalidate all type=... filters for the CAT_CACHE_TTL window.
-
         $options = [['slug' => '', 'name' => 'All Types']];
-        if (is_array($rows)) {
-            foreach ($rows as $row) {
-                $options[] = [
-                    'slug' => (string) $row->slug,
-                    'name' => (string) $row->name,
-                ];
-            }
+        foreach ($rows as $row) {
+            $options[] = [
+                'slug' => (string) $row->slug,
+                'name' => (string) $row->name,
+            ];
         }
 
         wp_cache_set(self::CAT_CACHE_KEY, $options, self::CACHE_GROUP, self::CAT_CACHE_TTL);

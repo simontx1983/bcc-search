@@ -94,8 +94,10 @@ final class SearchReads
      * never recorded. The driver error is appended only when there is one.
      *
      * @throws \RuntimeException always
+     *
+     * @return never
      */
-    private static function fail(string $context): void
+    private static function fail(string $context): never
     {
         global $wpdb;
         $detail = (string) $wpdb->last_error;
@@ -104,6 +106,36 @@ final class SearchReads
             $context . ': the read could not be trusted'
             . ($detail !== '' ? ' (' . $detail . ')' : '')
         );
+    }
+
+    /**
+     * Assoc rows, or NULL when they cannot be trusted — the non-throwing
+     * sibling, for a caller with a fallback path rather than a 503.
+     *
+     * ⚠⚠ "CANNOT THROW" IS NOT "CAN TRUST THE ROWS", and conflating
+     * the two is what this method exists to stop. The FULLTEXT candidate
+     * read falls through to the title-prefix LIKE on error, deliberately —
+     * degraded but available. That policy is about ERRORS; it says nothing
+     * about a pre-`flush()` bail, where `last_error` is EMPTY and
+     * `last_result` still holds the PREVIOUS query's rows. A caller
+     * checking only `last_error` would return those rows as results,
+     * bypassing the visibility clause its own query carried.
+     *
+     * So null means "fall through", exactly as an error does, and a
+     * non-empty return is rows this query actually produced. The only
+     * difference from {@see rowsOrThrow()} is WHO decides what to do about
+     * an untrusted read.
+     *
+     * ⚠ `[]` is a real answer ("no rows") and is NOT null. The FULLTEXT
+     * path also falls through on an empty result, but for its own stopword
+     * reason — a different decision from a read it cannot trust, and the
+     * two must stay distinguishable here.
+     *
+     * @return list<array<string, mixed>>|null null = the read cannot be trusted
+     */
+    public static function rowsOrNull(string $sql): ?array
+    {
+        return self::trustedRowsAssoc($sql);
     }
 
     /**

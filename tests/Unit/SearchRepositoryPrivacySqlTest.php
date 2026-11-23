@@ -81,6 +81,46 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
         self::assertStringContainsString("post_type = 'peepso-page'", $sql);
     }
 
+    /**
+     * ⭐⭐ A FULLTEXT read that bails must NOT return another query's
+     * rows as candidates.
+     *
+     * That path falls through to the title-prefix LIKE on error —
+     * deliberately, degraded but available. The policy is about ERRORS. A
+     * pre-`flush()` bail is different: `wpdb::query()` returns false above
+     * `flush()`, so `last_error` is EMPTY and `last_result` still holds the
+     * PREVIOUS query's rows. The old `last_error` check read that as
+     * success and handed those rows back — rows that never passed THIS
+     * query's `$base_where`, i.e. past the secret-page rule every other
+     * test in this file asserts.
+     *
+     * ⚠ The bail is scoped to the FULLTEXT query so the title-prefix
+     * fallback still answers. That is what makes the assertion mean
+     * something: an empty result here says the stale rows were DISCARDED
+     * and the fallback ran, not that something threw before anyone looked.
+     */
+    public function testAFullTextBailDoesNotReturnAnotherQuerysRowsAsCandidates(): void
+    {
+        // Rows left behind by an unrelated query — a secret page, no less.
+        $this->wpdb->last_result = [
+            (object) ['ID' => '999', 'post_title' => 'Someone\'s secret page', 'post_name' => 'secret'],
+        ];
+        $this->wpdb->bailOnMatch = true;
+
+        $dtos = SearchRepository::searchCandidates('matrix', '', 10);
+
+        self::assertSame([], $dtos, 'another query\'s rows came back as candidates');
+        self::assertSame('', $this->wpdb->last_error, 'the premise: the bail sets no error');
+
+        // And it really did fall through: a non-FULLTEXT read was sent.
+        $prefixReads = array_values(array_filter(
+            $this->wpdb->sent,
+            static fn (string $sql): bool => !str_contains($sql, 'MATCH(')
+                && str_contains($sql, 'FROM wp_posts p')
+        ));
+        self::assertNotSame([], $prefixReads, 'the fallback read never ran, so nothing was discarded');
+    }
+
     /** No copy of the old form is left beside the shared rule. */
     public function testTheOldLeftJoinFormIsGone(): void
     {
