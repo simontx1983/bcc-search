@@ -117,7 +117,33 @@ namespace {
             public string $users      = 'wp_users';
             public string $usermeta   = 'wp_usermeta';
             public string $last_error = '';
-            public ?string $failOn    = null;
+
+            /**
+             * ⚠ OBJECTS, like the real thing. `wpdb::query()` fills
+             * `last_result` with stdClass rows whatever output format the
+             * caller later asks for; `get_results(ARRAY_A)` converts on the
+             * way out. bcc-core's ProbesReads reads `last_result` directly,
+             * so the representation here has to be the real one: the seam's
+             * `trustedRowsAssoc()` converts to arrays, while
+             * `UserMetaRepository` uses `trustedRows()` and wants objects.
+             *
+             * @var mixed
+             */
+            public $last_result = [];
+
+            /** 'users' | 'usermeta' — which table's read should fail. */
+            public ?string $failOn = null;
+
+            /**
+             * 'driver_error'   — flush() ran: last_result reset, last_error set.
+             * 'pre_flush_bail' — ⚠⚠ query() returns false ABOVE flush(), so
+             *                    last_result still holds the PREVIOUS query's
+             *                    rows and last_error stays EMPTY. The failure
+             *                    a `last_error` check cannot see, and the
+             *                    reason F-472 exists.
+             */
+            public string $failMode = 'driver_error';
+
             /** @var list<string> */
             public array $queries = [];
 
@@ -137,17 +163,71 @@ namespace {
                 );
             }
 
-            /** @return list<array<string, string>>|null */
-            public function get_results(string $sql, string $output = 'OBJECT'): ?array
+            /**
+             * The real entry point. Returns the ROW COUNT for a SELECT, or
+             * false on failure — which is the signal `get_results()` throws
+             * away and `ProbesReads` checks.
+             *
+             * @return int|false
+             */
+            public function query(string $sql)
             {
-                $this->queries[]  = $sql;
-                $this->last_error = '';
+                $this->queries[] = $sql;
                 $table = str_contains($sql, 'FROM ' . $this->usermeta) ? 'usermeta' : 'users';
+
                 if ($this->failOn === $table) {
-                    $this->last_error = 'simulated read failure';
-                    return null;
+                    if ($this->failMode === 'pre_flush_bail') {
+                        // last_result DELIBERATELY untouched, no error set.
+                        $this->last_error = '';
+                        return false;
+                    }
+                    $this->last_result = [];
+                    $this->last_error  = 'simulated read failure';
+                    return false;
                 }
-                // The id list is the IN() of bare integers.
+
+                $this->last_error  = '';
+                $this->last_result = array_map(
+                    static fn (array $row): object => (object) $row,
+                    $this->rowsFor($table, $sql)
+                );
+
+                return count($this->last_result);
+            }
+
+            /**
+             * ⚠ FAITHFUL: calls query() and DISCARDS its return, then reads
+             * last_result — which is precisely why a `last_error` check after
+             * it cannot see the pre-flush bail. Kept so any remaining caller
+             * of the old shape behaves as production does.
+             *
+             * @return list<array<string, string>>
+             */
+            public function get_results(string $sql, string $output = 'OBJECT'): array
+            {
+                $this->query($sql);
+
+                $rows = is_array($this->last_result) ? $this->last_result : [];
+                if ($output === 'OBJECT') {
+                    return array_values($rows);
+                }
+
+                return array_map(
+                    static fn (object $row): array => array_map('strval', get_object_vars($row)),
+                    array_values($rows)
+                );
+            }
+
+            /**
+             * The fixture rows a query would match.
+             *
+             * @return list<array<string, string>>
+             */
+            private function rowsFor(string $table, string $sql): array
+            {
+                // The id list is the IN() of bare integers. The meta_key
+                // IN('...') clause cannot match this, so the last numeric
+                // IN() is the ids whichever order the clauses appear in.
                 preg_match_all('/IN \(([0-9, ]+)\)/', $sql, $m);
                 $ids = array_map('intval', explode(',', (string) end($m[1])));
 
@@ -166,6 +246,7 @@ namespace {
                     }
                     return $rows;
                 }
+
                 preg_match_all("/'([a-z_]+)'/", $sql, $k);
                 foreach ($ids as $id) {
                     foreach ($k[1] as $key) {

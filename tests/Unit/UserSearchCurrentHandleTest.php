@@ -35,6 +35,10 @@ final class UserSearchCurrentHandleTest extends TestCase
     {
         parent::setUp();
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         \PeepSoUserSearch::reset();
         $GLOBALS['__bcc_userdata'] = [];
         $GLOBALS['__bcc_usermeta'] = [];

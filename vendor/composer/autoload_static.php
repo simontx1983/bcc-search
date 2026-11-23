@@ -35,7 +35,9 @@ class ComposerStaticInit0180abac37f97f9f4f92c3f8cc3b3409
         'BCC\\Search\\Repositories\\UserSearchRepository' => __DIR__ . '/../..' . '/app/Repositories/UserSearchRepository.php',
         'BCC\\Search\\Services\\GroupSearchService' => __DIR__ . '/../..' . '/app/Services/GroupSearchService.php',
         'BCC\\Search\\Services\\UserSearchService' => __DIR__ . '/../..' . '/app/Services/UserSearchService.php',
+        'BCC\\Search\\Support\\CacheGeneration' => __DIR__ . '/../..' . '/app/Support/CacheGeneration.php',
         'BCC\\Search\\Support\\QueryQualityGate' => __DIR__ . '/../..' . '/app/Support/QueryQualityGate.php',
+        'BCC\\Search\\Support\\SearchReads' => __DIR__ . '/../..' . '/app/Support/SearchReads.php',
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
     );
 

@@ -47,6 +47,10 @@ final class UserSearchMatchingReadFailureTest extends TestCase
     private function oneMember(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         unset($GLOBALS['__bcc_member_candidates_fail'], $GLOBALS['__bcc_member_candidates_args']);

@@ -20,6 +20,8 @@ return array(
     'BCC\\Search\\Repositories\\UserSearchRepository' => $baseDir . '/app/Repositories/UserSearchRepository.php',
     'BCC\\Search\\Services\\GroupSearchService' => $baseDir . '/app/Services/GroupSearchService.php',
     'BCC\\Search\\Services\\UserSearchService' => $baseDir . '/app/Services/UserSearchService.php',
+    'BCC\\Search\\Support\\CacheGeneration' => $baseDir . '/app/Support/CacheGeneration.php',
     'BCC\\Search\\Support\\QueryQualityGate' => $baseDir . '/app/Support/QueryQualityGate.php',
+    'BCC\\Search\\Support\\SearchReads' => $baseDir . '/app/Support/SearchReads.php',
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
 );
