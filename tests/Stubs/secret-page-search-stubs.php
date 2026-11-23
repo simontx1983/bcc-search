@@ -21,7 +21,13 @@ namespace {
          */
         function get_option(string $key, $default = false)
         {
-            return $default;
+            // Seedable via $GLOBALS['__bcc_options'], defaulting to the
+            // caller's default when unseeded, so existing tests are
+            // unaffected. Needed because the FULLTEXT branch is gated on
+            // get_option('bcc_ft_index_v2_installed') -- with a stub that
+            // always returned the default, that branch was UNREACHABLE and
+            // any test claiming to exercise it proved nothing.
+            return $GLOBALS['__bcc_options'][$key] ?? $default;
         }
     }
     if (!function_exists('wp_cache_get')) {

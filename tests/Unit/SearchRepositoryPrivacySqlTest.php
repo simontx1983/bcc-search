@@ -102,12 +102,30 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
     public function testAFullTextBailDoesNotReturnAnotherQuerysRowsAsCandidates(): void
     {
         // Rows left behind by an unrelated query — a secret page, no less.
+        // The FULLTEXT branch is gated on this option; without it the
+        // branch never runs and this test would assert nothing.
+        $GLOBALS['__bcc_options']['bcc_ft_index_v2_installed'] = 1;
+
         $this->wpdb->last_result = [
             (object) ['ID' => '999', 'post_title' => 'Someone\'s secret page', 'post_name' => 'secret'],
         ];
         $this->wpdb->bailOnMatch = true;
 
-        $dtos = SearchRepository::searchCandidates('matrix', '', 10);
+        // The fall-through logs. Point error_log at a file for the duration
+        // rather than muting it: PHPUnit treats the output as a failure, and
+        // capturing it lets the log line itself be asserted below.
+        $logFile = (string) tempnam(sys_get_temp_dir(), 'bcc-ft-log');
+        $prevLog = (string) ini_get('error_log');
+        ini_set('error_log', $logFile);
+
+        try {
+            $dtos = SearchRepository::searchCandidates('matrix', '', 10);
+        } finally {
+            ini_set('error_log', $prevLog);
+        }
+
+        $logged = (string) @file_get_contents($logFile);
+        @unlink($logFile);
 
         self::assertSame([], $dtos, 'another query\'s rows came back as candidates');
         self::assertSame('', $this->wpdb->last_error, 'the premise: the bail sets no error');
@@ -119,6 +137,20 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
                 && str_contains($sql, 'FROM wp_posts p')
         ));
         self::assertNotSame([], $prefixReads, 'the fallback read never ran, so nothing was discarded');
+
+        // ANTI-VACUITY: prove the FULLTEXT query was actually SENT. Without
+        // this the test passes when the FT branch is skipped entirely (no
+        // index in this harness), asserting nothing about the bail.
+        $ftReads = array_values(array_filter(
+            $this->wpdb->sent,
+            static fn (string $sql): bool => str_contains($sql, 'MATCH(')
+        ));
+        self::assertNotSame([], $ftReads, 'the FULLTEXT query never ran, so this test proves nothing');
+
+        // And it said WHY, naming the absence of a driver error -- the
+        // detail that distinguishes a bail from an ordinary failure.
+        self::assertStringContainsString('could not be trusted', $logged);
+        self::assertStringContainsString('no driver error reported', $logged);
     }
 
     /**
