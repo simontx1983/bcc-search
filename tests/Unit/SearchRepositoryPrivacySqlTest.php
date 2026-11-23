@@ -121,6 +121,34 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
         self::assertNotSame([], $prefixReads, 'the fallback read never ran, so nothing was discarded');
     }
 
+    /**
+     * getCategories had NO test at all, which is how a missing argument
+     * shipped: `objectsOrThrow()` was called without its `$context`, and
+     * because an ArgumentCountError is an \Error rather than a
+     * RuntimeException, the controller's catch would have missed it and
+     * every `type=` filter would have 500'd. The full suite passed over
+     * the whole method.
+     *
+     * So this pins the happy path AND, by exercising the call at all, makes
+     * a dropped argument fail here instead of in production.
+     */
+    public function testCategoriesComeBackFromATrustedRead(): void
+    {
+        $this->wpdb->resultRows = [
+            (object) ['slug' => 'guides', 'name' => 'Guides'],
+        ];
+
+        $options = SearchRepository::getCategories();
+
+        self::assertSame(
+            [
+                ['slug' => '', 'name' => 'All Types'],
+                ['slug' => 'guides', 'name' => 'Guides'],
+            ],
+            $options
+        );
+    }
+
     /** No copy of the old form is left beside the shared rule. */
     public function testTheOldLeftJoinFormIsGone(): void
     {

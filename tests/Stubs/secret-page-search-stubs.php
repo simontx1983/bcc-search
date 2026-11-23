@@ -65,6 +65,16 @@ namespace {
          */
         public bool $bailOnMatch = false;
 
+        /**
+         * Rows a successful query answers with, as OBJECTS. Default empty,
+         * so every existing test keeps its "no rows" behaviour; a test that
+         * needs rows seeds this instead of writing last_result directly,
+         * which query() would clear.
+         *
+         * @var list<object>
+         */
+        public array $resultRows = [];
+
         /** @param mixed ...$args */
         public function prepare(string $query, mixed ...$args): string
         {
@@ -90,11 +100,30 @@ namespace {
             return [];
         }
 
-        /** @return list<array<string, mixed>> */
+        /**
+         * FAITHFUL, AND THE FIDELITY IS LOAD-BEARING. The real
+         * `get_results()` calls `query()` and DISCARDS its return value,
+         * then reads `last_result`. An earlier version of this double
+         * returned `[]` unconditionally and touched neither -- which made
+         * it blind to the exact defect the seam exists to remove: a mutant
+         * reverting a seam call back to `get_results()` SURVIVED, because
+         * the double answered `[]` either way.
+         *
+         * @return list<array<string, mixed>>
+         */
         public function get_results(string $query, string $output = 'OBJECT'): array
         {
-            $this->sent[] = $query;
-            return [];
+            $this->query($query); // return deliberately ignored, as wpdb does
+
+            $rows = is_array($this->last_result) ? $this->last_result : [];
+            if ($output === 'OBJECT') {
+                return array_values($rows);
+            }
+
+            return array_map(
+                static fn (object $row): array => array_map('strval', get_object_vars($row)),
+                array_values($rows)
+            );
         }
 
         /**
@@ -120,9 +149,9 @@ namespace {
             }
 
             $this->last_error  = '';
-            $this->last_result = [];
+            $this->last_result = $this->resultRows;
 
-            return 0;
+            return count($this->resultRows);
         }
     }
 }
