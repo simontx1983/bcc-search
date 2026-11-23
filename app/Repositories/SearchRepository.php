@@ -6,6 +6,7 @@ use BCC\Core\Repositories\PeepSoPagePrivacy;
 use BCC\Search\DTO\PageCandidateDTO;
 use BCC\Search\DTO\PageHydratedDTO;
 use BCC\Search\DTO\TrendingPageRowDTO;
+use BCC\Search\Support\SearchReads;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -25,33 +26,6 @@ final class SearchRepository
     private const CAT_CACHE_KEY = 'bcc_search_categories';
     private const CAT_CACHE_TTL = 43200; // 12 hours
 
-    /**
-     * Throw RuntimeException if the last query left an error on $wpdb.
-     *
-     * **IMMEDIATE-CHECK CONTRACT**: callers MUST invoke this on the
-     * line immediately following their wpdb accessor call, before any
-     * other wpdb operation on the same request. The helper reads
-     * $wpdb->last_error — which is reset at the start of the next
-     * _do_query() invocation — so any intervening wpdb call clobbers
-     * the error state and this check will silently miss a failed
-     * query. Pattern: run the wpdb accessor, assign its return into a
-     * local, then on the very next line call throwOnDbError with a
-     * descriptive context string and nothing else between the two.
-     *
-     * Centralised so the controller's LKG/503 escape hatch is the ONLY
-     * way a DB error surfaces (never silently-to-empty-result, which
-     * would poison the LKG mirror). The indirection also defeats
-     * PHPStan's after-narrowing of `$wpdb->last_error` across multiple
-     * queries in the same scope.
-     */
-    private static function throwOnDbError(string $context): void
-    {
-        global $wpdb;
-        $err = (string) $wpdb->last_error;
-        if ($err !== '') {
-            throw new \RuntimeException("{$context}: {$err}");
-        }
-    }
     // peepso_page_categories table presence rarely changes (install/activate
     // only). Cache the result long-term to skip the information_schema-ish
     // SHOW TABLES round-trip on hot-path searches. A PeepSo install/uninstall
@@ -107,14 +81,16 @@ final class SearchRepository
 
         $table = $wpdb->prefix . 'peepso_page_categories';
 
-        $found = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+        $found = SearchReads::scalarOrThrow(
+            (string) $wpdb->prepare('SHOW TABLES LIKE %s', $table),
+            'peepsoCategoryTable discovery query failed'
+        );
         // Immediate-check contract: capture last_error right after the
         // query while it still unambiguously belongs to this SHOW TABLES
         // call. Prior to this we have no $wpdb calls on this code path,
         // so $wpdb->last_error would be either '' or left over from an
         // earlier request — either way, after this line we know
         // definitively whether the discovery query itself errored.
-        self::throwOnDbError('peepsoCategoryTable discovery query failed');
 
         if ($found !== $table) {
             $cache[$prefix] = null;
@@ -418,7 +394,14 @@ final class SearchRepository
 
                 // LIMIT %d is applied in $sql (prepared above); $cap is
                 // the caller's result ceiling.
-                $rows = $wpdb->get_results($sql, ARRAY_A);
+                // ⚠⚠ rowsOrNull, NOT a last_error check. This path's
+                // fall-through policy is about ERRORS, and says nothing
+                // about a pre-flush() bail — where last_error is EMPTY and
+                // last_result still holds the PREVIOUS query's rows. Those
+                // rows never passed THIS query's $base_where, so returning
+                // them would serve candidates past the visibility clause.
+                // null falls through exactly as an error does.
+                $rows = SearchReads::rowsOrNull($sql);
 
                 // Fall-through policy:
                 //   - FT errored:  fall through to title-prefix (degraded but available).
@@ -432,10 +415,16 @@ final class SearchRepository
                 //     truly-empty results is worth correctness on stopword
                 //     queries.
                 //   - FT returned non-empty rows:  return them.
-                if ($wpdb->last_error) {
-                    error_log('[bcc-search] FULLTEXT query error, falling back to title-prefix: ' . $wpdb->last_error);
+                //   - FT could not be TRUSTED (driver error, or a bail
+                //     that left another query's rows behind): fall through,
+                //     and do not look at the rows.
+                if ($rows === null) {
+                    error_log(
+                        '[bcc-search] FULLTEXT read could not be trusted, falling back to title-prefix'
+                        . ($wpdb->last_error !== '' ? ': ' . $wpdb->last_error : ' (no driver error reported)')
+                    );
                     // Fall through to title-prefix LIKE below.
-                } elseif (is_array($rows) && !empty($rows)) {
+                } elseif ($rows !== []) {
                     return self::candidatesToDtos($rows);
                 }
                 // Otherwise (empty rows, or non-array) fall through to LIKE.
@@ -466,18 +455,13 @@ final class SearchRepository
             $cap
         );
 
-        $rows = $wpdb->get_results($sql, ARRAY_A);
+        $rows = SearchReads::rowsOrThrow($sql, 'searchCandidates title-prefix query failed');
 
         // A DB error on the title-prefix fallback is a hard failure. The
         // FT path already falls through on errors, so by the time we're
         // here the FT path also failed OR wasn't tried. Throwing rather
         // than returning [] prevents the controller from cache-poisoning
         // the LKG with a "no results" payload built from a broken query.
-        self::throwOnDbError('searchCandidates title-prefix query failed');
-        if (!is_array($rows)) {
-            return [];
-        }
-
         return self::candidatesToDtos($rows);
     }
 
@@ -547,7 +531,7 @@ final class SearchRepository
         // is the chokepoint that also hydrates primary-trending ids.
         $not_secret = PeepSoPagePrivacy::notSecretSql('p.ID');
 
-        $rows = $wpdb->get_results($wpdb->prepare(
+        $rows = SearchReads::rowsOrThrow((string) $wpdb->prepare(
             "SELECT
                 p.ID,
                 p.post_title,
@@ -564,16 +548,11 @@ final class SearchRepository
              ORDER BY FIELD(p.ID, {$field_placeholders})
              LIMIT %d",
             ...array_merge($ids, $ids, [count($ids)])
-        ), ARRAY_A);
+        ), 'hydratePages page query failed');
 
         // A DB error here means the hydrate batch is corrupt — throw
         // rather than return [], which the controller would otherwise
         // cache as "0 results" for the LKG 1h window.
-        self::throwOnDbError('hydratePages page query failed');
-        if (!is_array($rows)) {
-            return [];
-        }
-
         // Batch-fetch the primary category for each hydrated ID. Returns
         // up to (# distinct cats per page) * (# pages) rows — bounded in
         // practice at a few hundred. We iterate ORDER BY page, menu_order,
@@ -581,7 +560,7 @@ final class SearchRepository
         // per the admin's intent).
         $primary_cat_by_page = [];
         if ($cat_info) {
-            $cat_rows = $wpdb->get_results($wpdb->prepare(
+            $cat_rows = SearchReads::rowsOrThrow((string) $wpdb->prepare(
                 "SELECT pcl.{$cat_info['page_col']} AS page_id,
                         catl.post_title            AS name,
                         catl.post_name             AS slug,
@@ -596,20 +575,17 @@ final class SearchRepository
                           catl.menu_order ASC,
                           catl.post_title ASC",
                 ...$ids
-            ), ARRAY_A);
+            ), 'hydratePages category batch query failed');
 
-            self::throwOnDbError('hydratePages category batch query failed');
-            if (is_array($cat_rows)) {
-                foreach ($cat_rows as $cr) {
-                    $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
-                    if ($pid <= 0 || isset($primary_cat_by_page[$pid])) {
-                        continue; // Keep only the first (primary) row per page.
-                    }
-                    $primary_cat_by_page[$pid] = [
-                        'name' => isset($cr['name']) ? (string) $cr['name'] : null,
-                        'slug' => isset($cr['slug']) ? (string) $cr['slug'] : null,
-                    ];
+            foreach ($cat_rows as $cr) {
+                $pid = isset($cr['page_id']) ? (int) $cr['page_id'] : 0;
+                if ($pid <= 0 || isset($primary_cat_by_page[$pid])) {
+                    continue; // Keep only the first (primary) row per page.
                 }
+                $primary_cat_by_page[$pid] = [
+                    'name' => isset($cr['name']) ? (string) $cr['name'] : null,
+                    'slug' => isset($cr['slug']) ? (string) $cr['slug'] : null,
+                ];
             }
         }
 
@@ -704,7 +680,7 @@ final class SearchRepository
         $posts_table = $wpdb->posts;
         $not_secret  = PeepSoPagePrivacy::notSecretSql('p.ID');
 
-        $col = $wpdb->get_col($wpdb->prepare(
+        $col = SearchReads::columnOrThrow((string) $wpdb->prepare(
             "SELECT p.ID
              FROM {$posts_table} p
              WHERE p.post_type = 'peepso-page'
@@ -713,12 +689,11 @@ final class SearchRepository
              ORDER BY p.ID DESC
              LIMIT %d",
             $limit
-        ));
+        ), 'getFallbackPageIds query failed');
 
         // DB errors must propagate so the controller can take the LKG/503
         // path rather than serving "trending: []" from a broken query.
-        self::throwOnDbError('getFallbackPageIds query failed');
-        return array_map('intval', is_array($col) ? $col : []);
+        return array_map('intval', $col);
     }
 
     // ── Categories ──────────────────────────────────────────────────────
@@ -742,28 +717,28 @@ final class SearchRepository
         // request, the savings is up to ~1MB of PHP memory per request before
         // wp_cache absorbs it — meaningful under concurrent load.
         global $wpdb;
-        $rows = $wpdb->get_results(
+
+        // Throws when the read cannot be trusted, so the controller can
+        // treat categories as "unknown" rather than caching an empty list
+        // that would also invalidate every type=... filter for the
+        // CAT_CACHE_TTL window.
+        /** @var list<object{slug: string, name: string}> $rows */
+        $rows = SearchReads::objectsOrThrow(
             "SELECT post_name AS slug, post_title AS name
              FROM {$wpdb->posts}
              WHERE post_type = 'peepso-page-cat'
                AND post_status = 'publish'
              ORDER BY menu_order ASC, post_title ASC
-             LIMIT 100"
+             LIMIT 100",
+            'getCategories query failed'
         );
 
-        // Throw on DB error so the controller can treat categories as
-        // "unknown" rather than caching an empty list that would also
-        // invalidate all type=... filters for the CAT_CACHE_TTL window.
-        self::throwOnDbError('getCategories query failed');
-
         $options = [['slug' => '', 'name' => 'All Types']];
-        if (is_array($rows)) {
-            foreach ($rows as $row) {
-                $options[] = [
-                    'slug' => (string) $row->slug,
-                    'name' => (string) $row->name,
-                ];
-            }
+        foreach ($rows as $row) {
+            $options[] = [
+                'slug' => (string) $row->slug,
+                'name' => (string) $row->name,
+            ];
         }
 
         wp_cache_set(self::CAT_CACHE_KEY, $options, self::CACHE_GROUP, self::CAT_CACHE_TTL);

@@ -45,8 +45,8 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
     {
         parent::setUp();
         require_once dirname(__DIR__) . '/Stubs/secret-page-search-stubs.php';
-        self::requireCore('src/Repositories/ProbesReads.php');
-        self::requireCore('src/Repositories/PeepSoPagePrivacy.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/ProbesReads.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/PeepSoPagePrivacy.php');
 
         $this->wpdb      = new \BccSecretPageSearchFakeWpdb();
         $GLOBALS['wpdb'] = $this->wpdb;
@@ -81,6 +81,106 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
         self::assertStringContainsString("post_type = 'peepso-page'", $sql);
     }
 
+    /**
+     * ⭐⭐ A FULLTEXT read that bails must NOT return another query's
+     * rows as candidates.
+     *
+     * That path falls through to the title-prefix LIKE on error —
+     * deliberately, degraded but available. The policy is about ERRORS. A
+     * pre-`flush()` bail is different: `wpdb::query()` returns false above
+     * `flush()`, so `last_error` is EMPTY and `last_result` still holds the
+     * PREVIOUS query's rows. The old `last_error` check read that as
+     * success and handed those rows back — rows that never passed THIS
+     * query's `$base_where`, i.e. past the secret-page rule every other
+     * test in this file asserts.
+     *
+     * ⚠ The bail is scoped to the FULLTEXT query so the title-prefix
+     * fallback still answers. That is what makes the assertion mean
+     * something: an empty result here says the stale rows were DISCARDED
+     * and the fallback ran, not that something threw before anyone looked.
+     */
+    public function testAFullTextBailDoesNotReturnAnotherQuerysRowsAsCandidates(): void
+    {
+        // Rows left behind by an unrelated query — a secret page, no less.
+        // The FULLTEXT branch is gated on this option; without it the
+        // branch never runs and this test would assert nothing.
+        $GLOBALS['__bcc_options']['bcc_ft_index_v2_installed'] = 1;
+
+        $this->wpdb->last_result = [
+            (object) ['ID' => '999', 'post_title' => 'Someone\'s secret page', 'post_name' => 'secret'],
+        ];
+        $this->wpdb->bailOnMatch = true;
+
+        // The fall-through logs. Point error_log at a file for the duration
+        // rather than muting it: PHPUnit treats the output as a failure, and
+        // capturing it lets the log line itself be asserted below.
+        $logFile = (string) tempnam(sys_get_temp_dir(), 'bcc-ft-log');
+        $prevLog = (string) ini_get('error_log');
+        ini_set('error_log', $logFile);
+
+        try {
+            $dtos = SearchRepository::searchCandidates('matrix', '', 10);
+        } finally {
+            ini_set('error_log', $prevLog);
+        }
+
+        $logged = (string) @file_get_contents($logFile);
+        @unlink($logFile);
+
+        self::assertSame([], $dtos, 'another query\'s rows came back as candidates');
+        self::assertSame('', $this->wpdb->last_error, 'the premise: the bail sets no error');
+
+        // And it really did fall through: a non-FULLTEXT read was sent.
+        $prefixReads = array_values(array_filter(
+            $this->wpdb->sent,
+            static fn (string $sql): bool => !str_contains($sql, 'MATCH(')
+                && str_contains($sql, 'FROM wp_posts p')
+        ));
+        self::assertNotSame([], $prefixReads, 'the fallback read never ran, so nothing was discarded');
+
+        // ANTI-VACUITY: prove the FULLTEXT query was actually SENT. Without
+        // this the test passes when the FT branch is skipped entirely (no
+        // index in this harness), asserting nothing about the bail.
+        $ftReads = array_values(array_filter(
+            $this->wpdb->sent,
+            static fn (string $sql): bool => str_contains($sql, 'MATCH(')
+        ));
+        self::assertNotSame([], $ftReads, 'the FULLTEXT query never ran, so this test proves nothing');
+
+        // And it said WHY, naming the absence of a driver error -- the
+        // detail that distinguishes a bail from an ordinary failure.
+        self::assertStringContainsString('could not be trusted', $logged);
+        self::assertStringContainsString('no driver error reported', $logged);
+    }
+
+    /**
+     * getCategories had NO test at all, which is how a missing argument
+     * shipped: `objectsOrThrow()` was called without its `$context`, and
+     * because an ArgumentCountError is an \Error rather than a
+     * RuntimeException, the controller's catch would have missed it and
+     * every `type=` filter would have 500'd. The full suite passed over
+     * the whole method.
+     *
+     * So this pins the happy path AND, by exercising the call at all, makes
+     * a dropped argument fail here instead of in production.
+     */
+    public function testCategoriesComeBackFromATrustedRead(): void
+    {
+        $this->wpdb->resultRows = [
+            (object) ['slug' => 'guides', 'name' => 'Guides'],
+        ];
+
+        $options = SearchRepository::getCategories();
+
+        self::assertSame(
+            [
+                ['slug' => '', 'name' => 'All Types'],
+                ['slug' => 'guides', 'name' => 'Guides'],
+            ],
+            $options
+        );
+    }
+
     /** No copy of the old form is left beside the shared rule. */
     public function testTheOldLeftJoinFormIsGone(): void
     {
@@ -109,22 +209,4 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
         return $reads[0];
     }
 
-    /**
-     * A file of the bcc-core checkout beside this plugin. In CI a missing
-     * file FAILS (a skip is invisible in a green run); locally a bare clone
-     * may have no sibling, so it skips there.
-     */
-    private static function requireCore(string $relPath): void
-    {
-        $path = dirname(__DIR__, 3) . '/bcc-core/' . $relPath;
-        if (is_file($path)) {
-            require_once $path;
-            return;
-        }
-        $inCi = (string) getenv('GITHUB_ACTIONS') !== '' || strtolower((string) getenv('CI')) === 'true';
-        if ($inCi) {
-            self::fail('bcc-core file missing at ' . $path . ' while running in CI.');
-        }
-        self::markTestSkipped('bcc-core sibling not present at ' . $path . ' (expected outside CI).');
-    }
 }
