@@ -49,6 +49,9 @@ namespace {
         /** @var list<string> every statement sent, arguments filled in */
         public array $sent = [];
 
+        /** @var mixed rows of the last query, as OBJECTS like the real wpdb */
+        public $last_result = [];
+
         /** @param mixed ...$args */
         public function prepare(string $query, mixed ...$args): string
         {
@@ -79,6 +82,27 @@ namespace {
         {
             $this->sent[] = $query;
             return [];
+        }
+
+        /**
+         * The real entry point, which ProbesReads calls explicitly (F-472).
+         *
+         * ⚠ Still RECORDS the statement, because that is what these tests
+         * assert on: the privacy clause is checked by reading `sent`, and a
+         * read that stopped recording would make those assertions pass over
+         * nothing.
+         *
+         * Returns 0 rows, matching get_results() above.
+         *
+         * @return int|false
+         */
+        public function query(string $query)
+        {
+            $this->sent[]      = $query;
+            $this->last_error  = '';
+            $this->last_result = [];
+
+            return 0;
         }
     }
 }

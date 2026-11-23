@@ -45,8 +45,8 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
     {
         parent::setUp();
         require_once dirname(__DIR__) . '/Stubs/secret-page-search-stubs.php';
-        self::requireCore('src/Repositories/ProbesReads.php');
-        self::requireCore('src/Repositories/PeepSoPagePrivacy.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/ProbesReads.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/PeepSoPagePrivacy.php');
 
         $this->wpdb      = new \BccSecretPageSearchFakeWpdb();
         $GLOBALS['wpdb'] = $this->wpdb;
@@ -109,22 +109,4 @@ final class SearchRepositoryPrivacySqlTest extends TestCase
         return $reads[0];
     }
 
-    /**
-     * A file of the bcc-core checkout beside this plugin. In CI a missing
-     * file FAILS (a skip is invisible in a green run); locally a bare clone
-     * may have no sibling, so it skips there.
-     */
-    private static function requireCore(string $relPath): void
-    {
-        $path = dirname(__DIR__, 3) . '/bcc-core/' . $relPath;
-        if (is_file($path)) {
-            require_once $path;
-            return;
-        }
-        $inCi = (string) getenv('GITHUB_ACTIONS') !== '' || strtolower((string) getenv('CI')) === 'true';
-        if ($inCi) {
-            self::fail('bcc-core file missing at ' . $path . ' while running in CI.');
-        }
-        self::markTestSkipped('bcc-core sibling not present at ' . $path . ' (expected outside CI).');
-    }
 }

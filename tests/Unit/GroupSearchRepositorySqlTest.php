@@ -65,8 +65,8 @@ final class GroupSearchRepositorySqlTest extends TestCase
         // bcc-core, because bcc-core's own autoloader resolves the trait
         // while this harness requires files by path. The pages twin already
         // does exactly this; the groups twin was left behind.
-        self::requireCore('src/Repositories/ProbesReads.php');
-        self::requireCore('src/Repositories/PeepSoGroupPrivacy.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/ProbesReads.php');
+        \BCC\Search\Tests\Support\CoreSibling::require('src/Repositories/PeepSoGroupPrivacy.php');
 
         $this->hadWpdb  = array_key_exists('wpdb', $GLOBALS);
         $this->prevWpdb = $GLOBALS['wpdb'] ?? null;
@@ -84,26 +84,6 @@ final class GroupSearchRepositorySqlTest extends TestCase
         parent::tearDown();
     }
 
-    /**
-     * A file of the bcc-core checkout beside this plugin. In CI a missing
-     * file FAILS (a skip is invisible in a green run); locally a bare clone
-     * may have no sibling, so it skips there. Same contract as
-     * SearchRepositoryPrivacySqlTest::requireCore().
-     */
-    private static function requireCore(string $relPath): void
-    {
-        $path = dirname(__DIR__, 3) . '/bcc-core/' . $relPath;
-        if (is_file($path)) {
-            require_once $path;
-            return;
-        }
-        $inCi = (string) getenv('GITHUB_ACTIONS') !== '' || strtolower((string) getenv('CI')) === 'true';
-        if ($inCi) {
-            self::fail('bcc-core file missing at ' . $path . ' while running in CI.');
-        }
-        self::markTestSkipped('bcc-core sibling not present at ' . $path . ' (expected outside CI).');
-    }
-
     private function makeFakeWpdb(): object
     {
         return new class {
@@ -115,6 +95,9 @@ final class GroupSearchRepositorySqlTest extends TestCase
             public array $lastArgs = [];
             /** @var list<array<string,mixed>> */
             public array $rows = [];
+
+            /** @var mixed rows of the last query, as OBJECTS like the real wpdb */
+            public $last_result = [];
 
             public function esc_like(string $text): string
             {
@@ -136,6 +119,32 @@ final class GroupSearchRepositorySqlTest extends TestCase
             public function get_results(string $query, string $output): array
             {
                 return $this->rows;
+            }
+
+            /**
+             * The real entry point, which ProbesReads calls explicitly
+             * (F-472).
+             *
+             * ⚠ `last_result` holds OBJECTS, as wpdb does — the assoc
+             * shape is produced by `get_object_vars()` on the way out, so a
+             * double storing arrays would hand the assoc path
+             * arrays-of-arrays and pass for the wrong reason.
+             *
+             * ⚠ Deliberately does NOT touch `lastQuery`: `prepare()` sets
+             * it and the tests assert on that, so recording here as well
+             * would only risk masking a path that skipped prepare.
+             *
+             * @return int|false
+             */
+            public function query(string $query)
+            {
+                $this->last_error  = '';
+                $this->last_result = array_map(
+                    static fn (array $row): object => (object) $row,
+                    $this->rows
+                );
+
+                return count($this->last_result);
             }
         };
     }

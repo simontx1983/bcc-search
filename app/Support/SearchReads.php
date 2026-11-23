@@ -13,7 +13,15 @@ if (!defined('ABSPATH')) {
  *
  * Three copies of a private `throwOnDbError()` — in GroupSearchRepository,
  * SearchRepository and UserSearchRepository — each of which checked
- * `$wpdb->last_error` AFTER a `get_results()`.
+ * `$wpdb->last_error` AFTER a `get_results()`. It replaces them AS CALLERS
+ * MOVE, rather than all at once.
+ *
+ * ⚠ ONE READ CANNOT SIMPLY MOVE HERE, and it is the one left behind:
+ * `UserSearchRepository::handleOrNameMatches()` guards a PRIVACY read made
+ * by `PeepSoUserSearch`, a `WP_User_Query` whose SQL this plugin never
+ * holds — so there is no statement to hand to a method here. Its own
+ * `throwOnDbError` stays until that is designed separately (F-432 context),
+ * which is why that one private copy remains.
  *
  * ⚠⚠ That shape cannot see the failure that matters most.
  * `wpdb::query()` returns false on paths that run BEFORE it calls
@@ -71,20 +79,77 @@ final class SearchReads
     {
         $rows = self::trustedRowsAssoc($sql);
         if ($rows === null) {
-            global $wpdb;
-            $detail = (string) $wpdb->last_error;
-
-            // ⚠ The message says "could not be trusted", not "errored".
-            // On the pre-flush bail there IS no error to quote, and a
-            // message implying one would send the next person looking for a
-            // driver error that was never recorded.
-            throw new \RuntimeException(
-                $context . ': the read could not be trusted'
-                . ($detail !== '' ? ' (' . $detail . ')' : '')
-            );
+            self::fail($context);
         }
 
         return $rows;
+    }
+
+    /**
+     * The one refusal, so every read shape fails identically.
+     *
+     * ⚠ The message says "could not be trusted", NOT "errored". On the
+     * pre-`flush()` bail there IS no error to quote, and a message implying
+     * one would send the next person looking for a driver error that was
+     * never recorded. The driver error is appended only when there is one.
+     *
+     * @throws \RuntimeException always
+     */
+    private static function fail(string $context): void
+    {
+        global $wpdb;
+        $detail = (string) $wpdb->last_error;
+
+        throw new \RuntimeException(
+            $context . ': the read could not be trusted'
+            . ($detail !== '' ? ' (' . $detail . ')' : '')
+        );
+    }
+
+    /**
+     * The same rows as OBJECTS, or THROW.
+     *
+     * ⚠ A separate method rather than a flag, because the SHAPE is what
+     * the caller's consumers depend on: `$row->slug` and `$row['slug']` are
+     * not interchangeable, and a boolean at the call site would not say
+     * which you get. Replaces a bare `$wpdb->get_results($sql)` — wpdb's
+     * default output — followed by a `last_error` check.
+     *
+     * @return list<object>
+     * @throws \RuntimeException when the read cannot be trusted
+     */
+    public static function objectsOrThrow(string $sql, string $context): array
+    {
+        $rows = self::trustedRows($sql);
+        if ($rows === null) {
+            self::fail($context);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * The FIRST column of every row, or THROW — the `get_col()` shape.
+     *
+     * ⚠ Why not `get_col()`: like `get_var()` and `get_results()` it calls
+     * `query()` and DISCARDS the return value. It also ALWAYS returns an
+     * array, so a failed read is indistinguishable from "no rows" — the
+     * ambiguity this seam exists to remove.
+     *
+     * @return list<string>
+     * @throws \RuntimeException when the read cannot be trusted
+     */
+    public static function columnOrThrow(string $sql, string $context): array
+    {
+        $out = [];
+        foreach (self::objectsOrThrow($sql, $context) as $row) {
+            $values = array_values(get_object_vars($row));
+            if ($values !== []) {
+                $out[] = (string) $values[0];
+            }
+        }
+
+        return $out;
     }
 
     /**

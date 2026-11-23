@@ -4,6 +4,7 @@ namespace BCC\Search\Repositories;
 
 use BCC\Core\Repositories\PeepSoGroupPrivacy;
 use BCC\Search\DTO\GroupDTO;
+use BCC\Search\Support\SearchReads;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -62,19 +63,6 @@ final class GroupSearchRepository
     // group surface uses - the same move the pages vertical made to
     // PeepSoPagePrivacy. The local sentinel went with it; the value now
     // lives on the shared class as PeepSoGroupPrivacy::SECRET.
-
-    /**
-     * Throw on DB error. Immediate-check contract: call on the line
-     * following the wpdb accessor, nothing else between.
-     */
-    private static function throwOnDbError(string $context): void
-    {
-        global $wpdb;
-        $err = (string) $wpdb->last_error;
-        if ($err !== '') {
-            throw new \RuntimeException("{$context}: {$err}");
-        }
-    }
 
     /**
      * Substring search over published PeepSo groups, prefix-ranked.
@@ -159,8 +147,7 @@ final class GroupSearchRepository
             $limit
         );
 
-        $rows = $wpdb->get_results($sql, ARRAY_A);
-        self::throwOnDbError('GroupSearchRepository::search query failed');
+        $rows = SearchReads::rowsOrThrow($sql, 'GroupSearchRepository::search query failed');
 
         if (!is_array($rows)) {
             return [];
