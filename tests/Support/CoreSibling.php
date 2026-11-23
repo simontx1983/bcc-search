@@ -97,7 +97,39 @@ final class CoreSibling
     public static function requireVerifiedReads(): void
     {
         self::require('src/Repositories/ProbesReads.php');
+
+        // ⚠⚠ OPTIONAL BY DESIGN, and this line is why this helper exists.
+        // bcc-core F-463 moved UserMetaRepository's read into its own
+        // `ReadsMetaRows` trait. A by-path require of the repository alone
+        // then fatals with `Trait "..." not found` — which is what happened:
+        // 34 fatals in this plugin's CI, hours after the docblock above
+        // warned about exactly this.
+        //
+        // It is `requireIfPresent` rather than `require` so that a bcc-core
+        // predating F-463 — which has no such file and does not need one —
+        // still works. Required BEFORE the repository that uses it.
+
+        self::requireIfPresent('src/Repositories/ReadsMetaRows.php');
+
         self::require('src/Repositories/UserMetaRepository.php');
+    }
+
+    /**
+     * Require $relPath only if bcc-core has it.
+     *
+     * ⚠ For a dependency that exists in NEWER bcc-core only. Unlike
+     * {@see require()} this does NOT fail in CI when the file is absent,
+     * because absent is a legitimate state for an older core. The class
+     * that needs it will still fatal if it is genuinely required and
+     * missing — which is the honest failure, and better than this helper
+     * guessing.
+     */
+    public static function requireIfPresent(string $relPath): void
+    {
+        $path = self::root() . '/' . ltrim($relPath, '/');
+        if (is_file($path)) {
+            require_once $path;
+        }
     }
 
     /** True on GitHub Actions (or any runner exporting CI=true). */
