@@ -39,6 +39,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testRoutesThroughPeepSoUserSearchAndForwardsViewerId(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7, 9];
@@ -98,6 +102,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // F-54: PeepSo matched 'adm' on user_login; the visible fields of
         // this user ("Carol" / carol) do not contain it, so the row must drop.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [21];
@@ -112,6 +120,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // F-54: without a handle the only public identifier would be the
         // login-derived nicename.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [22];
@@ -125,6 +137,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     {
         // F-54: a wp-admin-created account defaults display_name to the login.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [23];
@@ -143,6 +159,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
         // (dropped); the public matches behind them must still come back,
         // trimmed to the requested limit.
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         $GLOBALS['__bcc_userdata'] = [];
@@ -166,6 +186,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAnonymousViewerPassesNullToWrapper(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         // One candidate, so the privacy-filtered pass runs (with none,
@@ -182,6 +206,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAHiddenRealNameIsNotSearchableAndShowsAsHandle(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7];
@@ -201,6 +229,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testTheMemberStillFindsAndSeesTheirOwnName(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [7];
@@ -214,6 +246,10 @@ final class UserSearchRepositoryPrivacyTest extends TestCase
     public function testAFalseFlagLeavesTheNameSearchable(): void
     {
         require_once __DIR__ . '/../Stubs/peepso-user-search-stub.php';
+        // F-472: the verified-read trait and the core meta repository,
+        // in dependency order. Loaded BY PATH — bcc-core is not autoloaded
+        // here — and the trait must precede anything that uses it.
+        \BCC\Search\Tests\Support\CoreSibling::requireVerifiedReads();
         require_once __DIR__ . '/../Stubs/member-search-candidates-stub.php';
         \PeepSoUserSearch::reset();
         \PeepSoUserSearch::$nextResults = [8];

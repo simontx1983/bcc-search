@@ -3,6 +3,7 @@
 namespace BCC\Search\Repositories;
 
 use BCC\Search\DTO\UserDTO;
+use BCC\Search\Support\SearchReads;
 
 if (!defined('ABSPATH')) {
     exit;
@@ -185,9 +186,36 @@ final class UserSearchRepository
      * ids), explicit columns. A meta key stored twice reads as its FIRST row,
      * as get_user_meta($id, $key, true) would.
      *
-     * Throws on a DB error rather than answering an empty list, which would
-     * read as "nobody matched" (the F-432 class); the controller turns it
-     * into its 503.
+     * Throws when a read CANNOT BE TRUSTED rather than answering an empty
+     * list, which would read as "nobody matched" (the F-432 class); the
+     * controller turns it into its 503.
+     *
+     * ⚠⚠ "Could not be trusted" is wider than "errored", and that is the
+     * point of F-472. `wpdb::query()` returns false on paths that run BEFORE
+     * `flush()`, leaving the PREVIOUS query's rows in `last_result` with
+     * `last_error` empty — so the old `get_results()` + `last_error` shape
+     * could hand back another query's rows as these members' identities.
+     * Both reads now go through a signal that sees it:
+     * {@see \BCC\Search\Support\SearchReads} for the users row, and bcc-core's
+     * `UserMetaRepository::valuesOrUnknown()` for the meta.
+     *
+     * ⛔ ON AN UNTRUSTED META READ THIS THROWS, it does not mask. There is
+     * nothing to mask TO: the handle and the hidden-name flag come from the
+     * SAME read, so "unknown" means the handle is unknown too, and a member
+     * with no handle is dropped here by design (F-54) — which would answer
+     * an empty list, the exact failure above. Masking as `@member-{id}`
+     * would instead produce a result row whose profile link goes nowhere.
+     * Refusing shows no real name and makes none searchable.
+     *
+     * ⚠ THE TWO KEYS RESOLVE DUPLICATES DIFFERENTLY, deliberately:
+     *   - `bcc_handle` takes the FIRST row (lowest `umeta_id`), as
+     *     `get_user_meta($id, $key, true)` would. It is an identifier;
+     *     "strictest" is meaningless for it.
+     *   - `bcc_privacy_real_name_hidden` takes the STRICTEST row: ANY value
+     *     that reads as true means hidden. First-row-wins would show the
+     *     real name of a member whose rows are ['0', '1'], and the hiding
+     *     is the half that matters. Same rule as bcc-trust's
+     *     PrivacySettings.
      *
      * @param list<int> $userIds
      * @return array<int, array{user_login: string, user_nicename: string, display_name: string, handle: string, real_name_hidden: string}>
@@ -198,45 +226,33 @@ final class UserSearchRepository
 
         $in = implode(',', array_fill(0, count($userIds), '%d'));
 
-        /** @var list<array<string, mixed>>|null $users */
-        $users = $wpdb->get_results(
-            $wpdb->prepare(
+        $users = SearchReads::rowsOrThrow(
+            (string) $wpdb->prepare(
                 "SELECT ID, user_login, user_nicename, display_name
                    FROM {$wpdb->users}
                   WHERE ID IN ({$in})",
                 ...$userIds
             ),
-            ARRAY_A
+            'UserSearchRepository::publicIdentities users'
         );
-        self::throwOnDbError('UserSearchRepository::publicIdentities users');
 
-        /** @var list<array<string, mixed>>|null $meta */
-        $meta = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT user_id, meta_key, meta_value
-                   FROM {$wpdb->usermeta}
-                  WHERE meta_key IN (%s, %s)
-                    AND user_id IN ({$in})
-                  ORDER BY umeta_id ASC",
-                self::META_HANDLE,
-                self::META_REAL_NAME_HIDDEN,
-                ...$userIds
-            ),
-            ARRAY_A
+        // bcc-core owns this read (F-472): it clears last_error, checks
+        // query()'s own return, and answers null when the rows cannot be
+        // trusted. It also keeps every stored value per (user, key) in
+        // umeta_id order, which is what lets the two keys below resolve
+        // duplicates by different rules.
+        $meta = \BCC\Core\Repositories\UserMetaRepository::valuesOrUnknown(
+            $userIds,
+            [self::META_HANDLE, self::META_REAL_NAME_HIDDEN]
         );
-        self::throwOnDbError('UserSearchRepository::publicIdentities usermeta');
-
-        $values = [];
-        foreach (is_array($meta) ? $meta : [] as $row) {
-            $id  = (int) ($row['user_id'] ?? 0);
-            $key = (string) ($row['meta_key'] ?? '');
-            if ($id > 0 && !isset($values[$id][$key])) {
-                $values[$id][$key] = (string) ($row['meta_value'] ?? '');
-            }
+        if ($meta === null) {
+            throw new \RuntimeException(
+                'UserSearchRepository::publicIdentities usermeta: the read could not be trusted'
+            );
         }
 
         $out = [];
-        foreach (is_array($users) ? $users : [] as $row) {
+        foreach ($users as $row) {
             $id = (int) ($row['ID'] ?? 0);
             if ($id <= 0) {
                 continue;
@@ -245,8 +261,10 @@ final class UserSearchRepository
                 'user_login'       => (string) ($row['user_login'] ?? ''),
                 'user_nicename'    => (string) ($row['user_nicename'] ?? ''),
                 'display_name'     => (string) ($row['display_name'] ?? ''),
-                'handle'           => $values[$id][self::META_HANDLE] ?? '',
-                'real_name_hidden' => $values[$id][self::META_REAL_NAME_HIDDEN] ?? '',
+                'handle'           => self::firstRow($meta[$id][self::META_HANDLE] ?? []),
+                'real_name_hidden' => self::strictestHiddenFlag(
+                    $meta[$id][self::META_REAL_NAME_HIDDEN] ?? []
+                ),
             ];
         }
         return $out;
@@ -355,4 +373,46 @@ final class UserSearchRepository
         }
         return false;
     }
+
+    /**
+     * The FIRST stored value, as `get_user_meta($id, $key, true)` answers.
+     * For an identifier such as the handle, where the oldest row is the one
+     * the profile route resolves.
+     *
+     * @param list<string> $rows lowest umeta_id first
+     */
+    private static function firstRow(array $rows): string
+    {
+        return $rows === [] ? '' : (string) $rows[0];
+    }
+
+    /**
+     * The STRICTEST stored value for a hide flag: '1' when ANY row reads as
+     * true, '' when there is no row at all, '0' otherwise.
+     *
+     * ⚠ NOT first-row-wins. WordPress allows duplicate meta rows, and a
+     * member whose rows are ['0', '1'] has asked to be hidden — reading the
+     * first row would publish the real name they turned off. The one-way
+     * door is the safe direction: an extra row can only ever hide more.
+     *
+     * Uses the same FILTER_VALIDATE_BOOLEAN reading as the consumer, so
+     * 'true'/'yes'/'on' count exactly as they do downstream rather than
+     * only the literal '1'.
+     *
+     * @param list<string> $rows
+     */
+    private static function strictestHiddenFlag(array $rows): string
+    {
+        if ($rows === []) {
+            return '';
+        }
+        foreach ($rows as $raw) {
+            if (filter_var((string) $raw, FILTER_VALIDATE_BOOLEAN)) {
+                return '1';
+            }
+        }
+
+        return '0';
+    }
+
 }

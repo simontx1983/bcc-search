@@ -26,3 +26,12 @@ if (!defined('ABSPATH')) {
 require_once __DIR__ . '/Stubs/wp-stubs.php';
 
 require_once __DIR__ . '/../vendor/autoload.php';
+
+// The bcc-core-sibling loader (F-472). Composer's autoloader here covers
+// `BCC\Search\` only, and this class lives under tests/.
+//
+// ⚠ Safe at file scope, unlike a stub: it defines ONE class, with no
+// globals, no functions and no side effects, so it cannot leak behaviour
+// into the rest of the run the way tests/Stubs/*.php would. Per-test
+// doubles still belong inside their own subprocess.
+require_once __DIR__ . '/Support/CoreSibling.php';
