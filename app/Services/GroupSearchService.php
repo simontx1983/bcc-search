@@ -48,11 +48,11 @@ final class GroupSearchService
      * `GroupContextResolver::resolveType()` — bcc-search depends only
      * on bcc-core and can never import bcc-trust, so the map is
      * duplicated here exactly like the page_type→prefix map in
-     * SearchController (see its header comment). The route the kind
-     * selects mirrors `CardUrlMap::groupUrl` (HALL_URL_PREFIX /
-     * COMMUNITY_URL_PREFIX — the locked owner of group routing since
-     * the v1.68 canonicalization). Changing a kind means updating BOTH
-     * sites in lockstep.
+     * SearchController (see its header comment). The group's route
+     * mirrors `CardUrlMap::groupUrl` (the locked owner of group routing
+     * since the v1.68 canonicalization): /communities/{slug} for every
+     * kind since structure A (F-594). Changing a kind or a route means
+     * updating BOTH sites in lockstep.
      *
      * Absent/unknown raw values resolve to 'user' (member-created
      * community) — same default as GroupContextResolver.
@@ -136,7 +136,7 @@ final class GroupSearchService
                 'slug'        => $g->slug,
                 'description' => $g->description,
                 'avatar_url'  => $this->resolveAvatarUrl($g, $peepso),
-                'group_url'   => $this->resolveGroupUrl($g, $kind),
+                'group_url'   => $this->resolveGroupUrl($g),
                 'kind'        => $kind,
                 'kind_label'  => self::KIND_LABEL[$kind],
             ];
@@ -188,16 +188,15 @@ final class GroupSearchService
     }
 
     /**
-     * Group URL resolution — relative in-app route, kind-aware (v1.70).
+     * Group URL resolution — relative in-app route.
      *
-     * `hall` → /halls/{slug} (the hall-flavored surface); every other
-     * kind → /communities/{slug} (the canonical cross-kind detail).
-     * This is `CardUrlMap::groupUrl`'s exact mapping (bcc-trust — the
-     * locked owner of group routing since the v1.68 canonicalization),
+     * Every kind → /communities/{slug}, Halls included: the frontend
+     * renders one page per group there since structure A (F-594), and
+     * the old /halls/{slug} route only forwards. This is
+     * `CardUrlMap::groupUrl`'s exact mapping (bcc-trust — the locked
+     * owner of group routing since the v1.68 canonicalization),
      * mirrored here in lockstep because bcc-search cannot import
-     * bcc-trust. It supersedes the v1.68-era flat '/communities/{slug}'
-     * this method briefly emitted — that shape existed only because the
-     * vertical projected no kind; it now does.
+     * bcc-trust. (v1.70 to F-594 sent Halls to /halls/{slug}.)
      *
      * RELATIVE by contract — the previous absolute WP-origin permalink
      * implementation (PeepSo page-root / get_permalink / home_url) was
@@ -208,16 +207,13 @@ final class GroupSearchService
      * Empty slug (shouldn't occur on published posts) → the
      * /communities list route rather than a broken detail link.
      */
-    private function resolveGroupUrl(GroupDTO $g, string $publicKind): string
+    private function resolveGroupUrl(GroupDTO $g): string
     {
         $slug = ltrim($g->slug, '/');
         if ($slug === '') {
             return '/communities';
         }
-        $slug = rawurlencode($slug);
-        return $publicKind === 'hall'
-            ? '/halls/' . $slug
-            : '/communities/' . $slug;
+        return '/communities/' . rawurlencode($slug);
     }
 
     /**
