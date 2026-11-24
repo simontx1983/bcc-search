@@ -51,8 +51,27 @@ namespace {
              */
             public static ?string $failIncludeWith = null;
 
+            /**
+             * ⚠ One UNRELATED statement runs before the privacy read,
+             * inside the constructor — modelling PeepSo resolving its
+             * display-name setting through `PeepSoUser::get_instance()`
+             * when `system_override_name` is on.
+             *
+             * It exists so a test can prove that a `num_queries` delta
+             * ALONE cannot detect a bail: with this on, the counter moves
+             * and the read still never ran.
+             */
+            public static bool $queryBeforeRead = false;
+
             /** @var list<int|numeric-string> */
             public array $results = [];
+
+            /**
+             * The WP_User_Query the real class wraps. Only `request` is
+             * modelled: it is the SQL WP assigns BEFORE running the read,
+             * which is what makes it readable after a bail.
+             */
+            public ?object $query = null;
 
             /** @param array<string,mixed> $args */
             public function __construct(array $args, ?int $viewerId, string $needle)
@@ -85,10 +104,49 @@ namespace {
                     if (isset($args['number']) && (int) $args['number'] > 0) {
                         $ids = array_slice($ids, 0, (int) $args['number']);
                     }
-                    $this->results = $ids;
+
+                    // ⭐ The ids are still decided in PHP (that is what
+                    // `$visible` is for), but they are DELIVERED through
+                    // $wpdb, so a pre-flush bail on this pass behaves as
+                    // it does in production instead of being imagined.
+                    //
+                    // `request` is assigned BEFORE the read, exactly as
+                    // WP_User_Query does — which is why it is still
+                    // readable when the read did not run.
+                    if (self::$queryBeforeRead) {
+                        $GLOBALS['wpdb']->query(
+                            'SELECT usr_display_name_as FROM wp_peepso_user_settings WHERE usr_id = 0'
+                        );
+                    }
+
+                    $request     = self::includeRequest($args);
+                    $this->query = (object) ['request' => $request];
+                    $GLOBALS['wpdb']->primeColumn($request, $ids);
+                    $this->results = $GLOBALS['wpdb']->get_col($request);
                     return;
                 }
                 $this->results  = self::$nextResults;
+            }
+
+            /**
+             * The statement WP_User_Query builds for the include pass,
+             * carrying the shape PeepSo's `pre_user_query` adds: the
+             * `peepso_users` join its privacy predicate reads, and the
+             * GROUP BY it appends. Recognisable enough for a test to bail
+             * this statement and nothing else.
+             *
+             * @param array<string,mixed> $args
+             */
+            private static function includeRequest(array $args): string
+            {
+                $include = array_map('intval', (array) ($args['include'] ?? []));
+
+                return 'SELECT wp_users.ID FROM wp_users'
+                    . ' LEFT JOIN wp_peepso_users acc ON acc.usr_id = wp_users.ID'
+                    . ' WHERE 1=1 AND wp_users.ID IN (' . implode(',', $include) . ')'
+                    . " AND acc.usr_role NOT IN ('register', 'verified', 'ban')"
+                    . ' AND acc.usr_profile_acc <> 4'
+                    . ' GROUP BY wp_users.ID ORDER BY wp_users.user_login ASC';
             }
 
             public static function reset(): void
@@ -98,6 +156,7 @@ namespace {
                 self::$calls       = [];
                 self::$visible     = null;
                 self::$failIncludeWith = null;
+                self::$queryBeforeRead = false;
             }
         }
     }
@@ -135,6 +194,50 @@ namespace {
             public ?string $failOn = null;
 
             /**
+             * Bail the ONE statement containing this fragment, whatever
+             * table it reads. `failOn` classifies by table, and the
+             * privacy pass reads `wp_users` like the repository's own
+             * row read — so bailing one without the other needs this.
+             */
+            public ?string $failOnSqlContaining = null;
+
+            /**
+             * ⚠ MAINTAINED ONLY ON THE SUCCESS PATH, because that is
+             * where real wpdb maintains them: `++$this->num_queries` is
+             * inside the private `_do_query()`, and `last_query` is
+             * assigned below it — both BELOW the two pre-flush bails. A
+             * bail therefore leaves the counter where it was and the
+             * PREVIOUS statement's SQL in `last_query`, which is the only
+             * pair of facts that can detect a read that did not run.
+             */
+            public int $num_queries = 0;
+
+            public string $last_query = '';
+
+            /**
+             * Rows a given statement answers with, keyed by its exact
+             * SQL. Used by the privacy pass, whose result the
+             * PeepSoUserSearch stub decides.
+             *
+             * @var array<string, list<object>>
+             */
+            public array $primed = [];
+
+            /**
+             * Seed what one statement answers. The rows carry a single
+             * `ID` column, which is what `fields => 'ID'` selects.
+             *
+             * @param list<int> $ids
+             */
+            public function primeColumn(string $sql, array $ids): void
+            {
+                $this->primed[$sql] = array_map(
+                    static fn (int $id): object => (object) ['ID' => (string) $id],
+                    array_values($ids)
+                );
+            }
+
+            /**
              * 'driver_error'   — flush() ran: last_result reset, last_error set.
              * 'pre_flush_bail' — ⚠⚠ query() returns false ABOVE flush(), so
              *                    last_result still holds the PREVIOUS query's
@@ -146,6 +249,20 @@ namespace {
 
             /** @var list<string> */
             public array $queries = [];
+
+            /**
+             * ⚠ THE PRIVACY PASS IS LEDGERED SEPARATELY, and is exempt
+             * from `failOn`. It reads `wp_users` exactly as
+             * publicIdentities' own row read does, so sharing either would
+             * silently change what every existing test in this harness
+             * observes: `failOn = 'users'` would fail TWO statements
+             * instead of one, and the "two narrow reads, not a full user
+             * load" count would become three. Both happened on the first
+             * attempt at this file.
+             *
+             * @var list<string>
+             */
+            public array $privacyQueries = [];
 
             /** @param mixed ...$args */
             public function prepare(string $query, ...$args): string
@@ -172,10 +289,24 @@ namespace {
              */
             public function query(string $sql)
             {
-                $this->queries[] = $sql;
+                $isPrivacyPass = str_contains($sql, 'wp_peepso_users acc');
+                if ($isPrivacyPass) {
+                    $this->privacyQueries[] = $sql;
+                } else {
+                    $this->queries[] = $sql;
+                }
                 $table = str_contains($sql, 'FROM ' . $this->usermeta) ? 'usermeta' : 'users';
 
-                if ($this->failOn === $table) {
+                // The pre-flush bail, scoped to one statement. Nothing is
+                // touched: no error, no last_result, no last_query, and
+                // the counter does not move.
+                if ($this->failOnSqlContaining !== null
+                    && str_contains($sql, $this->failOnSqlContaining)
+                ) {
+                    return false;
+                }
+
+                if (!$isPrivacyPass && $this->failOn === $table) {
                     if ($this->failMode === 'pre_flush_bail') {
                         // last_result DELIBERATELY untouched, no error set.
                         $this->last_error = '';
@@ -187,10 +318,14 @@ namespace {
                 }
 
                 $this->last_error  = '';
-                $this->last_result = array_map(
+                $this->last_result = $this->primed[$sql] ?? array_map(
                     static fn (array $row): object => (object) $row,
                     $this->rowsFor($table, $sql)
                 );
+
+                // Below the bails, as in wpdb.
+                $this->num_queries++;
+                $this->last_query = $sql;
 
                 return count($this->last_result);
             }
@@ -216,6 +351,32 @@ namespace {
                     static fn (object $row): array => array_map('strval', get_object_vars($row)),
                     array_values($rows)
                 );
+            }
+
+            /**
+             * ⚠ FAITHFUL, and the reason this harness can model the
+             * defect at all: it calls `query()`, DISCARDS the return
+             * value and plucks the column out of `last_result`. On a
+             * pre-flush bail that is the PREVIOUS statement's column, and
+             * `get_col()` never returns null — so the caller receives
+             * another query's ids as though they were its own.
+             *
+             * @return list<string>
+             */
+            public function get_col(string $sql, int $x = 0): array
+            {
+                $this->query($sql); // return deliberately ignored, as wpdb does
+
+                $rows = is_array($this->last_result) ? $this->last_result : [];
+
+                return array_values(array_map(
+                    static function (object $row) use ($x): string {
+                        $values = array_values(get_object_vars($row));
+
+                        return (string) ($values[$x] ?? '');
+                    },
+                    $rows
+                ));
             }
 
             /**

@@ -335,6 +335,8 @@ final class UserSearchRepository
         // PeepSo's total.
         global $wpdb;
         $wpdb->last_error = '';
+        // Captured BEFORE the read; see throwUnlessPrivacyReadRan().
+        $queriesBefore = (int) ($wpdb->num_queries ?? 0);
         $search = new \PeepSoUserSearch(
             [
                 'number'        => count($candidates),
@@ -347,7 +349,13 @@ final class UserSearchRepository
             $viewerId > 0 ? $viewerId : null,
             ''
         );
-        self::throwOnDbError('UserSearchRepository::handleOrNameMatches privacy read');
+        $context = 'UserSearchRepository::handleOrNameMatches privacy read';
+        self::throwOnDbError($context);
+
+        // A REPORTED error is only half of it. The other half is a read
+        // that never ran and said nothing about it.
+        $request = is_object($search->query) ? (string) ($search->query->request ?? '') : '';
+        self::throwUnlessPrivacyReadRan($request, $queriesBefore, $context);
 
         /** @var mixed $raw */
         $raw = $search->results;
@@ -359,6 +367,84 @@ final class UserSearchRepository
             }
         }
         return $ids;
+    }
+
+    /**
+     * Refuse unless PeepSo's privacy-filtered read ACTUALLY RAN.
+     *
+     * ⛔ WHY THIS IS NOT {@see \BCC\Search\Support\SearchReads}
+     * (F-472). The seam verifies reads WE issue: it calls `query()`
+     * itself and checks the return value. This read is issued inside
+     * `WP_User_Query`, so there is no return value of ours to check —
+     * and `last_error` alone cannot police it, because `wpdb::query()`
+     * returns false ABOVE `flush()` on a failed reconnect
+     * (`! $this->ready`) and on an emptied `query` filter, recording NO
+     * error at all.
+     *
+     * ⚠⚠ WHAT THIS GUARANTEES: the ids this method returns are the
+     * privacy filter's own answer, or the caller gets an exception
+     * instead of ids.
+     *
+     * `fields => 'ID'` makes WP_User_Query read through
+     * `$wpdb->get_col()`, which never returns null — so SOME value is
+     * always available to hand back, whether or not the statement behind
+     * it executed. A value that did not come from this statement has not
+     * passed this statement's conditions, whatever it happens to
+     * contain, so it is not an answer and must not be used as one.
+     *
+     * ⇒ Inspecting the returned ids cannot establish that, so it is
+     * established about the READ rather than about its output.
+     *
+     * So this verifies EXECUTION, with two facts that are each
+     * necessary and together sufficient:
+     *
+     *   1. `num_queries` increased. It is incremented inside wpdb's
+     *      private `_do_query()`, BELOW both bails, so a bail
+     *      increments nothing.
+     *   2. `last_query` is this read's own SQL, which WP_User_Query
+     *      exposes as `$query->request`. On a bail `last_query` still
+     *      holds the previous statement's SQL.
+     *
+     * Neither alone is enough. (1) alone passes if anything else
+     * queried in between — PeepSo resolves a display-name setting
+     * through `PeepSoUser::get_instance()` when `system_override_name`
+     * is on, and that runs before the read. (2) alone passes if the
+     * previous statement happened to be the identical SQL. Together
+     * they do not.
+     *
+     * ⚠ Nothing queries AFTER the read inside the constructor, which is
+     * what makes (2) an equality rather than a search through history:
+     * with `fields => 'ID'`, `count_total => false` and
+     * `cache_results => false`, `WP_User_Query::query()` returns
+     * straight after `get_col()`, and PeepSo's `get_total()` answers 0
+     * without a statement. If a future PeepSo adds a read there, (2)
+     * fails CLOSED — a 503, never a silent pass.
+     *
+     * @param string $request the SQL WP_User_Query reports it ran
+     * @throws \RuntimeException when the privacy-filtered read did not run
+     */
+    private static function throwUnlessPrivacyReadRan(
+        string $request,
+        int $queriesBefore,
+        string $context
+    ): void {
+        global $wpdb;
+
+        $ran    = (int) ($wpdb->num_queries ?? 0) > $queriesBefore;
+        $isOurs = $request !== '' && (string) ($wpdb->last_query ?? '') === $request;
+
+        if ($ran && $isOurs) {
+            return;
+        }
+
+        // The two flags are in the message because they say WHICH way it
+        // failed, and the two causes need different responses: nothing
+        // ran at all, versus something ran but not this.
+        throw new \RuntimeException(
+            $context . ': the privacy-filtered read did not run, so no result can be trusted'
+            . ' (a statement ran: ' . ($ran ? 'yes' : 'no')
+            . ', and it was this read: ' . ($isOurs ? 'yes' : 'no') . ')'
+        );
     }
 
     /**
