@@ -71,11 +71,13 @@ final class SearchControllerHandleSearchTest extends TestCase
         SearchRepository::$categories = self::CATEGORIES;
     }
 
-    private function dispatch(string $q, string $type = ''): \WP_REST_Response
+    private function dispatch(string $q, string $type = '', ?string $kind = null): \WP_REST_Response
     {
-        return (new SearchController())->handle_search(
-            new \WP_REST_Request(['q' => $q, 'type' => $type])
-        );
+        $params = ['q' => $q, 'type' => $type];
+        if ($kind !== null) {
+            $params['kind'] = $kind;
+        }
+        return (new SearchController())->handle_search(new \WP_REST_Request($params));
     }
 
     /**
@@ -222,7 +224,7 @@ final class SearchControllerHandleSearchTest extends TestCase
             ['results' => [], 'categories' => self::CATEGORIES],
             $response->get_data()
         );
-        self::assertSame(['ab', '', 50], SearchRepository::$lastSearchArgs);
+        self::assertSame(['ab', '', 50, ''], SearchRepository::$lastSearchArgs);
 
         // Version-scoped cache is written (suppresses re-query stampede)…
         self::assertNotEmpty($this->cacheEntriesWithPrefix('search_'));
@@ -244,7 +246,7 @@ final class SearchControllerHandleSearchTest extends TestCase
 
         self::assertSame([20, 10, 30], self::resultPageIds($response));
         // 4-char query → 80-candidate cap wired through to the repository.
-        self::assertSame(['acme', '', 80], SearchRepository::$lastSearchArgs);
+        self::assertSame(['acme', '', 80, ''], SearchRepository::$lastSearchArgs);
 
         // Row shape is the /cards-aligned contract; scoreless pages emit
         // null/false/0 trust fields, not fabricated values.
@@ -426,7 +428,7 @@ final class SearchControllerHandleSearchTest extends TestCase
         $response = $this->dispatch('acmes');
 
         // 5-char query → widest candidate cap.
-        self::assertSame(['acmes', '', 100], SearchRepository::$lastSearchArgs);
+        self::assertSame(['acmes', '', 100, ''], SearchRepository::$lastSearchArgs);
         // Only the top PRERANK_TOP_K (24) candidates reach trust
         // enrichment — the whole point of the pre-rank phase.
         self::assertSame(range(1, 24), FakeScoreReadService::$lastRequestedIds);
@@ -480,5 +482,163 @@ final class SearchControllerHandleSearchTest extends TestCase
         // No trending entry written — the degraded response returns before
         // cacheTrendingResult, so LKG is never poisoned with bad data.
         self::assertSame([], $this->cacheEntriesWithPrefix('trending_'));
+    }
+
+    // ── Page kind, ?kind= (F-589) ───────────────────────────────────────
+
+    /** @return array<string, array{0: string}> */
+    public static function notAPageKind(): array
+    {
+        return [
+            // /cards kinds that are not pages
+            'member'        => ['member'],
+            'community'     => ['community'],
+            // the stored page types, which are not the wire vocabulary
+            'builder'       => ['builder'],
+            'nft'           => ['nft'],
+            // PeepSo category slugs (that is what `type` takes)
+            'category slug' => ['vaildators'],
+            'plural'        => ['validators'],
+            'unknown'       => ['dao'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('notAPageKind')]
+    public function testAKindThatIsNotAPageKindIsA400BeforeAnyWork(string $kind): void
+    {
+        $response = $this->dispatch('bitcoin', '', $kind);
+
+        self::assertSame(400, $response->get_status());
+        self::assertSame(
+            [
+                'code'    => 'bcc_invalid_request',
+                'message' => 'kind must be validator, project, or creator.',
+                'data'    => ['status' => 400],
+            ],
+            $response->get_data()
+        );
+        self::assertFalse(SearchRepository::$searchCalled);
+        self::assertSame([], $this->cacheEntriesWithPrefix('search_'));
+    }
+
+    public function testAnUnknownKindIsA400InTrendingModeToo(): void
+    {
+        SearchRepository::$fallbackIds = [1];
+        $this->seedPage(1, 'Alpha');
+
+        $response = (new SearchController())->handle_search(
+            new \WP_REST_Request(['trending' => '1', 'kind' => 'member'])
+        );
+
+        self::assertSame(400, $response->get_status());
+        self::assertSame([], $this->cacheEntriesWithPrefix('trending_'));
+    }
+
+    public function testTheRateLimitStillComesFirst(): void
+    {
+        Throttle::$allow = false;
+
+        self::assertSame(429, $this->dispatch('bitcoin', '', 'member')->get_status());
+    }
+
+    /** @return array<string, array{0: string, 1: string}> */
+    public static function kindToPageType(): array
+    {
+        return [
+            'validator' => ['validator', 'validator'],
+            'project'   => ['project', 'builder'],
+            'creator'   => ['creator', 'nft'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('kindToPageType')]
+    public function testEachKindSearchesItsStoredPageType(string $kind, string $pageType): void
+    {
+        $this->dispatch('acme', '', $kind);
+
+        self::assertSame(['acme', '', 80, $pageType], SearchRepository::$lastSearchArgs);
+    }
+
+    public function testNoKindSearchesEveryPageType(): void
+    {
+        $this->dispatch('acme');
+
+        self::assertSame(['acme', '', 80, ''], SearchRepository::$lastSearchArgs);
+    }
+
+    /**
+     * ⭐ THE INVARIANT: `kind=X` returns exactly the pages whose `page_url`
+     * carries X's card route. Read off the SAME response builder, so the
+     * filter and the link can never disagree about a page: an untyped page
+     * is a project and links to `/p/`, a typed-but-unmapped one is in no
+     * kind (it has no card route).
+     */
+    public function testAKindReturnsExactlyThePagesThatLinkToItsCardRoute(): void
+    {
+        $this->seedPage(1, 'zeda', 'validator');
+        $this->seedPage(2, 'zedb', 'builder');
+        $this->seedPage(3, 'zedc', 'nft');
+        $this->seedPage(4, 'zedd', null);
+        $this->seedPage(5, 'zede', '');
+        $this->seedPage(6, 'zedf', 'dao');
+        $this->seedPage(7, 'zedg', 'validator');
+
+        $all = self::urlByPageId($this->dispatch('zed'));
+        self::assertCount(7, $all, 'the unfiltered search sees every seeded page');
+
+        $prefixByKind = ['validator' => '/v/', 'project' => '/p/', 'creator' => '/c/'];
+        $listed       = [];
+        foreach ($prefixByKind as $kind => $prefix) {
+            $expected = array_keys(array_filter(
+                $all,
+                static fn (string $url): bool => str_starts_with($url, $prefix)
+            ));
+            sort($expected);
+
+            $got = array_keys(self::urlByPageId($this->dispatch('zed', '', $kind)));
+            sort($got);
+
+            self::assertSame($expected, $got, "kind={$kind}");
+            self::assertNotSame([], $got, "kind={$kind} matched nothing, so this proves nothing");
+            $listed = array_merge($listed, $got);
+        }
+
+        // Each page in at most one kind; the unmapped one in none.
+        sort($listed);
+        self::assertSame([1, 2, 3, 4, 5, 7], $listed);
+    }
+
+    public function testAKindFilteredAnswerIsCachedApartFromTheUnfilteredOne(): void
+    {
+        $this->seedPage(1, 'zeda', 'validator');
+        $this->seedPage(2, 'zedb', 'builder');
+        FakeScoreReadService::$scoresById = [
+            1 => self::score(60.0, false),
+            2 => self::score(60.0, false),
+        ];
+
+        self::assertSame([1, 2], self::resultPageIds($this->dispatch('zed')));
+
+        SearchRepository::$searchCalled = false;
+        self::assertSame([1], self::resultPageIds($this->dispatch('zed', '', 'validator')));
+        self::assertTrue(SearchRepository::$searchCalled, 'the filtered answer came from the unfiltered cache entry');
+
+        // The unfiltered fingerprint is the one already in production
+        // caches (kind is appended only when set), so a deploy does not
+        // orphan every warm entry and LKG mirror.
+        $lkgKeys = array_keys($this->cacheEntriesWithPrefix('search_lkg_'));
+        self::assertCount(2, $lkgKeys);
+        $suffixes = array_map(static fn (string $k): string => substr($k, -32), $lkgKeys);
+        sort($suffixes);
+        $want = [md5('zed||out'), md5('zed||out|kind:validator')];
+        sort($want);
+        self::assertSame($want, $suffixes);
+    }
+
+    public function testAKindComposesWithACategory(): void
+    {
+        $this->dispatch('acme', 'validators', 'creator');
+
+        self::assertSame(['acme', 'validators', 80, 'nft'], SearchRepository::$lastSearchArgs);
     }
 }

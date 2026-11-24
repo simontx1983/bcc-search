@@ -34,6 +34,16 @@ final class SearchRepository
     private const PEEPSO_TABLE_CACHE_KEY = 'bcc_search_peepso_cat_table';
     private const PEEPSO_TABLE_CACHE_TTL = 3600;
 
+    /**
+     * The page type a peepso-page with no `_bcc_page_type` (or an empty
+     * one) stands for. Legacy pages written before the meta existed are
+     * project pages. Mirrors bcc-trust's `PageTypeMap::effectivePageType()`
+     * ('' → 'builder'); the controller's result routing uses this same
+     * constant, so a page listed under a kind always links to that kind's
+     * card route.
+     */
+    public const UNTYPED_PAGE_TYPE = 'builder';
+
     // ── PeepSo table discovery (cached per-process) ─────────────────────
 
     /**
@@ -271,12 +281,14 @@ final class SearchRepository
      * absent, we degrade to title-prefix-only and let the hourly self-heal
      * cron install the index in the background.
      *
-     * @param string $query Search term (min 2 chars).
-     * @param string $type  Category slug filter (empty = all).
-     * @param int    $cap   Max candidates to return.
+     * @param string $query    Search term (min 2 chars).
+     * @param string $type     Category slug filter (empty = all).
+     * @param int    $cap      Max candidates to return.
+     * @param string $pageType `_bcc_page_type` filter (empty = all), F-589.
+     *                         UNTYPED_PAGE_TYPE also matches untyped pages.
      * @return list<PageCandidateDTO>
      */
-    public static function searchCandidates(string $query, string $type, int $cap): array
+    public static function searchCandidates(string $query, string $type, int $cap, string $pageType = ''): array
     {
         global $wpdb;
 
@@ -314,6 +326,15 @@ final class SearchRepository
         $not_secret = PeepSoPagePrivacy::notSecretSql('p.ID');
 
         $base_where = "p.post_type = 'peepso-page' AND p.post_status = 'publish' AND {$not_secret}";
+
+        // Page-kind filter (F-589), inside the same non-secret, published
+        // set. Its placeholders lead each prepare() below, because
+        // $base_where comes first in both statements.
+        $base_args = [];
+        if ($pageType !== '') {
+            $base_where .= ' AND ' . self::pageTypeWhere($wpdb->postmeta);
+            $base_args   = [self::UNTYPED_PAGE_TYPE, $pageType];
+        }
 
         // ── FULLTEXT path ────────────────────────────────────────────────
         // Gated on BOTH length and index presence. When the v2 index has
@@ -387,9 +408,7 @@ final class SearchRepository
                      ORDER BY MATCH(p.post_title, p.post_content) AGAINST(%s IN BOOLEAN MODE) DESC,
                               p.post_title ASC
                      LIMIT %d",
-                    $ft_term,
-                    $ft_term,
-                    $cap
+                    ...array_merge($base_args, [$ft_term, $ft_term, $cap])
                 );
 
                 // LIMIT %d is applied in $sql (prepared above); $cap is
@@ -451,8 +470,7 @@ final class SearchRepository
                {$cat_where}
              ORDER BY p.post_title ASC
              LIMIT %d",
-            $prefix_like,
-            $cap
+            ...array_merge($base_args, [$prefix_like, $cap])
         );
 
         $rows = SearchReads::rowsOrThrow($sql, 'searchCandidates title-prefix query failed');
@@ -463,6 +481,29 @@ final class SearchRepository
         // than returning [] prevents the controller from cache-poisoning
         // the LKG with a "no results" payload built from a broken query.
         return self::candidatesToDtos($rows);
+    }
+
+    /**
+     * WHERE clause keeping only pages whose EFFECTIVE `_bcc_page_type` is
+     * one value (F-589). Two %s placeholders: UNTYPED_PAGE_TYPE, then the
+     * wanted type.
+     *
+     * The stored value is the first row by meta_id, which is what
+     * get_post_meta($id, '_bcc_page_type', true) returns. An absent or
+     * empty value reads as UNTYPED_PAGE_TYPE, the same default the
+     * controller routes by. A scalar subquery rather than a join, so a
+     * page can never be listed twice.
+     */
+    private static function pageTypeWhere(string $postmetaTable): string
+    {
+        return "COALESCE(NULLIF((
+                    SELECT ptm.meta_value
+                    FROM {$postmetaTable} ptm
+                    WHERE ptm.post_id = p.ID
+                      AND ptm.meta_key = '_bcc_page_type'
+                    ORDER BY ptm.meta_id ASC
+                    LIMIT 1
+                ), ''), %s) = %s";
     }
 
     /**

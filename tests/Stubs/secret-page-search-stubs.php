@@ -1,6 +1,7 @@
 <?php
 /**
- * Stubs for SearchRepositoryPrivacySqlTest ONLY.
+ * Stubs for SearchRepositoryPrivacySqlTest and SearchRepositoryPageKindSqlTest
+ * ONLY.
  *
  * ⚠ Required from the test's setUp(), inside its separate process, never at
  * file level: a function declared at file level becomes THE function for the

@@ -43,13 +43,32 @@ class SearchController
     ];
 
     /**
+     * `?kind=` value → `_bcc_page_type` meta value (F-589). The card
+     * vocabulary `GET /cards/search` and the contract use for page kinds.
+     *
+     * Mirrors bcc-trust's `PageTypeMap::KIND_TO_PAGE_TYPE`, which bcc-search
+     * can't import (same reason as PAGE_TYPE_ROUTE_PREFIX above). Keep the
+     * three in lockstep: every page type here needs a route prefix there.
+     *
+     * @var array<string, string>
+     */
+    private const KIND_TO_PAGE_TYPE = [
+        'validator' => 'validator',
+        'project'   => 'builder',
+        'creator'   => 'nft',
+    ];
+
+    /**
      * Default card type for a peepso-page whose `_bcc_page_type` meta is
      * empty/missing. Mirrors bcc-trust's canonical `?: 'builder'` default
      * so an untyped page still resolves to an in-app route rather than a
      * WP permalink. Keep in lockstep with PageReadModelRepository /
      * PageCardPrefetcher / CardViewService.
+     *
+     * The repository's `?kind=` filter applies the same constant, so an
+     * untyped page is listed under `project` and links to `/p/`.
      */
-    private const PAGE_TYPE_DEFAULT = 'builder';
+    private const PAGE_TYPE_DEFAULT = SearchRepository::UNTYPED_PAGE_TYPE;
 
     const SEARCH_CACHE_TTL    = 60;    // seconds
     const TRENDING_CACHE_TTL  = 300;   // 5 minutes
@@ -329,6 +348,14 @@ class SearchController
                     'sanitize_callback' => 'sanitize_text_field',
                     'default'           => '',
                 ],
+                // Page kind (F-589): validator | project | creator. Same
+                // sanitiser as GET /cards/search's `kind`; the handler
+                // rejects anything else with a 400.
+                'kind' => [
+                    'type'              => 'string',
+                    'sanitize_callback' => 'sanitize_key',
+                    'default'           => '',
+                ],
             ],
         ]);
     }
@@ -356,6 +383,21 @@ class SearchController
                 'data'    => ['status' => 429],
             ], 429);
         }
+
+        // Page kind (F-589). An unknown kind is a 400, as on GET
+        // /cards/search, in either mode; trending otherwise ignores it, as
+        // it ignores q and type. Checked after the throttle so a stream of
+        // bad requests still spends the caller's budget.
+        $kindParam = $request->get_param('kind');
+        $kind      = is_string($kindParam) ? $kindParam : '';
+        if ($kind !== '' && !isset(self::KIND_TO_PAGE_TYPE[$kind])) {
+            return new \WP_REST_Response([
+                'code'    => 'bcc_invalid_request',
+                'message' => 'kind must be validator, project, or creator.',
+                'data'    => ['status' => 400],
+            ], 400);
+        }
+        $pageType = $kind !== '' ? self::KIND_TO_PAGE_TYPE[$kind] : '';
 
         // PeepSo must be loaded: every result's avatar_url/page_url is
         // built from PeepSo page-root config. Without PeepSo we'd emit
@@ -450,6 +492,12 @@ class SearchController
         // whether the site currently enables closed pages.
         $visibility_bucket = is_user_logged_in() ? 'in' : 'out';
         $key_fingerprint   = mb_strtolower($q) . '|' . mb_strtolower($type) . '|' . $visibility_bucket;
+        // A kind-filtered answer is a different answer (F-589). Appended
+        // only when set, so the unfiltered keys (and their LKG) are the
+        // ones already in the cache.
+        if ($kind !== '') {
+            $key_fingerprint .= '|kind:' . $kind;
+        }
         $cache_key         = 'search_' . md5($key_fingerprint . '|' . $cache_version);
         // LKG: identical fingerprint, content version omitted so it
         // survives version bumps (cold-miss losers / enrichment failures
@@ -564,7 +612,7 @@ class SearchController
             // an empty-due-to-DB-error payload that poisoned LKG would
             // silently pin "no results" for LKG_CACHE_TTL.
             try {
-                $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap);
+                $candidate_rows = SearchRepository::searchCandidates($q, $type, $cap, $pageType);
             } catch (\RuntimeException $e) {
                 if (class_exists('\\BCC\\Core\\Log\\Logger')) {
                     \BCC\Core\Log\Logger::error('[bcc-search] searchCandidates failed', [
