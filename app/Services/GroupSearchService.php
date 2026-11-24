@@ -73,12 +73,17 @@ final class GroupSearchService
      * word verbatim and never maps kind→copy itself (§A2) — the same
      * reason community cards ship `kicker` rather than a type slug.
      *
-     * ⚠⚠ EDIT BOTH OR NEITHER. Contract line 4534 asserts the two are
-     * identical ("exactly the §3.2.4 kicker vocabulary") and nothing
-     * enforces it, so a one-sided change ships search results and the
-     * community card beside them disagreeing about the same group.
-     * Merge search BEFORE trust when they move together, so no surface
-     * shows the mismatch in between.
+     * ⚠⚠ EDIT BOTH OR NEITHER. §4.9's `GET /bcc/v1/search/groups`
+     * describes `kind_label` as "exactly the §3.2.4 kicker vocabulary",
+     * and nothing enforces that — so a one-sided change ships search
+     * results and the community card beside them disagreeing about the
+     * same group.
+     *
+     * ⚠ MERGE ORDER IS NOT ENOUGH. Merge search before trust so CI
+     * stays green, but DEPLOY BOTH IN THE SAME RELEASE: merge order
+     * only decides what builds, while what members see is decided by
+     * the release, and a release carrying one half shows the mismatch
+     * in production.
      */
     private const KIND_LABEL = [
         'hall'      => 'CHAIN HALL',
