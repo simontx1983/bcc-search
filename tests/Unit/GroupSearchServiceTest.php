@@ -20,8 +20,8 @@ use PHPUnit\Framework\TestCase;
  * GroupDTO into the public /search/groups response. v1.70 made three
  * guarantees worth pinning:
  *
- *   1. `group_url` is a RELATIVE kind-aware in-app route
- *      (hall → /halls/{slug}, else /communities/{slug}). The previous
+ *   1. `group_url` is a RELATIVE in-app route, /communities/{slug}
+ *      for every kind (Halls too since structure A, F-594). The previous
  *      implementation emitted absolute WP-origin permalinks — the
  *      third occurrence of the off-app-URL defect class (v1.46 users,
  *      v1.47 projects). The no-`http` guard below is the hard net.
@@ -58,13 +58,14 @@ final class GroupSearchServiceTest extends TestCase
         return (new GroupSearchService())->search('q', 20);
     }
 
-    public function testHallKindGetsHallRouteAndChainHallLabel(): void
+    public function testHallKindGetsTheCommunityRouteAndChainHallLabel(): void
     {
         $row = $this->searchWith(
             new GroupDTO(17, 'Cosmos Hall', 'cosmos-hall', null, null, 'hall'),
         )['results'][0];
 
-        self::assertSame('/halls/cosmos-hall', $row['group_url']);
+        // Structure A (F-594): a Hall's page is its community page.
+        self::assertSame('/communities/cosmos-hall', $row['group_url']);
         self::assertSame('hall', $row['kind']);
         self::assertSame('CHAIN HALL', $row['kind_label']);
     }
