@@ -183,6 +183,92 @@ final class UserSearchPrivacyReadExecutionTest extends TestCase
     }
 
     /**
+     * ⭐⭐ A `users_pre_query` answer is REFUSED, and that is the decision,
+     * not an oversight.
+     *
+     * `WP_User_Query::query()` applies that filter (WP 5.1+) BEFORE it
+     * assembles `request` — class-wp-user-query.php:820. A plugin answering
+     * it supplies the results itself and no statement runs. PeepSo's privacy
+     * predicate is added in `pre_user_query` (:772), and `request` is the
+     * only place `query_where` / `query_from` are ever used — so on that
+     * path the predicate is built and then DISCARDED, and the plugin's
+     * answer replaces it wholesale.
+     *
+     * Accepting it would reopen exactly what this check closes, by a
+     * different route than a read that failed. So it fails closed.
+     *
+     * ⚠ The cost is availability, accepted deliberately: if anything ever
+     * answers this query, member search returns 503 until someone decides
+     * what should filter instead. A 503 is discoverable and gets fixed; ids
+     * that skipped the filter are not discoverable at all. This test exists
+     * so that trade is something a future change has to argue with, rather
+     * than a line that looks like a missing branch.
+     */
+    public function testAPluginAnsweringTheQueryIsRefusedNotAccepted(): void
+    {
+        self::load();
+        // A plugin answers with ids that never passed the privacy predicate.
+        \PeepSoUserSearch::$preQueryAnswer = self::CANDIDATES;
+
+        try {
+            UserSearchRepository::search('op', 10, 0);
+            self::fail('ids that never passed the privacy predicate were accepted');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('users_pre_query', $e->getMessage());
+            self::assertStringContainsString('this read was built: no', $e->getMessage());
+        }
+
+        // The premise: no privacy statement was sent at all.
+        self::assertSame(
+            [],
+            $GLOBALS['wpdb']->privacyQueries,
+            'the premise: no privacy statement was sent'
+        );
+    }
+
+    /**
+     * ⭐ The same refusal when SOMETHING ELSE QUERIED, which is the case
+     * that isolates the built-ness check.
+     *
+     * This test exists because a mutation control told me it was missing. In
+     * the test above nothing else queries, so the counter never moves and
+     * the refusal comes from THAT half — meaning a mutant which accepted an
+     * unbuilt read still refused, and survived.
+     *
+     * With an unrelated statement in between the counter DOES move, so the
+     * only thing left refusing is that this read was never built. Accepting
+     * here — the shape of "just tolerate users_pre_query" — now fails.
+     */
+    public function testAPluginAnsweringIsStillRefusedWhenSomethingElseQueried(): void
+    {
+        self::load();
+        \PeepSoUserSearch::$preQueryAnswer  = self::CANDIDATES;
+        \PeepSoUserSearch::$queryBeforeRead = true;
+
+        $before = (int) $GLOBALS['wpdb']->num_queries;
+
+        try {
+            UserSearchRepository::search('op', 10, 0);
+            self::fail('ids that never passed the privacy predicate were accepted');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('this read was built: no', $e->getMessage());
+        }
+
+        // The premise of this test: a statement DID run, so the counter is
+        // no longer what refuses — the unbuilt request is.
+        self::assertGreaterThan(
+            $before,
+            (int) $GLOBALS['wpdb']->num_queries,
+            'the premise: an unrelated statement ran'
+        );
+        self::assertSame(
+            [],
+            $GLOBALS['wpdb']->privacyQueries,
+            'the premise: still no privacy statement'
+        );
+    }
+
+    /**
      * The control that keeps all of the above honest: a healthy pass still
      * returns the privacy-FILTERED ids, and fewer than were offered. A
      * change that refused unconditionally would pass every test above.

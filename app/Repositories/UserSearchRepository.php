@@ -420,6 +420,38 @@ final class UserSearchRepository
      * without a statement. If a future PeepSo adds a read there, (2)
      * fails CLOSED — a 503, never a silent pass.
      *
+     * ⚠⚠ AN EMPTY `$request` IS ALSO REFUSED, AND THAT IS DELIBERATE.
+     *
+     * `WP_User_Query::query()` applies `users_pre_query` (WP 5.1+) BEFORE it
+     * assembles `request` — class-wp-user-query.php:820. A plugin that
+     * answers that filter supplies the results itself, `request` is never
+     * assigned, and no statement runs.
+     *
+     * ⇒ PeepSo's privacy predicate is added in `pre_user_query` (:772), so
+     * on that path it is BUILT AND THEN DISCARDED: `request` is the only
+     * place `query_where` / `query_from` are used, and it is never built.
+     * The plugin's answer replaces the filter wholesale.
+     *
+     * So "a plugin answered it" is NOT a success here, however legitimate
+     * the filter is in general. This read IS the privacy boundary, and
+     * accepting an answer that did not pass it would reopen exactly what
+     * this method closes — by a different route than a failed read.
+     *
+     * ⚠ Both conditions take part in refusing it, in different situations,
+     * and a mutation control is what established that rather than
+     * inspection: with nothing else querying, the counter has not moved and
+     * (1) refuses; with an unrelated statement in between the counter HAS
+     * moved, and (2) refuses because an unassigned `request` can never
+     * equal `last_query`. Each case has its own test, because a mutant that
+     * accepted an unbuilt read survived while only the first existed.
+     *
+     * ⚠ The cost is availability, and it is accepted on purpose: if
+     * anything ever answers this query through `users_pre_query`, member
+     * search returns 503 until someone decides what the predicate should
+     * be in that world. A 503 is discoverable and gets fixed; ids that
+     * skipped the filter are not discoverable at all. No such hook exists
+     * in this stack today (checked), and the plugin set is ours.
+     *
      * @param string $request the SQL WP_User_Query reports it ran
      * @throws \RuntimeException when the privacy-filtered read did not run
      */
@@ -437,13 +469,18 @@ final class UserSearchRepository
             return;
         }
 
-        // The two flags are in the message because they say WHICH way it
-        // failed, and the two causes need different responses: nothing
-        // ran at all, versus something ran but not this.
+        // The flags say WHICH way it failed, and the causes need different
+        // responses. `built: no` is the `users_pre_query` case — something
+        // answered the query, so PeepSo's predicate never ran either — and
+        // it needs a decision about what should filter instead, not a
+        // retry.
         throw new \RuntimeException(
             $context . ': the privacy-filtered read did not run, so no result can be trusted'
             . ' (a statement ran: ' . ($ran ? 'yes' : 'no')
-            . ', and it was this read: ' . ($isOurs ? 'yes' : 'no') . ')'
+            . ', this read was built: ' . ($request !== '' ? 'yes' : 'no')
+            . ', and it was the last statement: ' . ($isOurs ? 'yes' : 'no') . ').'
+            . ' A read that was never built means something answered the query through'
+            . ' users_pre_query, in which case PeepSo\'s privacy predicate did not run either.'
         );
     }
 
