@@ -81,10 +81,30 @@ final class GroupSearchServiceTest extends TestCase
 
         // Raw meta → public §3.2.4 vocabulary; absent/unknown → 'user'.
         self::assertSame(['nft', 'validator', 'system', 'user', 'user'], array_column($out, 'kind'));
+
+        // ⚠ `nft` and `validator` read "GROUP" and the rest do not:
+        // structure A reversed the v1.52 convergence FOR THOSE TWO KINDS
+        // ONLY (owner decision, 2026-11-24). The `kind` slugs above are
+        // unchanged — this is display copy, nothing routes on it.
+        $labels = array_column($out, 'kind_label');
         self::assertSame(
-            ['HOLDER COMMUNITY', 'DELEGATOR COMMUNITY', 'SYSTEM COMMUNITY', 'COMMUNITY', 'COMMUNITY'],
-            array_column($out, 'kind_label'),
+            ['HOLDER GROUP', 'DELEGATOR GROUP', 'SYSTEM COMMUNITY', 'COMMUNITY', 'COMMUNITY'],
+            $labels,
         );
+
+        // ⇒ Asserted as a relationship too, so "finishing" the revert
+        // fails here with a message saying the mixture is intended
+        // rather than silently agreeing with whoever moved SYSTEM.
+        self::assertStringContainsString('GROUP', $labels[0]);
+        self::assertStringContainsString('GROUP', $labels[1]);
+        foreach ([2, 3, 4] as $unchanged) {
+            self::assertStringNotContainsString(
+                'GROUP',
+                $labels[$unchanged],
+                'the 2026-11-24 decision moved nft and validator ONLY,'
+                . ' and the mixture with SYSTEM COMMUNITY is intended'
+            );
+        }
 
         // Every non-hall kind routes to the generic community detail.
         self::assertSame(

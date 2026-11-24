@@ -72,11 +72,23 @@ final class GroupSearchService
      * vocabulary). Emitted server-side so the frontend renders the
      * word verbatim and never maps kind→copy itself (§A2) — the same
      * reason community cards ship `kicker` rather than a type slug.
+     *
+     * ⚠⚠ EDIT BOTH OR NEITHER. Contract line 4534 asserts the two are
+     * identical ("exactly the §3.2.4 kicker vocabulary") and nothing
+     * enforces it, so a one-sided change ships search results and the
+     * community card beside them disagreeing about the same group.
+     * Merge search BEFORE trust when they move together, so no surface
+     * shows the mismatch in between.
      */
     private const KIND_LABEL = [
         'hall'      => 'CHAIN HALL',
-        'nft'       => 'HOLDER COMMUNITY',
-        'validator' => 'DELEGATOR COMMUNITY',
+        // ⚠ `nft` and `validator` read "GROUP", reversing the v1.52
+        // "Communities vocabulary convergence" FOR THESE TWO KINDS ONLY
+        // (owner decision, 2026-11-24 — structure A: Halls / Holder
+        // Groups / Delegator Groups / member-made). `system` and the
+        // `user` fallback keep their copy; the mixture is intended.
+        'nft'       => 'HOLDER GROUP',
+        'validator' => 'DELEGATOR GROUP',
         'system'    => 'SYSTEM COMMUNITY',
         'user'      => 'COMMUNITY',
     ];
