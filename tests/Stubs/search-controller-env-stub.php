@@ -179,6 +179,9 @@ namespace BCC\Search\Repositories {
     if (!class_exists(__NAMESPACE__ . '\\SearchRepository', false)) {
         final class SearchRepository
         {
+            /** Same value as the real class (the controller routes by it). */
+            public const UNTYPED_PAGE_TYPE = 'builder';
+
             /** @var array<array{slug: string, name: string}> */
             public static array $categories = [];
 
@@ -189,7 +192,7 @@ namespace BCC\Search\Repositories {
 
             public static bool $searchCalled = false;
 
-            /** @var array{0: string, 1: string, 2: int}|null [q, type, cap] */
+            /** @var array{0: string, 1: string, 2: int, 3: string}|null [q, type, cap, pageType] */
             public static ?array $lastSearchArgs = null;
 
             /** @var array<int, \BCC\Search\DTO\PageHydratedDTO> keyed by page ID */
@@ -207,13 +210,30 @@ namespace BCC\Search\Repositories {
                 return self::$categories;
             }
 
-            /** @return list<\BCC\Search\DTO\PageCandidateDTO> */
-            public static function searchCandidates(string $query, string $type, int $cap): array
+            /**
+             * A non-empty $pageType keeps the candidates whose seeded page
+             * has that EFFECTIVE type (none or '' reads as
+             * UNTYPED_PAGE_TYPE), the rule the real SQL applies. The SQL
+             * itself is pinned in SearchRepositoryPageKindSqlTest.
+             *
+             * @return list<\BCC\Search\DTO\PageCandidateDTO>
+             */
+            public static function searchCandidates(string $query, string $type, int $cap, string $pageType = ''): array
             {
                 self::$searchCalled   = true;
-                self::$lastSearchArgs = [$query, $type, $cap];
+                self::$lastSearchArgs = [$query, $type, $cap, $pageType];
+                $pool = self::$candidates;
+                if ($pageType !== '') {
+                    $pool = array_values(array_filter(
+                        $pool,
+                        static function (\BCC\Search\DTO\PageCandidateDTO $c) use ($pageType): bool {
+                            $stored = isset(self::$pagesById[$c->id]) ? (string) self::$pagesById[$c->id]->pageType : '';
+                            return ($stored !== '' ? $stored : self::UNTYPED_PAGE_TYPE) === $pageType;
+                        }
+                    ));
+                }
                 // Mirror the production LIMIT: never return more than $cap.
-                return array_slice(self::$candidates, 0, $cap);
+                return array_slice($pool, 0, $cap);
             }
 
             /**
