@@ -63,6 +63,20 @@ namespace {
              */
             public static bool $queryBeforeRead = false;
 
+            /**
+             * ⚠ When set, a plugin ANSWERS the lookup through
+             * `users_pre_query` (WP 5.1+): these ids become the result,
+             * `request` is never assigned and NO statement runs.
+             *
+             * Faithful to class-wp-user-query.php:820, where that filter
+             * is applied before `request` is assembled — so PeepSo's
+             * privacy predicate, added in `pre_user_query` at :772, has
+             * been built and is then discarded unused.
+             *
+             * @var list<int>|null
+             */
+            public static ?array $preQueryAnswer = null;
+
             /** @var list<int|numeric-string> */
             public array $results = [];
 
@@ -119,6 +133,18 @@ namespace {
                         );
                     }
 
+                    // The `users_pre_query` short-circuit, which comes AFTER
+                    // the lookup above because that is core's order: the
+                    // display-name read happens in prepare_query() where
+                    // pre_user_query fires (:772), and this filter fires
+                    // later, inside query() (:820). No request, no
+                    // statement, and the predicate discarded.
+                    if (self::$preQueryAnswer !== null) {
+                        $this->query   = (object) ['request' => ''];
+                        $this->results = array_map('intval', self::$preQueryAnswer);
+                        return;
+                    }
+
                     $request     = self::includeRequest($args);
                     $this->query = (object) ['request' => $request];
                     $GLOBALS['wpdb']->primeColumn($request, $ids);
@@ -157,6 +183,7 @@ namespace {
                 self::$visible     = null;
                 self::$failIncludeWith = null;
                 self::$queryBeforeRead = false;
+                self::$preQueryAnswer  = null;
             }
         }
     }
