@@ -61,13 +61,40 @@ final class GroupSearchServiceTest extends TestCase
     public function testHallKindGetsTheCommunityRouteAndChainHallLabel(): void
     {
         $row = $this->searchWith(
-            new GroupDTO(17, 'Cosmos Hall', 'cosmos-hall', null, null, 'hall'),
+            new GroupDTO(17, 'Cosmos Hall', 'cosmos-hall', null, null, 'hall', 'chain'),
         )['results'][0];
 
         // Structure A (F-594): a Hall's page is its community page.
         self::assertSame('/communities/cosmos-hall', $row['group_url']);
         self::assertSame('hall', $row['kind']);
         self::assertSame('CHAIN HALL', $row['kind_label']);
+    }
+
+    /**
+     * Topic Halls (F-597): a Hall's label says which kind it is, exactly as
+     * bcc-trust's community card kicker does (HALL_KICKER_BY_KIND); a Hall
+     * whose kind is unknown reads the neutral word, never a guessed kind.
+     */
+    public function testAHallsLabelSaysItsKind(): void
+    {
+        $results = $this->searchWith(
+            new GroupDTO(17, 'Cosmos Hall', 'cosmos-hall', null, null, 'hall', 'chain'),
+            new GroupDTO(18, 'DeFi Hall', 'defi', null, null, 'hall', 'topic'),
+            new GroupDTO(19, 'Old Hall', 'old-hall', null, null, 'hall', null),
+        )['results'];
+
+        self::assertSame(['CHAIN HALL', 'TOPIC HALL', 'HALL'], array_column($results, 'kind_label'));
+        self::assertSame(['hall', 'hall', 'hall'], array_column($results, 'kind'), 'the kind stays the public type');
+    }
+
+    /** A Hall kind on a group that is not a Hall changes nothing. */
+    public function testAHallKindOnAnotherGroupIsIgnored(): void
+    {
+        $row = $this->searchWith(
+            new GroupDTO(20, 'Holders', 'holders-g', null, null, 'holders', 'topic'),
+        )['results'][0];
+
+        self::assertSame('HOLDER GROUP', $row['kind_label']);
     }
 
     public function testRawKindMatrixMapsToPublicVocabulary(): void
