@@ -212,6 +212,7 @@ jobs:
             --filter='H /.gitignore' \
             --filter='H /.gitattributes' \
             --filter='H /README.md' \
+            --filter='H /AGENTS.md' \
             -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.DEPLOY_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes" \
             ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$TARGET/"
 
@@ -322,7 +323,7 @@ jobs:
           # F-36: the hidden dev-only paths must be gone from the target too —
           # proves the first deploy with the new filters actually removed them.
           LEFT=""
-          for p in tests composer.json composer.lock phpstan.neon phpstan-bootstrap.php phpunit.xml.dist phpunit-integration.xml.dist .gitignore .gitattributes README.md; do
+          for p in tests composer.json composer.lock phpstan.neon phpstan-bootstrap.php phpunit.xml.dist phpunit-integration.xml.dist .gitignore .gitattributes README.md AGENTS.md; do
             [ -e "\$T/\$p" ] && LEFT="\$LEFT \$p"
           done
           if [ -n "\$LEFT" ]; then
