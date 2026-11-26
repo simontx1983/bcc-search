@@ -86,7 +86,9 @@ final class GroupSearchService
      * in production.
      */
     private const KIND_LABEL = [
-        'hall'      => 'CHAIN HALL',
+        // A Hall of unknown kind (or of neither) reads the neutral word;
+        // HALL_LABEL_BY_KIND names a chain or topic Hall (F-597).
+        'hall'      => 'HALL',
         // ⚠ `nft` and `validator` read "GROUP", reversing the v1.52
         // "Communities vocabulary convergence" FOR THESE TWO KINDS ONLY
         // (owner decision, 2026-11-24 — structure A: Halls / Holder
@@ -96,6 +98,16 @@ final class GroupSearchService
         'validator' => 'DELEGATOR GROUP',
         'system'    => 'SYSTEM COMMUNITY',
         'user'      => 'COMMUNITY',
+    ];
+
+    /**
+     * A Hall's label by its kind (topic Halls, F-597). DELIBERATE LOCKSTEP
+     * DUPLICATE of bcc-trust `CardViewService::HALL_KICKER_BY_KIND`, under
+     * the same EDIT BOTH OR NEITHER rule as KIND_LABEL.
+     */
+    private const HALL_LABEL_BY_KIND = [
+        'chain' => 'CHAIN HALL',
+        'topic' => 'TOPIC HALL',
     ];
 
     /**
@@ -138,7 +150,9 @@ final class GroupSearchService
                 'avatar_url'  => $this->resolveAvatarUrl($g, $peepso),
                 'group_url'   => $this->resolveGroupUrl($g),
                 'kind'        => $kind,
-                'kind_label'  => self::KIND_LABEL[$kind],
+                'kind_label'  => $kind === 'hall'
+                    ? (self::HALL_LABEL_BY_KIND[$g->hallKind ?? ''] ?? self::KIND_LABEL['hall'])
+                    : self::KIND_LABEL[$kind],
             ];
         }
 

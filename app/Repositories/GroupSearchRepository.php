@@ -3,6 +3,7 @@
 namespace BCC\Search\Repositories;
 
 use BCC\Core\Repositories\PeepSoGroupPrivacy;
+use BCC\Core\Repositories\PostMetaRepository;
 use BCC\Search\DTO\GroupDTO;
 use BCC\Search\Support\SearchReads;
 
@@ -44,6 +45,10 @@ if (!defined('ABSPATH')) {
 final class GroupSearchRepository
 {
     private const COLUMNS       = 'p.ID, p.post_title, p.post_name, p.post_excerpt';
+
+    /** A Hall's chain tag and topic (bcc-trust HallRepository::META_CHAIN_TAG / META_TOPIC). */
+    private const META_CHAIN_TAG  = '_bcc_chain_tag';
+    private const META_HALL_TOPIC = '_bcc_hall_topic';
     public  const GROUP_POST_TYPE = 'peepso-group';
 
     private const DEFAULT_LIMIT = 20;
@@ -149,6 +154,8 @@ final class GroupSearchRepository
 
         $rows = SearchReads::rowsOrThrow($sql, 'GroupSearchRepository::search query failed');
 
+        $hallKinds = self::hallKinds($rows);
+
         $dtos = [];
         $seen = [];
         foreach ($rows as $row) {
@@ -202,8 +209,48 @@ final class GroupSearchRepository
                 avatarHash:  $hash,
                 description: $desc,
                 kindRaw:     $kindRaw,
+                hallKind:    $kindRaw === 'hall' ? ($hallKinds[(int) $id] ?? null) : null,
             );
         }
         return $dtos;
+    }
+
+    /**
+     * Each Hall row's kind (topic Halls, F-597), by bcc-trust's rule
+     * (HallRepository::kindFactsForHalls): 'chain' when a `_bcc_chain_tag`
+     * value names a chain (a positive id), else 'topic' when a
+     * `_bcc_hall_topic` value is non-empty, else null. One bounded read for
+     * the page's Halls through bcc-core's PostMetaRepository; when it cannot
+     * be trusted every Hall's kind is null, and its label the neutral one.
+     *
+     * @param list<array<string, mixed>> $rows
+     * @return array<int, 'chain'|'topic'|null>
+     */
+    private static function hallKinds(array $rows): array
+    {
+        $ids = [];
+        foreach ($rows as $row) {
+            if (($row['group_kind_raw'] ?? '') === 'hall' && is_numeric($row['ID'] ?? null)) {
+                $ids[(int) $row['ID']] = true;
+            }
+        }
+        if ($ids === []) {
+            return [];
+        }
+
+        $meta = PostMetaRepository::valuesOrUnknown(array_keys($ids), [self::META_CHAIN_TAG, self::META_HALL_TOPIC]);
+        if ($meta === null) {
+            return [];
+        }
+
+        $kinds = [];
+        foreach (array_keys($ids) as $id) {
+            $values = $meta[$id] ?? [];
+            $chain  = array_filter($values[self::META_CHAIN_TAG] ?? [], static fn (string $v): bool => preg_match('/^[1-9][0-9]*$/', $v) === 1) !== [];
+            $topic  = array_filter($values[self::META_HALL_TOPIC] ?? [], static fn (string $v): bool => $v !== '') !== [];
+            $kinds[$id] = $chain ? 'chain' : ($topic ? 'topic' : null);
+        }
+
+        return $kinds;
     }
 }

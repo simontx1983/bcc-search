@@ -22,6 +22,10 @@ if (!defined('ABSPATH')) {
  * 'holders' / 'delegators' / 'system'; null when absent). The
  * raw→public mapping ('holders'→'nft', 'delegators'→'validator',
  * absent→'user') is the service's job, not the DTO's.
+ *
+ * hallKind (topic Halls, F-597) is set only on a Hall: 'chain' or 'topic',
+ * by bcc-trust's rule (HallRepository::kindFactsForHalls), or null when it
+ * has neither or could not be read.
  */
 final class GroupDTO
 {
@@ -32,6 +36,7 @@ final class GroupDTO
         public readonly ?string $avatarHash,
         public readonly ?string $description,
         public readonly ?string $kindRaw = null,
+        public readonly ?string $hallKind = null,
     ) {
     }
 }
